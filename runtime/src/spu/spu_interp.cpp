@@ -197,6 +197,17 @@ void SpuThread::reset() {
     tag_mask = 0, tag_update = 0;
 }
 
+void SpuThread::dump_history() {
+    LOG("spu", "%s: last instructions before 0x%x:", name.c_str(), pc);
+    for (uint32_t i = 0; i < 64; i++) {
+        uint32_t a = history[(history_pos + i) & 63];
+        LOG("spu", "  %05x: %08x  %s", a, ls32(a), disasm(a, ls32(a)).c_str());
+    }
+    std::string regs;
+    for (int r = 0; r < 8; r++) { char b[24]; snprintf(b, sizeof b, " r%d=%x", r, gpr[r].w[0]); regs += b; }
+    LOG("spu", "%s:%s", name.c_str(), regs.c_str());
+}
+
 void SpuThread::run() {
     running = true;
     // KZ2_SPU_TRACE=N logs the first N instructions executed by each SPU thread.
@@ -213,6 +224,7 @@ void SpuThread::run() {
             continue;
         }
         uint32_t x = ls32(pc);
+        history[history_pos++ & 63] = pc;
         if (traced < trace_limit && traced++ >= 0) LOG("spu", "%s %05x: %08x  %s", name.c_str(), pc, x, disasm(pc, x).c_str());
         uint32_t next = (pc + 4) & (LS_SIZE - 4);
         Op op = decode(x);
@@ -409,6 +421,7 @@ void SpuThread::run() {
                       : va.w[0] > b;
             if (halt) {
                 LOG("spu", "%s: halt instruction at 0x%x", name.c_str(), pc);
+                dump_history();
                 running = false;
             }
             break;
@@ -483,6 +496,7 @@ void SpuThread::run() {
 
         case INVALID: default:
             LOG("spu", "%s: unknown instruction %08x at 0x%x", name.c_str(), x, pc);
+            dump_history();
             running = false;
             continue;
         }

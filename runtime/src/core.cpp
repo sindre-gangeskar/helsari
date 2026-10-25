@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdarg>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -39,6 +40,39 @@ void fatal(const char *fmt, ...) {
     ExitProcess(1);
 }
 
+// Log the guest call chain: each frame's first doubleword links to the
+// caller's frame, and the caller's return address is saved at that frame + 16.
+static void backtrace(PPUContext *ctx) {
+    std::string s;
+    uint32_t sp = (uint32_t)ctx->r[1];
+    for (int i = 0; i < 16 && sp && sp < 0xf0000000u; i++) {
+        uint32_t caller = (uint32_t)ld64(sp);
+        if (!caller || caller <= sp) break;
+        char b[16];
+        snprintf(b, sizeof b, " 0x%x", (uint32_t)ld64(caller + 16));
+        s += b;
+        sp = caller;
+    }
+    log_msg("FATAL", "backtrace (return addresses):%s", s.c_str());
+    log_msg("FATAL", "r3=0x%llx r4=0x%llx r5=0x%llx r11=0x%llx r13=0x%llx r31=0x%llx",
+            (unsigned long long)ctx->r[3], (unsigned long long)ctx->r[4], (unsigned long long)ctx->r[5],
+            (unsigned long long)ctx->r[11], (unsigned long long)ctx->r[13], (unsigned long long)ctx->r[31]);
+    // KZ2_FATAL_PEEK=addr,addr,...: words to show (prefix 'r13' for TLS-relative, e.g. r13-28068)
+    if (const char *p = getenv("KZ2_FATAL_PEEK")) {
+        std::string list = p;
+        size_t i = 0;
+        while (i < list.size()) {
+            size_t e = list.find(',', i);
+            std::string item = list.substr(i, e == std::string::npos ? std::string::npos : e - i);
+            uint32_t a = item.rfind("r13", 0) == 0 ? (uint32_t)(ctx->r[13] + strtoll(item.c_str() + 3, nullptr, 0))
+                                                   : (uint32_t)strtoull(item.c_str(), nullptr, 0);
+            log_msg("FATAL", "  [%s] 0x%x = 0x%08x 0x%08x", item.c_str(), a, ld32(a), ld32(a + 4));
+            if (e == std::string::npos) break;
+            i = e + 1;
+        }
+    }
+}
+
 /* ---------------- function table ---------------- */
 static std::vector<ppu_fn> g_table;   // indexed by (addr - ELF_BASE) / 4
 static uint32_t g_table_end;
@@ -58,6 +92,7 @@ static ppu_fn lookup(uint32_t addr) {
 extern "C" void ppu_call(PPUContext *ctx, uint32_t addr) {
     if (ppu_fn f = lookup(addr)) return f(ctx);
     if (hle_dispatch(ctx, addr)) return;
+    backtrace(ctx);
     fatal("call to unknown guest address 0x%08x (lr=0x%llx)", addr, (unsigned long long)ctx->lr);
 }
 
@@ -65,11 +100,13 @@ extern "C" void ppu_dispatch(PPUContext *ctx) {
     uint32_t t = ctx->jt;
     if (ppu_fn f = lookup(t)) { __attribute__((musttail)) return f(ctx); }
     if (hle_dispatch(ctx, t)) return;
+    backtrace(ctx);
     fatal("indirect jump to 0x%08x is not a known function entry (lr=0x%llx) - "
           "probably an unresolved jump table; add it to the analyzer", t, (unsigned long long)ctx->lr);
 }
 
 extern "C" void ppu_unimpl(PPUContext *ctx, uint32_t addr, uint32_t word) {
+    backtrace(ctx);
     fatal("reached untranslated code at 0x%08x (word %08x, lr=0x%llx)", addr, word, (unsigned long long)ctx->lr);
 }
 

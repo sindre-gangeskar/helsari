@@ -136,7 +136,7 @@ uint32_t SpuThread::read_channel(int ch) {
         }
     case SPU_RdEventMask: return event_mask;
     case SPU_RdDec: return dec_value - (uint32_t)(ticks_now() - dec_start);
-    case SPU_RdMachStat: return 0;
+    case SPU_RdMachStat: return interrupts ? 1 : 0;   // bit 0: interrupts enabled
     case SPU_RdSRR0: return srr0;
     case MFC_RdTagStat: {                           // transfers complete at once, except paused lists
         uint32_t busy = 0;

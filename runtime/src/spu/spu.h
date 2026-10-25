@@ -56,6 +56,9 @@ struct SpuThread {
     uint32_t srr0 = 0;
     bool running = false;
     std::string name;
+    uint32_t history[64] = {};             // recently executed PCs, for crash dumps
+    uint32_t history_pos = 0;
+    void dump_history();
     int64_t traced = 0;                      // instructions logged so far (KZ2_SPU_TRACE)
 
     // MFC command parameters (channels 16-21)
