@@ -1,0 +1,9 @@
+# Everything derived from the game stays out of the repository.
+build/
+generated/
+*.elf
+*.self
+EBOOT.BIN
+kz2.log
+data/
+__pycache__/
