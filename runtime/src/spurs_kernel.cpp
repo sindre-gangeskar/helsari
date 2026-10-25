@@ -24,7 +24,7 @@ namespace {
 constexpr uint32_t PM_ADDR = 0xa00;
 constexpr uint32_t CTX_ADDR = 0x100;
 constexpr uint32_t SELECT_WORKLOAD_ADDR = 0x290;   // kernel entry points the module calls
-constexpr uint32_t EXIT_ADDR = 0x818;
+constexpr uint32_t EXIT_ADDR = 0x808;            // CELL_SPURS_KERNEL1_EXIT_ADDR
 
 // CellSpursWorkloadAttribute is opaque to the game; this is our layout.
 enum AttrOff { A_PM = 8, A_SIZE = 12, A_DATA = 16, A_MINC = 24, A_MAXC = 28, A_CLASS = 32, A_INSTANCE = 36, A_PRIO = 40 };
@@ -87,6 +87,7 @@ void workload_thread(Workload *w) {
     };
     s.on_stop = [](spu::SpuThread &t, uint32_t code) {
         LOG("spurs", "%s: stop 0x%x at 0x%x", t.name.c_str(), code, t.pc);
+        t.dump_history();
         return false;
     };
     LOG("spurs", "workload %u '%s': policy module 0x%x (%u bytes), arg 0x%llx", w->id, w->name.c_str(), w->pm,

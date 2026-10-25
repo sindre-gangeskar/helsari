@@ -1,16 +1,18 @@
-// SPURS on the host. No SPU code runs: known SPU task programs are
-// identified by their embedded ELF and replaced with native C++.
+// SPURS pieces that run natively: known SPU task programs identified by
+// their embedded ELF and replaced with C++ (other tasks run on the SPU core,
+// spurs_tasks.cpp), plus event flags and LF queues.
 //
 //   Edge Zlib inflate task  -> inflate_raw() on the PPU side
 //
-// SPURS event flags and LF queues are host objects keyed by the guest
-// address of their structure.
+// Event flags use the real CellSpursEventFlag layout in guest memory, since
+// SPU tasks set them with atomics: +0x00 u16 events, +0x0F clear mode.
 #include "runtime.h"
 
-#include <condition_variable>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #define REG(n) hle_register(#n, hle_##n)
 
@@ -19,14 +21,11 @@ long inflate_raw(const uint8_t *src, size_t srclen, uint8_t *dst, size_t dstlen)
 namespace {
 enum class TaskKind { Unknown, EdgeZlibInflate };
 
-struct EventFlag { uint16_t bits = 0; uint32_t clear_mode = 0; std::condition_variable cv; };
 struct LFQueue { uint32_t taskset = 0, entry_size = 0; };
 
 std::mutex g_lock;
-std::map<uint32_t, EventFlag> g_flags;
 std::map<uint32_t, LFQueue> g_queues;
 std::map<uint32_t, TaskKind> g_taskset_kind;
-uint32_t g_next_task = 1;
 
 TaskKind identify_task(uint32_t elf) {
     // SPU ELFs embedded in the game; look for a telltale string.
@@ -36,11 +35,10 @@ TaskKind identify_task(uint32_t elf) {
     return TaskKind::Unknown;
 }
 
+// The u16 event bits are the high half of the big-endian word at +0.
+uint32_t *flag_word(uint32_t ef) { return (uint32_t *)mem::ptr(ef); }
 void flag_set(uint32_t ef, uint16_t bits) {
-    std::lock_guard<std::mutex> lk(g_lock);
-    EventFlag &f = g_flags[ef];
-    f.bits |= bits;
-    f.cv.notify_all();
+    __atomic_fetch_or(flag_word(ef), __builtin_bswap32((uint32_t)bits << 16), __ATOMIC_SEQ_CST);
 }
 
 // Edge Zlib inflate queue element (32 bytes):
@@ -75,28 +73,34 @@ void edge_zlib(uint32_t e) {
 
 HLE(_cellSpursEventFlagInitialize) {
     // (spurs, taskset, eventFlag, flagClearMode, flagDirection)
-    std::lock_guard<std::mutex> lk(g_lock);
-    EventFlag &f = g_flags[ARG32(2)];
-    f.bits = 0;
-    f.clear_mode = ARG32(3);
-    memset(mem::ptr(ARG32(2)), 0, 128);
+    uint32_t ef = ARG32(2);
+    memset(mem::ptr(ef), 0, 128);
+    *(uint8_t *)mem::ptr(ef + 0x0e) = (uint8_t)ARG32(4);
+    *(uint8_t *)mem::ptr(ef + 0x0f) = (uint8_t)ARG32(3);
     RET(0);
 }
 HLE(cellSpursEventFlagWait) {
-    // (eventFlag, u16 *mask, mode: 0 = OR, 1 = AND)
+    // (eventFlag, u16 *mask, mode: 0 = OR, 1 = AND). Setters may be SPU tasks
+    // writing guest memory directly, so poll the event bits.
     uint32_t ef = ARG32(0), mp = ARG32(1), mode = ARG32(2);
     uint16_t want = ld16(mp);
-    std::unique_lock<std::mutex> lk(g_lock);
-    EventFlag &f = g_flags[ef];
-    f.cv.wait(lk, [&] { return mode ? (f.bits & want) == want : (f.bits & want) != 0; });
-    uint16_t got = f.bits & want;
-    if (f.clear_mode == 0) f.bits &= ~got;  // CELL_SPURS_EVENT_FLAG_CLEAR_AUTO
-    st16(mp, got);
+    bool auto_clear = *(uint8_t *)mem::ptr(ef + 0x0f) == 0;               // CELL_SPURS_EVENT_FLAG_CLEAR_AUTO
+    for (;;) {
+        uint32_t old = __atomic_load_n(flag_word(ef), __ATOMIC_SEQ_CST);
+        uint16_t bits = (uint16_t)(__builtin_bswap32(old) >> 16), got = bits & want;
+        if (mode ? got == want : got != 0) {
+            uint32_t now = auto_clear ? __builtin_bswap32(__builtin_bswap32(old) & ~((uint32_t)got << 16)) : old;
+            if (!__atomic_compare_exchange_n(flag_word(ef), &old, now, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+                continue;
+            st16(mp, got);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
     RET(0);
 }
 HLE(cellSpursEventFlagClear) {
-    std::lock_guard<std::mutex> lk(g_lock);
-    g_flags[ARG32(0)].bits &= ~(uint16_t)ARG32(1);
+    __atomic_fetch_and(flag_word(ARG32(0)), ~__builtin_bswap32((uint32_t)(uint16_t)ARG32(1) << 16), __ATOMIC_SEQ_CST);
     RET(0);
 }
 HLE(cellSpursEventFlagAttachLv2EventQueue) { RET(0); }
@@ -126,22 +130,20 @@ HLE(_cellSpursLFQueuePushBody) {
     RET(0);
 }
 
-HLE(cellSpursCreateTask) {
-    // (taskset, u32 *taskId, elf, context, size, lsPattern, argument)
-    TaskKind kind = identify_task(ARG32(2));
-    {
-        std::lock_guard<std::mutex> lk(g_lock);
-        if (kind != TaskKind::Unknown) g_taskset_kind[ARG32(0)] = kind;
-    }
-    LOG("spurs", "task in taskset 0x%x: SPU ELF 0x%x -> %s", ARG32(0), ARG32(2),
-        kind == TaskKind::EdgeZlibInflate ? "Edge Zlib inflate (native)" : "unknown (not run)");
-    if (ARG32(1)) st32(ARG32(1), g_next_task++);
-    RET(0);
+// Called when a task is created: true if it is replaced natively (and must
+// not run on an SPU), remembering the replacement for the taskset's queues.
+bool spurs_is_native_task(uint32_t taskset, uint32_t elf) {
+    TaskKind kind = identify_task(elf);
+    if (kind == TaskKind::Unknown) return false;
+    std::lock_guard<std::mutex> lk(g_lock);
+    g_taskset_kind[taskset] = kind;
+    LOG("spurs", "task in taskset 0x%x: SPU ELF 0x%x -> Edge Zlib inflate (native)", taskset, elf);
+    return true;
 }
 
 void register_spurs() {
     REG(_cellSpursEventFlagInitialize); REG(cellSpursEventFlagWait); REG(cellSpursEventFlagClear);
     REG(cellSpursEventFlagAttachLv2EventQueue); REG(cellSpursEventFlagDetachLv2EventQueue);
     REG(_cellSpursLFQueueInitialize); REG(cellSpursLFQueueAttachLv2EventQueue);
-    REG(cellSpursLFQueueDetachLv2EventQueue); REG(_cellSpursLFQueuePushBody); REG(cellSpursCreateTask);
+    REG(cellSpursLFQueueDetachLv2EventQueue); REG(_cellSpursLFQueuePushBody);
 }

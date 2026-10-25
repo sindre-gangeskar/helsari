@@ -48,6 +48,8 @@ add_executable(kz2
   runtime/src/dualsense.cpp
   runtime/src/spurs.cpp
   runtime/src/spurs_kernel.cpp
+  runtime/src/spurs_tasks.cpp
+  runtime/src/sync.cpp
   runtime/src/spu/spu_interp.cpp
   runtime/src/spu/spu_mfc.cpp
   runtime/src/inflate.cpp
