@@ -76,8 +76,6 @@ void set_tls_params(uint32_t img, uint32_t filesz, uint32_t memsz);
 void run_main(uint32_t argv, uint32_t envp);
 void note_call(const char *name, PPUContext *ctx, bool entering);  /* watchdog bookkeeping */
 void dump_all();
-void unstick_sound();
-void skip_spu_jobs();
 }
 
 /* ---- config ---- */

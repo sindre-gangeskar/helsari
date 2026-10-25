@@ -18,6 +18,7 @@ void register_sys();
 void register_gcm();
 void register_io();
 void register_spurs();
+void register_spurs_kernel();
 void hle_dump_counts();
 void rsx_dump_methods();
 
@@ -26,6 +27,7 @@ void hle_register_all() {
     register_gcm();
     register_io();
     register_spurs();
+    register_spurs_kernel();
 }
 
 static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -114,10 +116,6 @@ int main(int argc, char **argv) {
             }
         }).detach();
     }
-    if (!getenv("KZ2_NO_SOUND_HACK"))
-        std::thread([] { for (;;) { Sleep(1000); thread::unstick_sound(); } }).detach();
-    if (!getenv("KZ2_NO_JOB_SKIP"))
-        std::thread([] { for (;;) { Sleep(1); thread::skip_spu_jobs(); } }).detach();
     thread::run_main(av, ev);
     LOG("main", "main thread returned");
     return 0;
