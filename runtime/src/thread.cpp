@@ -105,12 +105,14 @@ void set_tls_params(uint32_t img, uint32_t filesz, uint32_t memsz) {
 }
 
 uint32_t alloc_tls() {
-    // 0x30-byte system area, then the TLS image. r13 = image + 0x7030.
+    // 0x30-byte system area, then the TLS image. Returns the start of the
+    // system area; callers set r13 = that + 0x7030 (i.e. image + 0x7000),
+    // which is where the compiler's r13-relative TLS offsets are based.
     uint32_t base = mem::alloc(0x30 + g_tls_memsz + 16, 16);
     uint32_t img = base + 0x30;
     memset(mem::ptr(base), 0, 0x30 + g_tls_memsz);
     if (g_tls_filesz) memcpy(mem::ptr(img), mem::ptr(g_tls_img), g_tls_filesz);
-    return img;
+    return base;
 }
 
 uint64_t create(uint32_t entry_opd, uint64_t arg, int prio, uint32_t stack, const char *name, bool joinable) {
