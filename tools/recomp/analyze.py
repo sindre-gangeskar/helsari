@@ -97,6 +97,8 @@ class Program:
             m, i = self.decode(a)
             if m is None or i.rd != reg:
                 continue
+            if m in ('ld', 'lwz') and i.ra == 1:
+                continue  # epilogue restore of a callee-saved register, not its definition
             if m == 'or' and i.ra == 2 and i.rb == 2:
                 return self.toc
             if m == 'lwz' and i.ra == 2:
@@ -117,24 +119,44 @@ class Program:
             return None
         regs = {add.ra, add.rb}
         ld = self._find_back(at, lambda m, i: m == 'lwz' and i.rd in regs, depth=2)
-        cmp = self._find_back(at, lambda m, i: m == 'cmpli', depth=3)
-        if ld is None or cmp is None:
+        if ld is None:
             return None
+        # An index clamped by masking, e.g. `rlwinm r9,r3,2,22,29` (index*4 &
+        # 0x3fc), needs no bounds check; the mask only gives an upper bound, so
+        # the table is read until an entry leaves the code. A plain `slwi`
+        # (mb = 0) masks nothing, and the bound comes from the cmpli instead.
+        idx = self._find_back(at, lambda m, i: m == 'rlwinm' and i.sh32 == 2 and i.me32 == 29
+                              and 16 <= i.mb32 <= i.me32, depth=0, limit=8)
+        if idx is not None:
+            # mask covers bits mb..29 (bit 0 = MSB): entries = (mask >> 2) + 1
+            bound, exact = ((0xffffffff >> idx.mb32) & ~3 & 0xffffffff) // 4 + 1, False
+        else:
+            cmp = self._find_back(at, lambda m, i: m == 'cmpli', depth=3)
+            if cmp is None:
+                return None
+            bound, exact = cmp.uimm + 1, True
         ptr = self._reg_value(at, ld.ra)
         if ptr is None or self.elf.seg_for((ptr + ld.simm) & 0xffffffff) is None:
             return None
         base = self.elf.u32((ptr + ld.simm) & 0xffffffff)
-        bound = cmp.uimm + 1
-        if bound > 4096 or self.elf.seg_for(base) is None or self.elf.seg_for(base + 4 * bound - 4) is None:
+        if bound > 4096 or self.elf.seg_for(base) is None:
             return None
         targets = []
         for k in range(bound):
+            if self.elf.seg_for(base + 4 * k) is None:
+                break
             off = struct.unpack('>i', self.elf.read(base + 4 * k, 4))[0]
             t = (base + off) & 0xffffffff
-            if not self.in_code(t):
-                return None
+            # Without an exact bound, also stop at targets far from the jump:
+            # they belong to the data after the table, not to this switch.
+            if not self.in_code(t) or (not exact and abs(t - at) > 0x10000):
+                if exact:
+                    return None
+                break
             targets.append(t)
-        return targets
+        if exact and len(targets) != bound:
+            return None
+        return targets or None
 
     # -- discovery ---------------------------------------------------------
     def discover(self, roots):
