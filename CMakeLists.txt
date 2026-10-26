@@ -66,6 +66,6 @@ cmake_path(SET _dump NORMALIZE "${KZ2_DUMP}")
 target_compile_definitions(kz2 PRIVATE
   KZ2_DEFAULT_DUMP="${_dump}"
   KZ2_DEFAULT_ELF="${GEN_DIR}/decrypt/EBOOT.elf")
-target_compile_options(kz2 PRIVATE -O2 -g)
+target_compile_options(kz2 PRIVATE -O2 -g -msse4.2)
 target_link_libraries(kz2 PRIVATE kz2_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm)
 target_link_options(kz2 PRIVATE -static)

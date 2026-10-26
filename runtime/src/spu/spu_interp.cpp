@@ -122,10 +122,13 @@ inline float ftz(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::cop
 V splat(uint32_t v) { return V{{v, v, v, v}}; }
 
 // 128-bit helpers on the big-endian register image.
-void to_bytes(const V &v, uint8_t *o) { for (int i = 0; i < 16; i++) o[i] = v.b(i); }
+// Big-endian byte i of a register is host byte i ^ 3: one shuffle converts either way.
+void to_bytes(const V &v, uint8_t *o) {
+    _mm_storeu_si128((__m128i *)o, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)v.w), SpuThread::bswap32_mask()));
+}
 V from_bytes(const uint8_t *o) {
-    V r{};
-    for (int i = 0; i < 16; i++) r.set_b(i, o[i]);
+    V r;
+    _mm_storeu_si128((__m128i *)r.w, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)o), SpuThread::bswap32_mask()));
     return r;
 }
 V shl_bits(const V &a, int s) {   // s in 0..7
@@ -212,9 +215,12 @@ void SpuThread::run() {
     running = true;
     // KZ2_SPU_TRACE=N logs the first N instructions executed by each SPU thread.
     static const int64_t trace_limit = getenv("KZ2_SPU_TRACE") ? atoll(getenv("KZ2_SPU_TRACE")) : 0;
+    uint32_t event_poll = 0;
     while (running) {
-        // External interrupt: an enabled event is pending while interrupts are on.
-        if (interrupts && pending_events()) {
+        // External interrupt: an enabled event is pending while interrupts are on. Checked
+        // every 64 instructions: the check (lock-line compare, clock read) costs far more than
+        // an instruction, and hardware delivers events asynchronously anyway.
+        if (interrupts && !(++event_poll & 63) && pending_events()) {
             srr0 = pc;
             pc = 0;
             interrupts = false;
@@ -349,14 +355,11 @@ void SpuThread::run() {
             break;
         }
         case SHUFB: {
-            const V &C = gpr[rt];
-            uint8_t ab[32];
-            to_bytes(va, ab), to_bytes(vb, ab + 16);
-            for (int i = 0; i < 16; i++) {
-                uint8_t c = C.b(i);
-                r.set_b(i, c >= 0xe0 ? 0x80 : c >= 0xc0 ? 0xff : c >= 0x80 ? 0x00 : ab[c & 0x1f]);
-            }
-            gpr[(x >> 21) & 0x7f] = r;
+            uint8_t ab[32], c[16], o[16];
+            to_bytes(va, ab), to_bytes(vb, ab + 16), to_bytes(gpr[rt], c);
+            for (int i = 0; i < 16; i++)
+                o[i] = c[i] >= 0xe0 ? 0x80 : c[i] >= 0xc0 ? 0xff : c[i] >= 0x80 ? 0x00 : ab[c[i] & 0x1f];
+            gpr[(x >> 21) & 0x7f] = from_bytes(o);
             break;
         }
 

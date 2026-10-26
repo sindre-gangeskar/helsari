@@ -5,6 +5,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <immintrin.h>
 #include <deque>
 #include <functional>
 #include <string>
@@ -98,15 +99,18 @@ struct SpuThread {
         uint32_t v; memcpy(&v, ls + (a & (LS_SIZE - 4)), 4); return __builtin_bswap32(v);
     }
     void set_ls32(uint32_t a, uint32_t v) { v = __builtin_bswap32(v); memcpy(ls + (a & (LS_SIZE - 4)), &v, 4); }
+    // A quadword in LS is 16 big-endian bytes; V keeps big-endian word order with each
+    // word in host order, so converting is one byte swap per word.
+    static __m128i bswap32_mask() { return _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12); }
     V lq(uint32_t a) const {
-        a &= LS_SIZE - 16;
         V r;
-        for (int i = 0; i < 4; i++) r.w[i] = ls32(a + 4 * i);
+        _mm_storeu_si128((__m128i *)r.w,
+                         _mm_shuffle_epi8(_mm_load_si128((const __m128i *)(ls + (a & (LS_SIZE - 16)))), bswap32_mask()));
         return r;
     }
     void stq(uint32_t a, const V &v) {
-        a &= LS_SIZE - 16;
-        for (int i = 0; i < 4; i++) set_ls32(a + 4 * i, v.w[i]);
+        _mm_store_si128((__m128i *)(ls + (a & (LS_SIZE - 16))),
+                        _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)v.w), bswap32_mask()));
     }
 
     void reset();
