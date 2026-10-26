@@ -53,6 +53,7 @@ void run(Thread *t) {
 }
 
 DWORD WINAPI host_entry(LPVOID p) {
+    name_host_thread(((Thread *)p)->name);
     run((Thread *)p);
     return 0;
 }

@@ -74,6 +74,7 @@ void init_context(Workload &w, spu::SpuThread &s) {
 void workload_thread(Workload *w) {
     auto &s = *w->spu;
     s.name = "spurs:" + (w->name.empty() ? std::to_string(w->id) : w->name);
+    name_host_thread(s.name);
     if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;   // exclude from tracing
     memcpy(s.ls + PM_ADDR, mem::ptr(w->pm), w->size);

@@ -60,7 +60,14 @@ uint32_t syscall_dispatch(PPUContext *ctx, uint64_t n) {
     case 56: return OK;                                  // rename
 
     /* ---- timers / time ---- */
-    case 141: std::this_thread::sleep_for(std::chrono::microseconds(ARG(0))); return OK;
+    case 141: {                                          // usleep
+        // Windows sleeps in whole timer ticks (1 ms at best): short waits - games poll
+        // with usleep(30) - yield until a high-resolution deadline instead.
+        auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(ARG(0));
+        if (ARG(0) >= 2000) std::this_thread::sleep_for(std::chrono::microseconds(ARG(0) - 1000));
+        while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
+        return OK;
+    }
     case 142: std::this_thread::sleep_for(std::chrono::seconds(ARG(0))); return OK;
     case 144: put32(ARG32(0), 0); put32(ARG32(1), 0); return OK;
     case 145: {

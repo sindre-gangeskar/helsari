@@ -67,6 +67,8 @@ struct LineGuard {
 void log_msg(const char *chan, const char *fmt, ...);
 #define LOG(chan, ...) log_msg(chan, __VA_ARGS__)
 [[noreturn]] void fatal(const char *fmt, ...);
+/* Name the calling host thread (shown by the profiler and debuggers). */
+void name_host_thread(const std::string &name);
 
 /* ---- HLE ---- */
 #define ARG(n) (ctx->r[3 + (n)])

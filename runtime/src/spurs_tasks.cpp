@@ -97,6 +97,7 @@ void task_thread(std::shared_ptr<Task> tp) {
     char buf[32];
     snprintf(buf, sizeof buf, "task %u (ELF 0x%x)", t.id, t.elf);
     s.name = buf;
+    name_host_thread(s.name);
     if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;
 
@@ -174,6 +175,7 @@ void task_thread(std::shared_ptr<Task> tp) {
 // Tasks become ready through create_task, or through SPU-side code (Havok
 // tasks spawn worker tasks by writing task_info and the bitsets directly).
 void scheduler_thread(uint32_t ts) {
+    name_host_thread("taskset scheduler");
     std::unique_lock<std::mutex> lk(g_lock);
     while (!g_shutdown[ts]) {
         auto &tasks = g_tasksets[ts];

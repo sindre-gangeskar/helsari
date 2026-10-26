@@ -53,6 +53,7 @@ add_executable(kz2
   runtime/src/spurs_tasks.cpp
   runtime/src/sync.cpp
   runtime/src/savedata.cpp
+  runtime/src/profiler.cpp
   runtime/src/spu/spu_interp.cpp
   runtime/src/spu/spu_mfc.cpp
   runtime/src/inflate.cpp
@@ -66,5 +67,5 @@ target_compile_definitions(kz2 PRIVATE
   KZ2_DEFAULT_DUMP="${_dump}"
   KZ2_DEFAULT_ELF="${GEN_DIR}/decrypt/EBOOT.elf")
 target_compile_options(kz2 PRIVATE -O2 -g)
-target_link_libraries(kz2 PRIVATE kz2_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid)
+target_link_libraries(kz2 PRIVATE kz2_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm)
 target_link_options(kz2 PRIVATE -static)

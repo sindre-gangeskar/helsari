@@ -87,7 +87,14 @@ void window_thread() {
 
 void flip(uint32_t id) {
     static uint32_t n;
-    if (n++ % 60 == 0) LOG("gcm", "flip #%u (buffer %u)", n, id);
+    // Every 60 flips: how fast the game is presenting.
+    static auto last = std::chrono::steady_clock::now();
+    if (n++ % 60 == 0) {
+        auto now = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(now - last).count();
+        last = now;
+        LOG("gcm", "flip #%u (buffer %u), %.1f fps", n, id, n > 1 ? 60 / secs : 0.0);
+    }
     g_last_flip = id;
     if (id < 8) rsx::flip(g_disp[id].offset, g_disp[id].width, g_disp[id].height, g_disp[id].pitch);
     if (g_flip_handler) g_pending_flip_handler = 1;
@@ -153,6 +160,7 @@ void method(uint32_t m, uint32_t arg) {
 }
 
 void fifo_thread() {
+    name_host_thread("rsx fifo");
     while (!g_hwnd) Sleep(1);
     rsx::init(g_hwnd);
     int trace = getenv("KZ2_TRACE_RSX") ? 400 : 0;

@@ -3,6 +3,7 @@
 #include "runtime.h"
 
 #include <windows.h>
+#include <mmsystem.h>
 
 #include <filesystem>
 #include <thread>
@@ -22,6 +23,7 @@ void register_spurs_kernel();
 void register_spurs_tasks();
 void register_sync();
 void register_savedata();
+void start_profiler();
 void hle_dump_counts();
 void rsx_dump_methods();
 void spurs_tasks_dump();
@@ -35,6 +37,7 @@ void hle_register_all() {
     register_spurs_tasks();
     register_sync();
     register_savedata();
+    start_profiler();
 }
 
 static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -79,6 +82,8 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
 }
 
 int main(int argc, char **argv) {
+    // 1 ms timer resolution (the default 15.6 ms tick stretches every short sleep and timed wait).
+    timeBeginPeriod(1);
     SetUnhandledExceptionFilter(on_crash);
     SetProcessDPIAware();  // render at real pixel size on scaled displays
     std::filesystem::path exe_dir = std::filesystem::path(argv[0]).parent_path();
