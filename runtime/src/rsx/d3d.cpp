@@ -604,6 +604,17 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     for (int f = 0; f < faces; f++) {
         UINT row;
         df = decode(ea + f * face_stride, fmt, w, h, pitch, data[f], row);
+        // Diagnostic only (KZ2_DEBUG_IDENTITY_LUT): an all-zero 64x64 A8R8G8B8 texture
+        // (the colour-grading table) becomes an identity ramp, to see what else renders.
+        static const bool identity_lut = getenv("KZ2_DEBUG_IDENTITY_LUT") != nullptr;
+        if (identity_lut && w == 64 && h == 64 && (fmt & ~0x60u) == 0x85 &&
+            std::all_of(data[f].begin(), data[f].end(), [](uint8_t b) { return b == 0; })) {
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t x = 0; x < w; x++) {
+                    uint8_t v = (uint8_t)(x * 255 / 63), *d = &data[f][(size_t)y * row + x * 4];
+                    d[0] = v, d[1] = v, d[2] = 0, d[3] = v;     // with remap aa93: rgb = v, a (desaturate) = 0
+                }
+        }
         sd[f] = {data[f].data(), row, 0};
     }
     D3D11_TEXTURE2D_DESC d{};
@@ -1047,9 +1058,9 @@ void draw() {
             if (reg(0x1a0c + t * 32) & 0x80000000) {
                 uint32_t tea = ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32));
                 auto rt = g_surfaces.find(tea);
-                LOG("draw", "   tex%d ea=%x fmt=%08x rect=%08x pitch=%x filter=%08x addr=%08x %s", t, tea,
+                LOG("draw", "   tex%d ea=%x fmt=%08x rect=%08x pitch=%x filter=%08x addr=%08x remap=%04x %s", t, tea,
                     reg(0x1a04 + t * 32), reg(0x1a18 + t * 32), reg(0x1840 + t * 4) & 0xfffff, reg(0x1a14 + t * 32),
-                    reg(0x1a08 + t * 32),
+                    reg(0x1a08 + t * 32), reg(0x1a10 + t * 32) & 0xffff,
                     rt != g_surfaces.end() ? ("(render target fmt " + std::to_string(rt->second.fmt) + " " +
                                               std::to_string(rt->second.w) + "x" + std::to_string(rt->second.h) + ")").c_str()
                                            : "");
