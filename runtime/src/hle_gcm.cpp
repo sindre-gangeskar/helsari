@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <string>
 #include <mutex>
 #include <thread>
@@ -29,6 +31,11 @@ uint32_t g_io_to_ea[512];       // io offset >> 20 -> ea >> 20 (0xffff = unmappe
 uint32_t g_io_next;             // next free io offset (MB granularity)
 uint32_t g_flip_handler, g_vblank_handler, g_user_handler;
 std::atomic<uint32_t> g_pending_flip_handler{0};
+// GCM user commands (method 0xEB00): the RSX raises an interrupt and the
+// user handler runs with the command's argument, on the interrupt thread.
+std::mutex g_intr_lock;
+std::condition_variable g_intr_cv;
+std::vector<uint32_t> g_user_commands;
 std::atomic<uint32_t> g_last_flip{0xffffffff};
 std::atomic<bool> g_started{false};
 HWND g_hwnd;
@@ -122,6 +129,16 @@ void method(uint32_t m, uint32_t arg) {
         break;
     case 0x1d74: st32(LABEL_ADDR + g_rsx.be_semaphore_offset, arg); break; // TEXTURE_READ_SEMAPHORE_RELEASE
     case GCM_FLIP_METHOD: flip(arg); break;
+    case 0xeb00: {                                                      // GCM_SET_USER_COMMAND
+        static std::atomic<int> logs{0};
+        if (logs++ < 5) LOG("rsx", "user command 0x%x (handler 0x%x)", arg, g_user_handler);
+        {
+            std::lock_guard<std::mutex> lk(g_intr_lock);
+            g_user_commands.push_back(arg);
+        }
+        g_intr_cv.notify_one();
+        break;
+    }
     }
 }
 
@@ -157,8 +174,20 @@ void fifo_thread() {
 
 // Runs on a guest thread so handlers can be invoked with a valid context.
 void vblank_loop(PPUContext *ctx) {
+    auto next_vblank = std::chrono::steady_clock::now();
     for (;;) {
-        Sleep(16);
+        next_vblank += std::chrono::milliseconds(16);
+        // Until the next vblank, service user commands as the RSX raises them.
+        for (;;) {
+            std::vector<uint32_t> cmds;
+            {
+                std::unique_lock<std::mutex> lk(g_intr_lock);
+                if (!g_intr_cv.wait_until(lk, next_vblank, [] { return !g_user_commands.empty(); })) break;
+                cmds.swap(g_user_commands);
+            }
+            for (uint32_t c : cmds)
+                if (g_user_handler) { ctx->r[3] = c; ppu_invoke(ctx, g_user_handler); }
+        }
         if (g_vblank_handler) { ctx->r[3] = 1; ppu_invoke(ctx, g_vblank_handler); }
         if (g_pending_flip_handler.exchange(0) && g_flip_handler) { ctx->r[3] = 1; ppu_invoke(ctx, g_flip_handler); }
     }
@@ -198,6 +227,8 @@ void rsx_dump_methods() {
     std::string s;
     for (size_t k = 0; k < v.size() && k < 24; k++) s += " " + std::to_string(v[k].first) + "x" + [&] { char b[8]; snprintf(b, 8, "%04x", v[k].second); return std::string(b); }();
     LOG("watchdog", "  rsx methods (%llu total):%s", (unsigned long long)g_rsx.methods, s.c_str());
+    LOG("watchdog", "  rsx user commands %u, semaphore release %u, back-end release %u", g_method_hist[0xeb00 >> 2].load(),
+        g_method_hist[0x006c >> 2].load(), g_method_hist[0x1d70 >> 2].load());
     LOG("watchdog", "  fifo get=0x%x put=0x%x, in method 0x%x (arg 0x%x)", ld32(CTRL_ADDR + 4), ld32(CTRL_ADDR),
         g_cur_method.load(), g_cur_arg.load());
     if (uint32_t ea = io_ea(ld32(CTRL_ADDR + 4))) {
