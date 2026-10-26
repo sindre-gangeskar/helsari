@@ -238,6 +238,7 @@ int32_t auto_op(PPUContext *ctx, bool save) {
             if (op == FILEOP_WRITE || !stdfs::exists(file, ec)) std::ofstream(file, std::ios::binary);   // create / truncate
             std::fstream f(file, std::ios::binary | std::ios::in | std::ios::out);
             f.seekp(off);
+            mem::ensure(buf, std::min(size, buf_size));            // kernel I/O does not commit guest pages
             f.write((const char *)mem::ptr(buf), std::min(size, buf_size));
             done = f ? std::min(size, buf_size) : 0;
         } else if (op == FILEOP_DELETE) {
