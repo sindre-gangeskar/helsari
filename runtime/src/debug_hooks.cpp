@@ -4,16 +4,26 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 extern "C" void f_00a4a99c_guest(PPU_CTX);
 
-// KZ2_HOOK_WATCH="ea:len": hooks and host writers log only what overlaps it.
+// KZ2_HOOK_WATCH="ea:len,ea:len": hooks and host writers log only what overlaps.
 bool mem::hook_watched(uint32_t ea, uint32_t size) {
-    static const char *e = getenv("KZ2_HOOK_WATCH");
-    if (!e) return false;
-    static uint32_t a = strtoul(e, nullptr, 16);
-    static uint32_t n = strchr(e, ':') ? strtoul(strchr(e, ':') + 1, nullptr, 16) : 4;
-    return ea < a + n && a < ea + size;
+    static const std::vector<std::pair<uint32_t, uint32_t>> ranges = [] {
+        std::vector<std::pair<uint32_t, uint32_t>> r;
+        if (const char *p = getenv("KZ2_HOOK_WATCH"))
+            for (const char *s = p; *s;) {
+                char *end;
+                uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 4;
+                r.push_back({a, n});
+                s = *end == ',' ? end + 1 : end;
+            }
+        return r;
+    }();
+    for (auto &[a, n] : ranges)
+        if (ea < a + n && a < ea + size) return true;
+    return false;
 }
 
 namespace {

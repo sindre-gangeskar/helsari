@@ -1051,6 +1051,10 @@ void draw() {
         LOG("draw", "#%d rt=%x tex0=%x ps=%016llx cmask=%08x blend=%x/%x/%x fc0=(%g %g %g %g) fc1=(%g %g %g %g) n=%zu",
             g_draws_this_frame, b.color[0] ? b.color[0]->ea : 0, srv[0] ? ea_for((reg(0x1a04) & 3) == 2, reg(0x1a00)) : 0,
             (unsigned long long)psh, reg(0x324), reg(0x310), reg(0x314), reg(0x318), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], list.size());
+        LOG("draw", "   depth test %u func %x write %u, stencil %u func %x ref %x mask %x/%x ops %x/%x/%x two-sided %u, "
+            "depth bounds %u [%g, %g]", reg(0x0a74) & 1, reg(0x0a6c), reg(0x0a70) & 1, reg(0x0328) & 1, reg(0x0330),
+            reg(0x0334), reg(0x0338), reg(0x032c), reg(0x033c), reg(0x0340), reg(0x0344), reg(0x0348) & 1,
+            reg(0x0380) & 1, regf(0x0384), regf(0x0388));
         LOG("draw", "   surface fmt=%08x %ux%u target=%x color=%x/%x/%x/%x depth=%x pitch=%x", reg(0x0208), b.w, b.h,
             reg(0x0220), b.color[0] ? b.color[0]->ea : 0, b.color[1] ? b.color[1]->ea : 0, b.color[2] ? b.color[2]->ea : 0,
             b.color[3] ? b.color[3]->ea : 0, b.depth ? b.depth->ea : 0, reg(0x020c));

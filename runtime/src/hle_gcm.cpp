@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <string>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -28,7 +29,7 @@ struct Display { uint32_t offset, pitch, width, height; };
 Display g_disp[8];
 uint32_t g_io_base, g_io_size;
 uint32_t g_io_to_ea[512];       // io offset >> 20 -> ea >> 20 (0xffff = unmapped)
-uint32_t g_io_next;             // next free io offset (MB granularity)
+std::map<uint32_t, uint32_t> g_io_maps;   // first io page -> page count, of each cellGcmMapMainMemory
 uint32_t g_flip_handler, g_vblank_handler, g_user_handler;
 std::atomic<uint32_t> g_pending_flip_handler{0};
 // GCM user commands (method 0xEB00): the RSX raises an interrupt and the
@@ -45,6 +46,14 @@ uint32_t io_ea(uint32_t off) {
     return page == 0xffff ? 0 : (page << 20) | (off & 0xfffff);
 }
 uint32_t local_ea(uint32_t off) { return mem::LOCAL_BASE + off; }
+
+void unmap_io_pages(uint32_t first, uint32_t count) {
+    for (uint32_t p = first; p < first + count && p < 512; p++) {
+        if (g_io_to_ea[p] != 0xffff) st16(OFFSET_TABLES + 0x400 + 2 * g_io_to_ea[p], 0xffff);   // ioAddress table
+        st16(OFFSET_TABLES + 2 * p, 0xffff);                                                     // eaAddress table
+        g_io_to_ea[p] = 0xffff;
+    }
+}
 
 void map_io(uint32_t ea, uint32_t io, uint32_t size) {
     for (uint32_t i = 0; i < (size + 0xfffff) >> 20; i++) {
@@ -166,7 +175,16 @@ void fifo_thread() {
         } else {
             uint32_t count = (cmd >> 18) & 0x7ff, m = cmd & 0xfffc;
             bool noinc = cmd & 0x40000000;
-            for (uint32_t i = 0; i < count; i++) method(noinc ? m : m + 4 * i, ld32(ea + 4 + 4 * i));
+            // KZ2_TRACE_METHOD=<method>[:value]: where in memory the command words for it are.
+            static const uint32_t tm = getenv("KZ2_TRACE_METHOD") ? strtoul(getenv("KZ2_TRACE_METHOD"), nullptr, 16) : 0;
+            static const char *tv = tm && strchr(getenv("KZ2_TRACE_METHOD"), ':') ? strchr(getenv("KZ2_TRACE_METHOD"), ':') + 1 : nullptr;
+            static int traced;
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t mi = noinc ? m : m + 4 * i, v = ld32(ea + 4 + 4 * i);
+                if (tm && mi == tm && (!tv || v == strtoul(tv, nullptr, 16)) && traced++ < 30)
+                    LOG("rsx", "method 0x%x = 0x%x from command word at ea 0x%x (fifo get 0x%x)", mi, v, ea + 4 + 4 * i, get);
+                method(mi, v);
+            }
             get += 4 + 4 * count;
         }
         st32(CTRL_ADDR + 4, get);
@@ -265,7 +283,7 @@ HLE(_cellGcmInitBody) {
     memset(mem::ptr(OFFSET_TABLES), 0xff, 0x400 + 0x1800);
     g_io_base = io_addr, g_io_size = io_size;
     map_io(io_addr, 0, io_size);
-    g_io_next = (io_size + 0xfffff) & ~0xfffffu;
+    g_io_maps.clear();
     uint32_t frag = cmd_size < FRAGMENT ? cmd_size : FRAGMENT;
     st32(CTX_ADDR + 0, io_addr + 0x1000);              // begin (first 4 KiB reserved)
     st32(CTX_ADDR + 4, io_addr + frag - 4);            // end (room for the wrap jump)
@@ -300,10 +318,16 @@ HLE(cellGcmAddressToOffset) {
     RET(0);
 }
 HLE(cellGcmMapMainMemory) {
-    uint32_t ea = ARG32(0), size = ARG32(1);
-    uint32_t io = g_io_next;
+    // Like libgcm: the lowest free run of 1 MB io pages (unmapped ranges are reused).
+    uint32_t ea = ARG32(0), size = ARG32(1), pages = (size + 0xfffff) >> 20, first = 0, run = 0;
+    for (uint32_t p = 0; p < 512 && run < pages; p++) {
+        if (g_io_to_ea[p] != 0xffff) { run = 0; first = p + 1; continue; }
+        run++;
+    }
+    if (run < pages) { RET(0x802100ff); return; }                     // CELL_GCM_ERROR_FAILURE
+    uint32_t io = first << 20;
     map_io(ea, io, size);
-    g_io_next += (size + 0xfffff) & ~0xfffffu;
+    g_io_maps[first] = pages;
     st32(ARG32(2), io);
     LOG("gcm", "map main memory ea=0x%x size=0x%x -> io 0x%x", ea, size, io);
     RET(0);
@@ -348,8 +372,23 @@ HLE(cellGcmBindTile) { RET(0); }
 HLE(cellGcmUnbindTile) { RET(0); }
 HLE(cellGcmBindZcull) { RET(0); }
 HLE(cellGcmUnbindZcull) { RET(0); }
-HLE(cellGcmUnmapIoAddress) { RET(0); }
-HLE(cellGcmUnmapEaIoAddress) { RET(0); }
+// Unmapping frees the io pages of a whole cellGcmMapMainMemory mapping.
+int32_t unmap_mapping(uint32_t first_page, const char *how, uint32_t arg) {
+    auto it = g_io_maps.find(first_page);
+    if (it == g_io_maps.end()) {
+        LOG("gcm", "%s 0x%x: not the start of a mapping", how, arg);
+        return (int32_t)0x802100ff;
+    }
+    LOG("gcm", "%s 0x%x: io 0x%x, %u MB", how, arg, first_page << 20, it->second);
+    unmap_io_pages(first_page, it->second);
+    g_io_maps.erase(it);
+    return 0;
+}
+HLE(cellGcmUnmapIoAddress) { RET(unmap_mapping(ARG32(0) >> 20, "unmap io", ARG32(0))); }
+HLE(cellGcmUnmapEaIoAddress) {
+    uint16_t io = ld16(OFFSET_TABLES + 0x400 + 2 * (ARG32(0) >> 20));
+    RET(io == 0xffff ? (int32_t)0x802100ff : unmap_mapping(io, "unmap ea", ARG32(0)));
+}
 HLE(cellGcmSortRemapEaIoAddress) { RET(0); }
 HLE(_cellGcmFunc15) { RET(0); }
 
