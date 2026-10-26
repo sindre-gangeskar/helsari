@@ -8,10 +8,13 @@
 //   - r3 = task argument, r4 = {taskset args, spurs address},
 //   - the PM syscall entry at LS 0xA70 is trapped (r3 = syscall, r4 = arg).
 // Tasks identified as Edge Zlib keep their native implementation (spurs.cpp).
+// A scheduler thread per taskset starts tasks once they are enabled and ready.
 #include "kernel.h"
 #include "spu/spu.h"
 
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -33,7 +36,7 @@ constexpr uint32_t KERNEL_CTX = 0x100, TASKSET_CTX = 0x2700;
 enum { SYS_EXIT = 0, SYS_YIELD = 1, SYS_WAIT_SIGNAL = 2, SYS_POLL = 3, SYS_RECV_WKL_FLAG = 4 };
 
 // CellSpursTaskset offsets
-enum { TS_RUNNING = 0x00, TS_READY = 0x10, TS_ENABLED = 0x30, TS_SIGNALLED = 0x40, TS_WAITING = 0x50,
+enum { TS_RUNNING = 0x00, TS_READY = 0x10, TS_PENDING_READY = 0x20, TS_ENABLED = 0x30, TS_SIGNALLED = 0x40, TS_WAITING = 0x50,
        TS_SPURS = 0x60, TS_ARGS = 0x68, TS_WID = 0x74, TS_TASK_INFO = 0x80, TS_SIZE = 0x1890 };
 // TaskInfo (0x30 each): args[16], u64 elf, u64 context, ls_pattern[16]
 enum { TI_ARGS = 0x00, TI_ELF = 0x10, TI_CONTEXT = 0x18, TI_LS_PATTERN = 0x20, TI_SIZE = 0x30 };
@@ -42,11 +45,12 @@ enum { TA_ELF = 0x00, TA_CONTEXT = 0x04, TA_CONTEXT_SIZE = 0x08, TA_EXIT_CODE = 
 
 struct Task {
     uint32_t taskset = 0, id = 0, elf = 0, exit_code_addr = 0;
-    std::unique_ptr<spu::SpuThread> spu;
+    std::unique_ptr<spu::SpuThread> spu;      // set when the scheduler starts it
     std::atomic<bool> done{false};
 };
 
 std::mutex g_lock;
+std::condition_variable g_wake;                                        // a task became ready
 std::map<uint32_t, std::vector<std::shared_ptr<Task>>> g_tasksets;   // taskset ea -> tasks
 std::map<uint32_t, bool> g_shutdown;
 
@@ -80,6 +84,7 @@ void finish(Task &t, uint32_t exit_code) {
     bit_clear(t.taskset + TS_RUNNING, t.id);
     bit_clear(t.taskset + TS_ENABLED, t.id);
     bit_clear(t.taskset + TS_READY, t.id);
+    bit_clear(t.taskset + TS_PENDING_READY, t.id);
     if (t.exit_code_addr) st32(t.exit_code_addr, exit_code);
     t.done = true;
 }
@@ -164,6 +169,38 @@ void task_thread(std::shared_ptr<Task> tp) {
     LOG("spurs", "%s: finished", s.name.c_str());
 }
 
+// The policy module's scheduling, natively: any task that is enabled and
+// ready (or pending_ready) but not running gets started from its task_info.
+// Tasks become ready through create_task, or through SPU-side code (Havok
+// tasks spawn worker tasks by writing task_info and the bitsets directly).
+void scheduler_thread(uint32_t ts) {
+    std::unique_lock<std::mutex> lk(g_lock);
+    while (!g_shutdown[ts]) {
+        auto &tasks = g_tasksets[ts];
+        tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](auto &t) { return t->done.load(); }), tasks.end());
+        for (uint32_t id = 0; id < 128; id++) {
+            if (!bit_test(ts + TS_ENABLED, id) || bit_test(ts + TS_RUNNING, id)) continue;
+            if (!bit_test(ts + TS_READY, id) && !bit_test(ts + TS_PENDING_READY, id)) continue;
+            std::shared_ptr<Task> t;
+            for (auto &c : tasks)
+                if (c->id == id) t = c;
+            if (t && t->spu) continue;                                      // started, about to set running
+            uint32_t info = ts + TS_TASK_INFO + id * TI_SIZE;
+            if (!t) {                                                       // made ready by guest code
+                t = std::make_shared<Task>();
+                t->taskset = ts, t->id = id, t->elf = ld32(info + TI_ELF + 4);
+                tasks.push_back(t);
+            }
+            bit_clear(ts + TS_PENDING_READY, id);
+            bit_set(ts + TS_READY, id);
+            bit_set(ts + TS_RUNNING, id);
+            t->spu = std::make_unique<spu::SpuThread>();
+            std::thread(task_thread, t).detach();
+        }
+        g_wake.wait_for(lk, std::chrono::milliseconds(1));
+    }
+}
+
 // Shared by CreateTask and CreateTaskWithAttribute.
 int32_t create_task(uint32_t ts, uint32_t id_out, uint32_t elf, uint32_t context, uint32_t ls_pattern,
                     uint32_t args, uint32_t exit_code_addr) {
@@ -184,14 +221,14 @@ int32_t create_task(uint32_t ts, uint32_t id_out, uint32_t elf, uint32_t context
         t->taskset = ts, t->id = id, t->elf = elf, t->exit_code_addr = exit_code_addr;
         tasks.push_back(t);
         if (id_out) st32(id_out, id);
+        LOG("spurs", "taskset 0x%x: create task %u (ELF 0x%x)", ts, id, elf);
         if (spurs_is_native_task(ts, elf)) {
             // Replaced natively: no SPU thread; it stays "enabled" until the taskset ends.
             return 0;
         }
-        t->spu = std::make_unique<spu::SpuThread>();
         bit_set(ts + TS_READY, id);
-        std::thread(task_thread, t).detach();
     }
+    g_wake.notify_all();
     return 0;
 }
 
@@ -224,6 +261,7 @@ HLE(cellSpursCreateTasksetWithAttribute) {
         g_tasksets[ts].clear();
         g_shutdown[ts] = false;
     }
+    std::thread(scheduler_thread, ts).detach();
     std::string name = ld32(a + 0x1c) ? mem::cstr(ld32(a + 0x1c)) : "";
     LOG("spurs", "taskset 0x%x '%s' created (args 0x%llx)", ts, name.c_str(), (unsigned long long)ld64(a + 0x08));
     RET(0);
@@ -255,8 +293,11 @@ HLE(cellSpursCreateTask) {
     RET(create_task(ARG32(0), ARG32(1), ARG32(2), ARG32(3), ARG32(5), ARG32(6), 0));
 }
 HLE(cellSpursShutdownTaskset) {
-    std::lock_guard<std::mutex> lk(g_lock);
-    g_shutdown[ARG32(0)] = true;
+    {
+        std::lock_guard<std::mutex> lk(g_lock);
+        g_shutdown[ARG32(0)] = true;
+    }
+    g_wake.notify_all();
     RET(0);
 }
 HLE(cellSpursJoinTaskset) {
@@ -282,8 +323,27 @@ void spurs_tasks_dump() {
     for (auto &[ts, tasks] : g_tasksets) {
         if (tasks.empty() || !tasks.back()->spu) continue;
         auto bits = [ts](uint32_t off) { return ld32(ts + off); };
-        LOG("watchdog", "  taskset 0x%x: running %08x ready %08x enabled %08x signalled %08x waiting %08x", ts,
-            bits(TS_RUNNING), bits(TS_READY), bits(TS_ENABLED), bits(TS_SIGNALLED), bits(TS_WAITING));
+        LOG("watchdog", "  taskset 0x%x: running %08x ready %08x pending_ready %08x enabled %08x signalled %08x waiting %08x",
+            ts, bits(TS_RUNNING), bits(TS_READY), bits(0x20), bits(TS_ENABLED), bits(TS_SIGNALLED), bits(TS_WAITING));
+        for (uint32_t o = 0x60; o < 0x80; o += 32) {
+            char line[128];
+            int n = snprintf(line, sizeof line, "    hdr %02x:", o);
+            for (uint32_t w = 0; w < 32; w += 4) n += snprintf(line + n, sizeof line - n, " %08x", ld32(ts + o + w));
+            LOG("watchdog", "%s", line);
+        }
+        // Where live tasks are (full history once per task, to find a spinning one).
+        static std::map<const Task *, int> shown;
+        for (auto &t : tasks) {
+            if (!t->spu || t->done) continue;
+            LOG("watchdog", "    task %u (ELF 0x%x) at pc 0x%x", t->id, t->elf, t->spu->pc);
+            if (!shown[t.get()]++) t->spu->dump_history();
+        }
+        for (uint32_t id = 0; id < 32; id++) {
+            if (!bit_test(ts + TS_ENABLED, id)) continue;
+            uint32_t ti = ts + TS_TASK_INFO + id * TI_SIZE;
+            LOG("watchdog", "    task %u: args %08x %08x %08x %08x elf %08x ctx %08x", id, ld32(ti), ld32(ti + 4),
+                ld32(ti + 8), ld32(ti + 12), ld32(ti + TI_ELF + 4), ld32(ti + TI_CONTEXT + 4));
+        }
         uint32_t info = ts + TS_TASK_INFO + tasks.back()->id * TI_SIZE;
         uint32_t arg1 = ld32(info + TI_ARGS + 4);
         uint32_t areas[3] = {ld32(info + TI_ARGS), arg1, arg1 ? ld32(arg1 + 40) : 0};   // [arg1+40]: queue data?

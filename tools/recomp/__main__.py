@@ -15,6 +15,7 @@ import sys
 import time
 
 from . import analyze, codegen, elf, nid
+from .overrides import OVERRIDES
 
 KNOWN_TITLES = {'BCES00081': 'Killzone 2 (EU)', 'BCUS98116': 'Killzone 2 (US)',
                 'BCJS30022': 'Killzone 2 (JP)', 'BCAS20071': 'Killzone 2 (Asia)'}
@@ -91,6 +92,11 @@ def generate(e, out, rpcs3):
         h.write('#pragma once\n#include "ppu.h"\n')
         for a in order:
             h.write(f'void f_{a:08x}(PPU_CTX);\n')
+            if a in OVERRIDES:
+                h.write(f'void f_{a:08x}_guest(PPU_CTX);  /* native override: {OVERRIDES[a]} */\n')
+    missing = [a for a in OVERRIDES if a not in funcs]
+    if missing:
+        sys.exit(f'overrides name addresses that are not functions: {[hex(a) for a in missing]}')
 
     files = []
     chunk, size, idx = [], 0, 0
@@ -103,7 +109,7 @@ def generate(e, out, rpcs3):
         with open(p, 'w') as c:
             c.write('#include "ppu_funcs.h"\n\n')
             for a in chunk:
-                c.write(gen.function(funcs[a]))
+                c.write(gen.function(funcs[a], f'f_{a:08x}_guest' if a in OVERRIDES else None))
                 c.write('\n\n')
         files.append(p)
         chunk, size, idx = [], 0, idx + 1

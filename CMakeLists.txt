@@ -39,6 +39,7 @@ add_executable(kz2
   runtime/src/core.cpp
   runtime/src/memory.cpp
   runtime/src/thread.cpp
+  runtime/src/fibers.cpp
   runtime/src/kernel.cpp
   runtime/src/syscalls.cpp
   runtime/src/fs.cpp

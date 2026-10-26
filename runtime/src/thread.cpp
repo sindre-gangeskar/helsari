@@ -94,6 +94,9 @@ void dump_all() {
     for (auto &[id, t] : g_threads) {
         LOG("watchdog", "  0x%x %-28s %s %s(0x%llx) lr=0x%llx", id, t->name.c_str(), t->done ? "DONE" : t->in_call ? "IN  " : "last",
             t->last_call.load(), (unsigned long long)t->last_arg0, (unsigned long long)t->last_lr);
+        if (t->in_call && !t->done)                     // callee-saved registers often hold what it waits for
+            LOG("watchdog", "      r28=0x%llx r29=0x%llx r30=0x%llx r31=0x%llx", (unsigned long long)t->ctx.r[28],
+                (unsigned long long)t->ctx.r[29], (unsigned long long)t->ctx.r[30], (unsigned long long)t->ctx.r[31]);
     }
 }
 

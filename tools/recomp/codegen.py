@@ -59,8 +59,8 @@ class Gen:
         return f'ppu_call(ctx, 0x{t:x});'
 
     # -- one function -----------------------------------------------------
-    def function(self, fn):
-        out = [f'void f_{fn.addr:08x}(PPU_CTX) {{']
+    def function(self, fn, name=None):
+        out = [f'void {name or f"f_{fn.addr:08x}"}(PPU_CTX) {{']
         addrs = sorted(fn.insns)
         # labels: branch targets plus fall-through targets that aren't adjacent
         labels = set(fn.labels)

@@ -204,6 +204,24 @@ void rsx_dump_methods() {
         std::string w;
         for (int i = 0; i < 8; i++) { char b[12]; snprintf(b, 12, " %08x", ld32(ea + 4 * i)); w += b; }
         LOG("watchdog", "  words at get (ea 0x%x):%s", ea, w.c_str());
+        for (int row = -4; row < 0; row++) {                // what led up to it
+            w.clear();
+            for (int i = 0; i < 8; i++) { char b[12]; snprintf(b, 12, " %08x", ld32(ea + 32 * row + 4 * i)); w += b; }
+            LOG("watchdog", "  words at get%+d:%s", 32 * row, w.c_str());
+        }
+    }
+    // KZ2_WATCHDOG_PEEK="ea:len,ea:len" dumps guest memory (hex, len rounded up to 32).
+    if (const char *p = getenv("KZ2_WATCHDOG_PEEK")) {
+        for (const char *s = p; *s;) {
+            char *end;
+            uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 32;
+            for (uint32_t o = 0; o < n; o += 32) {
+                std::string w;
+                for (int i = 0; i < 8; i++) { char b[12]; snprintf(b, 12, " %08x", ld32(a + o + 4 * i)); w += b; }
+                LOG("watchdog", "  peek %08x:%s", a + o, w.c_str());
+            }
+            s = *end == ',' ? end + 1 : end;
+        }
     }
 }
 

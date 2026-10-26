@@ -1,0 +1,133 @@
+// The game's microthread scheduler, on host fibers.
+//
+// Killzone 2 runs some work as cooperative microthreads. A context buffer
+// holds the callee-saved registers, r1 (+144), r2 (+152), the resume address
+// (+160, the saved r0), r3 (+168) and r4/r5 (+512/+520):
+//   0x71e10  save(buf)                 - like setjmp
+//   0x72680  pick(scheduler) -> buf    - next runnable context
+//   0x71f24  restore(buf)              - loads it and "returns" into it
+//   0x7203c  yield(cur, scheduler)     - save(cur); restore(pick())
+// New contexts are made by saving a template and patching r1 (fresh stack),
+// r2 and the resume address (an entry point). Restoring a context continues
+// on that context's stack, but generated code keeps its frames on the host
+// stack, so every guest context runs on its own host fiber: yield suspends
+// the current fiber, and restore resumes the fiber suspended in that buffer
+// or starts a new one at the buffer's entry point.
+#include "runtime.h"
+
+#include <windows.h>
+
+#include <map>
+#include <mutex>
+
+extern "C" {
+void f_00071e10(PPU_CTX);           // save
+void f_00072680(PPU_CTX);           // pick
+void f_00071f24_guest(PPU_CTX);     // restore: the generated register loads
+}
+
+namespace {
+
+constexpr SIZE_T FIBER_STACK = 256u << 20;   // as for guest threads: generated frames are large
+enum { CTX_R1 = 144, CTX_PC = 160 };
+
+struct Fiber {
+    void *handle = nullptr;
+    uint32_t buf = 0;          // context buffer it is suspended in (or starts from)
+    uint64_t sp = 0;           // r1 and resume address saved there, to tell a
+    uint32_t pc = 0;           // suspended fiber from a re-initialized buffer
+    bool primary = false;      // the guest thread's own fiber: deleting it would end the thread
+};
+
+std::mutex g_lock;
+std::map<uint32_t, Fiber *> g_suspended;      // buffer -> fiber that yielded into it
+
+thread_local Fiber *t_cur;                    // fiber running on this thread
+thread_local Fiber *t_dead;                   // abandoned fiber, deleted by the next one to run
+thread_local PPUContext *t_ctx;               // guest registers handed across a switch
+
+void reap() {
+    if (Fiber *d = t_dead) {
+        t_dead = nullptr;
+        if (d->primary) return;               // stays converted; never resumed again
+        DeleteFiber(d->handle);
+        delete d;
+    }
+}
+
+Fiber *current() {
+    if (!t_cur) {                             // first switch on this thread: adopt the thread itself
+        t_cur = new Fiber();
+        t_cur->primary = true;
+        t_cur->handle = IsThreadAFiber() ? GetCurrentFiber() : ConvertThreadToFiber(nullptr);
+        if (!t_cur->handle) fatal("ConvertThreadToFiber failed (%lu)", GetLastError());
+    }
+    return t_cur;
+}
+
+void CALLBACK fresh_entry(void *p) {
+    Fiber *self = (Fiber *)p;
+    reap();
+    PPUContext *ctx = t_ctx;
+    ctx->r[3] = self->buf;
+    f_00071f24_guest(ctx);                    // r1 = new stack, r2, r3 = argument, lr = entry
+    uint32_t entry = (uint32_t)ctx->lr;
+    ppu_call(ctx, entry);
+    fatal("microthread entry 0x%x returned (context 0x%x)", entry, self->buf);
+}
+
+// Leave the current fiber for the context in `next`. If `suspend_in` is set
+// the current fiber has saved itself there and returns from this call when
+// that buffer is restored; otherwise it is abandoned.
+void switch_to(PPUContext *ctx, uint32_t next, uint32_t suspend_in) {
+    Fiber *me = current(), *target = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_lock);
+        auto it = g_suspended.find(next);
+        if (it != g_suspended.end()) {
+            Fiber *f = it->second;
+            g_suspended.erase(it);
+            if (f->sp == ld64(next + CTX_R1) && f->pc == ld32(next + CTX_PC)) target = f;
+            else t_dead = f;                  // buffer was re-initialized: that fiber is gone
+        }
+        if (suspend_in) {
+            me->buf = suspend_in, me->sp = ld64(suspend_in + CTX_R1), me->pc = ld32(suspend_in + CTX_PC);
+            g_suspended[suspend_in] = me;
+        }
+    }
+    if (t_dead) reap();
+    if (!target) {
+        target = new Fiber();
+        target->buf = next;
+        target->handle = CreateFiberEx(64 << 10, FIBER_STACK, FIBER_FLAG_FLOAT_SWITCH, fresh_entry, target);
+        if (!target->handle) fatal("CreateFiberEx failed (%lu)", GetLastError());
+    }
+    if (!suspend_in) t_dead = me;
+    t_ctx = ctx;
+    t_cur = target;
+    SwitchToFiber(target->handle);
+    // Resumed: someone restored our buffer.
+    reap();
+    if (t_ctx != ctx) fatal("microthread context 0x%x resumed on another guest thread", suspend_in);
+}
+
+} // namespace
+
+extern "C" void f_0007203c(PPU_CTX) {
+    // yield(cur = r3, scheduler = r4)
+    uint32_t cur = (uint32_t)ctx->r[3], sched = (uint32_t)ctx->r[4];
+    ctx->r[0] = ctx->lr;                      // the guest's mflr r0: save() stores it as the resume address
+    f_00071e10(ctx);
+    ctx->r[3] = sched;
+    f_00072680(ctx);
+    uint32_t next = (uint32_t)ctx->r[3];
+    if (next != cur) switch_to(ctx, next, cur);
+    ctx->r[3] = cur;
+    f_00071f24_guest(ctx);                    // our registers; lr = our caller
+}
+
+extern "C" void f_00071f24(PPU_CTX) {
+    // restore(buf = r3) reached directly (microthread exit): switch for good.
+    switch_to(ctx, (uint32_t)ctx->r[3], 0);
+    fatal("abandoned microthread was resumed");
+}
