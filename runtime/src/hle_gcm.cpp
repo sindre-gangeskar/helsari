@@ -57,6 +57,7 @@ void map_io(uint32_t ea, uint32_t io, uint32_t size) {
 /* ---------------- window / present ---------------- */
 LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { LOG("gcm", "window closed - exiting"); ExitProcess(0); }
+    if (m == WM_KEYDOWN && w == VK_F12) rsx::request_capture();
     return DefWindowProcW(h, m, w, l);
 }
 

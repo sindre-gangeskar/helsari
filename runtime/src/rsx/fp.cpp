@@ -244,7 +244,9 @@ FpInfo translate_fp(const FpKey &key) {
          "  float4 h[64]; [unroll] for (int k = 0; k < 64; k++) h[k] = 0;\n"
          "  float4 cc0 = 0, cc1 = 0;\n"
          "  float face = i.front ? 1 : -1;\n"
-         "  float4 wpos = float4(i.pos.x, wpos_info.x > 0 ? wpos_info.y - i.pos.y : i.pos.y, i.pos.z, 1 / i.pos.w);\n" +
+         // wpos_info: x = origin bottom, y = window height, zw = multisample scale (pixel = sample / scale)
+         "  float2 px = floor(i.pos.xy / wpos_info.zw) + 0.5;\n"
+         "  float4 wpos = float4(px.x, wpos_info.x > 0 ? wpos_info.y - px.y : px.y, i.pos.z, 1 / i.pos.w);\n" +
          body + "  POut o;\n";
     if (fp32) h += "  o.c0 = r[0]; o.c1 = r[2]; o.c2 = r[3]; o.c3 = r[4];\n";
     else h += "  o.c0 = h[0]; o.c1 = h[4]; o.c2 = h[6]; o.c3 = h[8];\n";
