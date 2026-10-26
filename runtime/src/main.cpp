@@ -23,6 +23,7 @@ void register_spurs_tasks();
 void register_sync();
 void hle_dump_counts();
 void rsx_dump_methods();
+void spurs_tasks_dump();
 
 void hle_register_all() {
     register_sys();
@@ -117,6 +118,7 @@ int main(int argc, char **argv) {
                 LOG("watchdog", "most-called imports:");
                 hle_dump_counts();
                 rsx_dump_methods();
+                spurs_tasks_dump();
             }
         }).detach();
     }

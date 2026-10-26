@@ -5,6 +5,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <string>
 
@@ -76,6 +77,11 @@ struct SpuThread {
     struct StalledList { bool active; uint32_t cmd, lsa, list, next, count; };
     StalledList stalled[32] = {};
     uint32_t stall_stat = 0;
+    // Mailboxes: the outbound value is read by the host when the SPU writes the
+    // outbound interrupt mailbox (sys_spu_thread_send_event); the host answers
+    // through the inbound queue.
+    uint32_t out_mbox = 0;
+    std::deque<uint32_t> in_mbox;
 
     // Host hooks. stop(code) runs on STOP/STOPD and returns false to end
     // execution. trap(pc) runs when execution reaches an address marked with

@@ -22,6 +22,7 @@
 #define REG(n) hle_register(#n, hle_##n)
 
 bool spurs_is_native_task(uint32_t taskset, uint32_t elf);   // spurs.cpp
+void spurs_connect_events(spu::SpuThread &s, uint32_t spurs); // spurs_kernel.cpp
 
 namespace {
 
@@ -141,6 +142,7 @@ void task_thread(std::shared_ptr<Task> tp) {
         c.pc = c.gpr[0].w[0] & (spu::LS_SIZE - 4);
         return true;
     };
+    spurs_connect_events(s, spurs);
     s.on_stop = [&t](spu::SpuThread &c, uint32_t code) {
         LOG("spurs", "%s: stop 0x%x at 0x%x", c.name.c_str(), code, c.pc);
         c.dump_history();
@@ -155,7 +157,8 @@ void task_thread(std::shared_ptr<Task> tp) {
     s.gpr[4] = spu::V{{ld32(ts + TS_ARGS), ld32(ts + TS_ARGS + 4), 0, spurs}};
     s.pc = entry;
     bit_set(ts + TS_RUNNING, t.id);
-    LOG("spurs", "%s: start at 0x%x", s.name.c_str(), entry);
+    LOG("spurs", "%s: start at 0x%x (args %08x %08x %08x %08x)", s.name.c_str(), entry, s.gpr[3].w[0], s.gpr[3].w[1],
+        s.gpr[3].w[2], s.gpr[3].w[3]);
     s.run();
     if (!t.done) finish(t, 0);
     LOG("spurs", "%s: finished", s.name.c_str());
@@ -226,14 +229,17 @@ HLE(cellSpursCreateTasksetWithAttribute) {
     RET(0);
 }
 HLE(_cellSpursTaskAttributeInitialize) {
-    // (attr, revision, sdkVersion, elf, context, sizeContext, lsPattern *, argument *)
-    uint32_t a = ARG32(0);
+    // (attr, revision, sdkVersion, elf, const CellSpursTaskSaveConfig *, const CellSpursTaskArgument *)
+    // CellSpursTaskSaveConfig: { eaContext, sizeContext, const CellSpursTaskLsPattern * }
+    uint32_t a = ARG32(0), save = ARG32(4), arg = ARG32(5);
     memset(mem::ptr(a), 0, 256);
     st32(a + TA_ELF, ARG32(3));
-    st32(a + TA_CONTEXT, ARG32(4));
-    st32(a + TA_CONTEXT_SIZE, ARG32(5));
-    if (ARG32(6)) memcpy(mem::ptr(a + TA_LS_PATTERN), mem::ptr(ARG32(6)), 16);
-    if (ARG32(7)) memcpy(mem::ptr(a + TA_ARGS), mem::ptr(ARG32(7)), 16);
+    if (save) {
+        st32(a + TA_CONTEXT, ld32(save));
+        st32(a + TA_CONTEXT_SIZE, ld32(save + 4));
+        if (ld32(save + 8)) memcpy(mem::ptr(a + TA_LS_PATTERN), mem::ptr(ld32(save + 8)), 16);
+    }
+    if (arg) memcpy(mem::ptr(a + TA_ARGS), mem::ptr(arg), 16);
     RET(0);
 }
 HLE(cellSpursTaskAttributeSetExitCodeContainer) { st32(ARG32(0) + TA_EXIT_CODE, ARG32(1)); RET(0); }
@@ -268,6 +274,31 @@ HLE(cellSpursJoinTaskset) {
     RET(0);
 }
 HLE(cellSpursTasksetUnsetExceptionEventHandler) { RET(0); }
+
+// Watchdog: task bitsets of each taskset, and the guest data the last task
+// was pointed at (argument words 0 and 1), to inspect a stalled job queue.
+void spurs_tasks_dump() {
+    std::lock_guard<std::mutex> lk(g_lock);
+    for (auto &[ts, tasks] : g_tasksets) {
+        if (tasks.empty() || !tasks.back()->spu) continue;
+        auto bits = [ts](uint32_t off) { return ld32(ts + off); };
+        LOG("watchdog", "  taskset 0x%x: running %08x ready %08x enabled %08x signalled %08x waiting %08x", ts,
+            bits(TS_RUNNING), bits(TS_READY), bits(TS_ENABLED), bits(TS_SIGNALLED), bits(TS_WAITING));
+        uint32_t info = ts + TS_TASK_INFO + tasks.back()->id * TI_SIZE;
+        uint32_t arg1 = ld32(info + TI_ARGS + 4);
+        uint32_t areas[3] = {ld32(info + TI_ARGS), arg1, arg1 ? ld32(arg1 + 40) : 0};   // [arg1+40]: queue data?
+        for (int a = 0; a < 3; a++) {
+            uint32_t ea = areas[a] & ~127u;
+            if (!ea || ea >= 0xf0000000u) continue;
+            for (uint32_t o = 0; o < 0x100; o += 32) {
+                char line[128];
+                int n = snprintf(line, sizeof line, "    area%d %08x:", a, ea + o);
+                for (uint32_t w = 0; w < 32; w += 4) n += snprintf(line + n, sizeof line - n, " %08x", ld32(ea + o + w));
+                LOG("watchdog", "%s", line);
+            }
+        }
+    }
+}
 
 void register_spurs_tasks() {
     REG(_cellSpursTasksetAttributeInitialize); REG(cellSpursTasksetAttributeSetName);

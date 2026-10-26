@@ -149,7 +149,20 @@ static inline uint64_t divdu_(uint64_t a, uint64_t b) { return b ? a / b : 0; }
 static inline uint64_t cntlzw_(uint64_t x) { return (uint32_t)x ? __builtin_clz((uint32_t)x) : 32; }
 static inline uint64_t cntlzd_(uint64_t x) { return x ? __builtin_clzll(x) : 64; }
 
-/* ---- atomics (lwarx/stwcx. reservation emulated with CAS) ---- */
+/* ---- atomics (lwarx/stwcx. reservation emulated with CAS) ----
+ * Conditional stores take a spinlock per 128-byte line, shared with SPU
+ * PUTLLC, so a lock-line commit (several 64-bit words) is atomic against
+ * them, as on hardware. */
+#define LINE_LOCKS 4096
+extern uint32_t g_line_locks[LINE_LOCKS];
+static inline void line_lock(uint64_t ea) {
+    uint32_t *l = &g_line_locks[(EA(ea) >> 7) & (LINE_LOCKS - 1)];
+    while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(l, __ATOMIC_RELAXED)) __builtin_ia32_pause();
+}
+static inline void line_unlock(uint64_t ea) {
+    __atomic_store_n(&g_line_locks[(EA(ea) >> 7) & (LINE_LOCKS - 1)], 0, __ATOMIC_RELEASE);
+}
 static inline uint64_t lwarx_(PPUContext *ctx, uint64_t ea) {
     ctx->reserve_addr = EA(ea);
     ctx->reserve_val = __builtin_bswap32(__atomic_load_n((uint32_t *)(g_mem + EA(ea)), __ATOMIC_SEQ_CST));
@@ -164,15 +177,21 @@ static inline int stwcx_(PPUContext *ctx, uint64_t ea, uint64_t v) {
     if (ctx->reserve_addr != EA(ea)) return 0;
     ctx->reserve_addr = ~0ull;
     uint32_t expect = __builtin_bswap32((uint32_t)ctx->reserve_val);
-    return __atomic_compare_exchange_n((uint32_t *)(g_mem + EA(ea)), &expect, __builtin_bswap32((uint32_t)v), 0,
-                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    line_lock(ea);
+    int ok = __atomic_compare_exchange_n((uint32_t *)(g_mem + EA(ea)), &expect, __builtin_bswap32((uint32_t)v), 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    line_unlock(ea);
+    return ok;
 }
 static inline int stdcx_(PPUContext *ctx, uint64_t ea, uint64_t v) {
     if (ctx->reserve_addr != EA(ea)) return 0;
     ctx->reserve_addr = ~0ull;
     uint64_t expect = __builtin_bswap64(ctx->reserve_val);
-    return __atomic_compare_exchange_n((uint64_t *)(g_mem + EA(ea)), &expect, __builtin_bswap64(v), 0,
-                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    line_lock(ea);
+    int ok = __atomic_compare_exchange_n((uint64_t *)(g_mem + EA(ea)), &expect, __builtin_bswap64(v), 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    line_unlock(ea);
+    return ok;
 }
 
 /* ---- floating point ---- */

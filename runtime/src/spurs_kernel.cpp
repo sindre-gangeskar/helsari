@@ -19,6 +19,8 @@
 
 #define REG(n) hle_register(#n, hle_##n)
 
+void spurs_connect_events(spu::SpuThread &s, uint32_t spurs);
+
 namespace {
 
 constexpr uint32_t PM_ADDR = 0xa00;
@@ -90,6 +92,7 @@ void workload_thread(Workload *w) {
         t.dump_history();
         return false;
     };
+    spurs_connect_events(s, w->spurs);
     LOG("spurs", "workload %u '%s': policy module 0x%x (%u bytes), arg 0x%llx", w->id, w->name.c_str(), w->pm,
         w->size, (unsigned long long)w->data);
     uint64_t runs = 0;
@@ -121,7 +124,79 @@ void workload_thread(Workload *w) {
     }
 }
 
+// SPU ports attached to event queues with cellSpursAttachLv2EventQueue:
+// spurs -> port -> queue. Every SPU thread of that SPURS instance can send on them.
+std::mutex g_port_lock;
+std::map<uint32_t, std::map<uint32_t, uint32_t>> g_ports;
+
 } // namespace
+
+// Services the outbound interrupt mailbox of an SPU thread running for `spurs`.
+// The top byte of the value selects the call (as sys_spu_thread_* encode it):
+//   0-63    send_event(port, data0, data1): queued event, result to the inbound mailbox
+//   64-127  throw_event: same event, no result
+//   128/192 event_flag_set_bit(flag id in the outbound mailbox, bit); 128 waits for a result
+void spurs_connect_events(spu::SpuThread &s, uint32_t spurs) {
+    s.on_write_channel = [spurs](spu::SpuThread &c, int ch, uint32_t v) {
+        if (ch != spu::SPU_WrOutIntrMbox) {
+            LOG("spu", "%s: write 0x%x to unhandled channel %d", c.name.c_str(), v, ch);
+            return;
+        }
+        uint32_t code = v >> 24;
+        int32_t r;
+        if (code < 128) {
+            uint32_t port = code & 63, queue = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_port_lock);
+                auto &ports = g_ports[spurs];
+                auto it = ports.find(port);
+                if (it != ports.end()) queue = it->second;
+            }
+            // SYS_SPU_THREAD_EVENT_USER_KEY; d1 = SPU thread id, d2 = port << 32 | data0, d3 = data1
+            r = queue ? kern::equeue_push(queue, {0xFFFFFFFF53505501ull, 0, ((uint64_t)port << 32) | (v & 0xffffff),
+                                            c.out_mbox})
+                      : (int32_t)0x80010016;                 // ENOTCONN
+            static std::atomic<int> logs{0};
+            if (r || logs++ < 100)
+                LOG("spurs", "%s: %s_event port %u -> queue 0x%x (data 0x%x 0x%x): 0x%x", c.name.c_str(),
+                    code < 64 ? "send" : "throw", port, queue, v & 0xffffff, c.out_mbox, r);
+            if (code < 64) c.in_mbox.push_back(r);
+        } else if (code == 128 || code == 192) {
+            r = kern::eflag_set(c.out_mbox, 1ull << (v & 63));
+            if (code == 128) c.in_mbox.push_back(r);
+        } else {
+            LOG("spurs", "%s: unknown outbound interrupt mailbox call 0x%x", c.name.c_str(), v);
+            c.in_mbox.push_back(0x80010005);                         // ESRCH
+        }
+    };
+}
+
+HLE(cellSpursAttachLv2EventQueue) {
+    // (spurs, queue, u8 *port, isDynamic): dynamic ports are picked from 0x10..0x3F.
+    uint32_t spurs = ARG32(0), queue = ARG32(1), port_ptr = ARG32(2);
+    bool dynamic = ARG32(3);
+    if (!spurs || !port_ptr) RET(0x80410711);                               // CELL_SPURS_CORE_ERROR_NULL_POINTER
+    std::lock_guard<std::mutex> lk(g_port_lock);
+    auto &ports = g_ports[spurs];
+    uint32_t port = dynamic ? 0x10 : ld8(port_ptr);
+    if (dynamic) {
+        while (port < 64 && ports.count(port)) port++;
+        if (port == 64) RET(0x80410701);                                    // CELL_SPURS_CORE_ERROR_AGAIN
+    } else if (port >= 64) {
+        RET(0x80410702);                                                    // CELL_SPURS_CORE_ERROR_INVAL
+    } else if (ports.count(port)) {
+        RET(0x8041070a);                                                    // CELL_SPURS_CORE_ERROR_BUSY
+    }
+    ports[port] = queue;
+    st8(port_ptr, port);
+    LOG("spurs", "spurs 0x%x: event queue 0x%x attached to SPU port %u", spurs, queue, port);
+    RET(0);
+}
+HLE(cellSpursDetachLv2EventQueue) {
+    // (spurs, port)
+    std::lock_guard<std::mutex> lk(g_port_lock);
+    RET(g_ports[ARG32(0)].erase(ARG32(1) & 0xff) ? 0 : 0x80410705);       // CELL_SPURS_CORE_ERROR_SRCH
+}
 
 HLE(_cellSpursWorkloadAttributeInitialize) {
     // (attr, revision, sdkVersion, pm, size, u64 data, const u8 priority[8], minContention, maxContention)
@@ -196,4 +271,5 @@ void register_spurs_kernel() {
     REG(_cellSpursWorkloadAttributeInitialize); REG(cellSpursWorkloadAttributeSetName);
     REG(cellSpursAddWorkloadWithAttribute); REG(cellSpursReadyCountStore); REG(cellSpursGetWorkloadInfo);
     REG(cellSpursShutdownWorkload); REG(cellSpursWaitForWorkloadShutdown); REG(cellSpursRemoveWorkload);
+    REG(cellSpursAttachLv2EventQueue); REG(cellSpursDetachLv2EventQueue);
 }

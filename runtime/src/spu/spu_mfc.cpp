@@ -1,7 +1,7 @@
 // SPU channels and the MFC (DMA engine). Transfers complete immediately, so
 // tag-status reads never block. Lock-line atomics (GETLLAR/PUTLLC) keep a copy
-// of the reserved 128-byte line and commit with 64-bit compare-and-swap, which
-// interoperates with the PPU's lwarx/stwcx. emulation (also CAS based).
+// of the reserved 128-byte line and commit under the per-line lock that the
+// PPU's stwcx./stdcx. also take, so a multi-word commit is all-or-nothing.
 #include "spu.h"
 
 #include "runtime.h"
@@ -13,8 +13,6 @@
 
 namespace spu {
 namespace {
-
-std::mutex g_atomic_lock;   // serializes SPU lock-line commits against each other
 
 uint8_t *ea_ptr(uint32_t ea) { return (uint8_t *)mem::ptr(ea); }
 
@@ -54,6 +52,15 @@ void SpuThread::mfc_command(uint32_t cmd) {
             LOG("spu", "%s     line: %s", name.c_str(), hex.c_str());
         }
     }
+    // A transfer touching the NULL page is a bug upstream (on hardware it is a DMA fault).
+    bool ea_cmd = (cmd >= 0x20 && cmd <= 0x22) || (cmd >= 0x30 && cmd <= 0x32) || (cmd >= 0x40 && cmd <= 0x42) ||
+                  cmd == 0xb0 || cmd == 0xb4 || cmd == 0xb8 || cmd == 0xd0;
+    if (ea_cmd && ea < 0x10000) {
+        static std::atomic<int> logs{0};
+        if (logs++ < 10)
+            LOG("spu", "%s: mfc cmd 0x%x on NULL page: ea 0x%x lsa 0x%x size 0x%x at pc 0x%x (lr 0x%x)", name.c_str(),
+                cmd, ea, lsa, size, pc, gpr[0].w[0]);
+    }
     switch (cmd) {
     case 0x40: case 0x41: case 0x42:                // GET, GETB, GETF
         memcpy(ls + lsa, ea_ptr(ea), size);
@@ -77,23 +84,22 @@ void SpuThread::mfc_command(uint32_t cmd) {
         uint32_t line = ea & ~127u;
         bool ok = raddr == line;
         if (ok) {
-            std::lock_guard<std::mutex> lk(g_atomic_lock);
             uint64_t *mem64 = (uint64_t *)ea_ptr(line);
             const uint64_t *want = (const uint64_t *)rdata, *src = (const uint64_t *)(ls + (lsa & ~127u));
-            ok = memcmp(mem64, want, 128) == 0;
-            for (int i = 0; ok && i < 16; i++) {
-                if (want[i] == src[i]) continue;
-                uint64_t expect = want[i];
-                ok = __atomic_compare_exchange_n(&mem64[i], &expect, src[i], false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-            }
+            line_lock(line);
+            for (int i = 0; ok && i < 16; i++) ok = __atomic_load_n(&mem64[i], __ATOMIC_SEQ_CST) == want[i];
+            for (int i = 0; ok && i < 16; i++)
+                if (want[i] != src[i]) __atomic_store_n(&mem64[i], src[i], __ATOMIC_SEQ_CST);
+            line_unlock(line);
         }
         raddr = 0;
         atomic_stat = ok ? 0 : 1;                   // 1 = MFC_PUTLLC_FAILURE
         break;
     }
     case 0xb0: case 0xb8: {                         // PUTLLUC, PUTQLLUC
-        std::lock_guard<std::mutex> lk(g_atomic_lock);
+        line_lock(ea);
         memcpy(ea_ptr(ea & ~127u), ls + (lsa & ~127u), 128);
+        line_unlock(ea);
         if (cmd == 0xb0) atomic_stat = 2;           // MFC_PUTLLUC_SUCCESS
         break;
     }
@@ -145,6 +151,9 @@ uint32_t SpuThread::read_channel(int ch) {
     }
     case MFC_RdListStallStat: { uint32_t s = stall_stat; stall_stat = 0; return s; }
     case MFC_RdAtomicStat: { uint32_t s = atomic_stat; atomic_stat = 0; return s; }
+    case SPU_RdInMbox:
+        if (!in_mbox.empty()) { uint32_t v = in_mbox.front(); in_mbox.pop_front(); return v; }
+        [[fallthrough]];
     default:
         if (on_read_channel) return on_read_channel(*this, ch);
         LOG("spu", "%s: read of unhandled channel %d", name.c_str(), ch);
@@ -154,6 +163,7 @@ uint32_t SpuThread::read_channel(int ch) {
 
 void SpuThread::write_channel(int ch, uint32_t v) {
     switch (ch) {
+    case SPU_WrOutMbox: out_mbox = v; break;
     case SPU_WrEventMask: event_mask = v; break;
     case SPU_WrEventAck: event_stat &= ~v; break;
     case SPU_WrDec: dec_value = v, dec_start = ticks_now(), dec_armed = (int32_t)v >= 0; break;
@@ -188,7 +198,8 @@ uint32_t SpuThread::channel_count(int ch) {
     case MFC_Cmd: return 16;                       // free queue slots
     case MFC_RdAtomicStat: return atomic_stat ? 1 : 0;
     case MFC_RdListStallStat: return stall_stat ? 1 : 0;
-    case SPU_RdInMbox: case SPU_RdSigNotify1: case SPU_RdSigNotify2:
+    case SPU_RdInMbox: return !in_mbox.empty() || on_read_channel ? 1 : 0;
+    case SPU_RdSigNotify1: case SPU_RdSigNotify2:
         return on_read_channel ? 1 : 0;
     default: return 1;
     }

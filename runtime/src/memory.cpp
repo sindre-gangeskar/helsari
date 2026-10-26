@@ -12,6 +12,7 @@
 #include <mutex>
 
 uint8_t *g_mem;
+uint32_t g_line_locks[LINE_LOCKS];
 
 namespace mem {
 namespace {
