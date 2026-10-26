@@ -57,20 +57,40 @@ static void backtrace(PPUContext *ctx) {
     log_msg("FATAL", "r3=0x%llx r4=0x%llx r5=0x%llx r11=0x%llx r13=0x%llx r31=0x%llx",
             (unsigned long long)ctx->r[3], (unsigned long long)ctx->r[4], (unsigned long long)ctx->r[5],
             (unsigned long long)ctx->r[11], (unsigned long long)ctx->r[13], (unsigned long long)ctx->r[31]);
-    // KZ2_FATAL_PEEK=addr,addr,...: words to show (prefix 'r13' for TLS-relative, e.g. r13-28068)
+    // KZ2_FATAL_PEEK=addr,addr,...: words to show; rN+off / rN-off are register-relative (e.g. r13-28068)
     if (const char *p = getenv("KZ2_FATAL_PEEK")) {
         std::string list = p;
         size_t i = 0;
         while (i < list.size()) {
             size_t e = list.find(',', i);
             std::string item = list.substr(i, e == std::string::npos ? std::string::npos : e - i);
-            uint32_t a = item.rfind("r13", 0) == 0 ? (uint32_t)(ctx->r[13] + strtoll(item.c_str() + 3, nullptr, 0))
-                                                   : (uint32_t)strtoull(item.c_str(), nullptr, 0);
+            uint32_t a;
+            if (item[0] == 'r') {               // register-relative: rN+off / rN-off
+                char *end;
+                long reg = strtol(item.c_str() + 1, &end, 10);
+                a = (uint32_t)(ctx->r[reg & 31] + strtoll(end, nullptr, 0));
+            } else {
+                a = (uint32_t)strtoull(item.c_str(), nullptr, 0);
+            }
             log_msg("FATAL", "  [%s] 0x%x = 0x%08x 0x%08x", item.c_str(), a, ld32(a), ld32(a + 4));
             if (e == std::string::npos) break;
             i = e + 1;
         }
     }
+}
+
+void guest_null_write(uint32_t ea) {
+    PPUContext *ctx = thread::current();
+    if (ctx) {
+        backtrace(ctx);
+        // The game's fatal-error functions format their message into a stack
+        // buffer at r1+0x70 just before the deliberate NULL write.
+        std::string msg = mem::cstr((uint32_t)ctx->r[1] + 0x70);
+        bool printable = !msg.empty();
+        for (char c : msg) printable &= (c >= 32 && c < 127) || c == 10 || c == 9;
+        if (printable) log_msg("FATAL", "game error message: %s", msg.substr(0, 1024).c_str());
+    }
+    fatal("guest write to NULL page (0x%x) - the game hit a fatal error", ea);
 }
 
 /* ---------------- function table ---------------- */

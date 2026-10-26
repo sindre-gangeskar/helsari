@@ -43,6 +43,10 @@ std::string cstr(uint32_t ea);
 void write_cstr(uint32_t ea, const std::string &s, size_t max);
 }
 
+/* Report a guest write to the NULL page (the game's deliberate crash after a
+   fatal error) with backtrace and the error message, then exit. */
+[[noreturn]] void guest_null_write(uint32_t ea);
+
 /* ---- logging ---- */
 void log_msg(const char *chan, const char *fmt, ...);
 #define LOG(chan, ...) log_msg(chan, __VA_ARGS__)

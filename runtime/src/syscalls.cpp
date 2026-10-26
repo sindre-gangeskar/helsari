@@ -13,6 +13,12 @@
 using namespace kern;
 
 namespace {
+// sys_memory_allocate accounting: user memory the game has taken out of its 213 MB.
+constexpr uint32_t USER_MEMORY_TOTAL = 0x0d500000;
+std::mutex g_user_lock;
+std::map<uint32_t, uint32_t> g_user_blocks;
+uint32_t g_user_used = 0;
+
 uint64_t usec_now() {
     using namespace std::chrono;
     return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
@@ -136,15 +142,38 @@ uint32_t syscall_dispatch(PPUContext *ctx, uint64_t n) {
 
     /* ---- memory ---- */
     case 348: case 350: {                                // sys_memory_allocate[_from_container]
+        // User memory is 213 MB in total; report and enforce what the game
+        // has left, as the game sizes its heaps from sys_memory_get_user_memory_size.
         uint32_t size = ARG32(0), flags = ARG32(n == 348 ? 1 : 2), out = ARG32(n == 348 ? 2 : 3);
-        uint32_t a = mem::alloc(size, (flags & 0x400) ? 0x100000 : 0x10000);
+        uint32_t align = (flags & 0x400) ? 0x100000 : 0x10000;
+        size = (size + align - 1) & ~(align - 1);
+        std::lock_guard<std::mutex> lk(g_user_lock);
+        if (g_user_used + size > USER_MEMORY_TOTAL) {
+            LOG("mem", "sys_memory_allocate(0x%x) refused: 0x%x of 0x%x in use", size, g_user_used, USER_MEMORY_TOTAL);
+            return ENOMEM;
+        }
+        uint32_t a = mem::alloc(size, align);
         if (!a) return ENOMEM;
+        g_user_blocks[a] = size;
+        g_user_used += size;
+        if (size >= 0x100000) LOG("mem", "sys_memory_allocate(0x%x) -> 0x%x (0x%x in use)", size, a, g_user_used);
         put32(out, a);
         return OK;
     }
-    case 349: mem::free(ARG32(0)); return OK;
+    case 349: {                                          // sys_memory_free
+        std::lock_guard<std::mutex> lk(g_user_lock);
+        auto it = g_user_blocks.find(ARG32(0));
+        if (it != g_user_blocks.end()) { g_user_used -= it->second; g_user_blocks.erase(it); }
+        mem::free(ARG32(0));
+        return OK;
+    }
     case 351: put64(ARG32(1), 0x40000ull); put64(ARG32(1) + 8, 0xf); put32(ARG32(1) + 16, 0x100000); return OK;
-    case 352: put32(ARG32(0), 0x0d500000); put32(ARG32(0) + 4, 0x0a000000); return OK; // total/available
+    case 352: {                                          // sys_memory_get_user_memory_size(total, available)
+        std::lock_guard<std::mutex> lk(g_user_lock);
+        put32(ARG32(0), USER_MEMORY_TOTAL);
+        put32(ARG32(0) + 4, USER_MEMORY_TOTAL - g_user_used);
+        return OK;
+    }
     case 324: put32(ARG32(0), 0x30000001); return OK;    // memory_container_create
     case 325: return OK;
     case 330: {                                          // mmapper_allocate_address(size, flags, align, *addr)

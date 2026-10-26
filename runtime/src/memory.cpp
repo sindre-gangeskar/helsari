@@ -29,6 +29,9 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
     auto addr = (uint8_t *)er->ExceptionInformation[1];
     if (addr < g_mem || addr >= g_mem + RESERVE) return EXCEPTION_CONTINUE_SEARCH;
     uint64_t ea = (uint64_t)(addr - g_mem);
+    // A write to the NULL page is how the game crashes on purpose after a
+    // fatal error (it stores 0x0deadca7 to address 0); on hardware it faults.
+    if (ea < ELF_BASE && er->ExceptionInformation[0] == 1) guest_null_write((uint32_t)ea);
     if (ea < ELF_BASE && g_fault_logs < 20) {
         g_fault_logs++;
         LOG("mem", "guest NULL-page access at 0x%llx (rip=%p) - committing zero page", ea, (void *)ep->ContextRecord->Rip);
