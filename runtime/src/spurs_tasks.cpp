@@ -29,6 +29,8 @@ constexpr uint32_t TASK_TOP = 0x3000, TASK_BOTTOM = 0x40000;
 constexpr uint32_t SYSCALL_ADDR = 0xa70;
 constexpr uint32_t TASK_RETURN_ADDR = 0xa80;     // where a task's main() returns to
 constexpr uint32_t KERNEL_CTX = 0x100, TASKSET_CTX = 0x2700;
+// Inside the PM's stack area (0x2850..0x2C80), unused by tasks.
+constexpr uint32_t SERVICE_TRAPS = 0x2900, SERVICE_TABLE = 0x2a00, SERVICE_SPAN = 0x100;
 enum { SYS_EXIT = 0, SYS_YIELD = 1, SYS_WAIT_SIGNAL = 2, SYS_POLL = 3, SYS_RECV_WKL_FLAG = 4 };
 
 // CellSpursTaskset offsets
@@ -110,10 +112,28 @@ void task_thread(std::shared_ptr<Task> tp) {
     s.set_ls32(0x2fbc, TASK_TOP);                                           // guidAddr
     memcpy(s.ls + 0x2780, mem::ptr(info), TI_SIZE);                          // task info copy
 
+    // Taskset PM service table (tasksetMgmtAddr, 0x2FB8): libspurs calls
+    // entries through it (e.g. +0xC4). Each entry points at its own trapped
+    // address; calls are logged until the services are implemented.
+    for (uint32_t k = 0; k < SERVICE_SPAN; k += 4) {
+        s.set_ls32(SERVICE_TABLE + k, SERVICE_TRAPS + k);
+        s.set_trap(SERVICE_TRAPS + k);
+    }
+    s.set_ls32(0x2fb8, SERVICE_TABLE);
     s.set_trap(SYSCALL_ADDR);
     s.set_trap(TASK_RETURN_ADDR);
     s.on_trap = [&t, ts](spu::SpuThread &c) {
         if (c.pc == TASK_RETURN_ADDR) { finish(t, c.gpr[3].w[0]); return false; }
+        if (c.pc >= SERVICE_TRAPS && c.pc < SERVICE_TRAPS + SERVICE_SPAN) {
+            static std::atomic<uint64_t> seen{0};
+            uint32_t off = c.pc - SERVICE_TRAPS;
+            if (!(seen.fetch_or(1ull << (off / 4)) & (1ull << (off / 4))))
+                LOG("spurs", "%s: taskset service +0x%x called (r3=0x%x r4=0x%x r5=0x%x) - not implemented, returns 0",
+                    c.name.c_str(), off, c.gpr[3].w[0], c.gpr[4].w[0], c.gpr[5].w[0]);
+            c.gpr[3] = spu::V{{0, 0, 0, 0}};
+            c.pc = c.gpr[0].w[0] & (spu::LS_SIZE - 4);
+            return true;
+        }
         uint32_t num = c.gpr[3].w[0] & 0xf, ret = 0;
         switch (num) {
         case SYS_EXIT:
