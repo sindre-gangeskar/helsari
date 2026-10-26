@@ -106,9 +106,12 @@ FpInfo translate_fp(const FpKey &key) {
         std::string texs = "t" + std::to_string(tex), smp = "s" + std::to_string(tex);
         auto sample = [&](const std::string &coord, const std::string &fn = "Sample", const std::string &extra = "") {
             used_tex[tex] = true;
-            uint8_t dim = key.texdim[tex] & 0x7f;
+            uint8_t dim = key.texdim[tex] & TEX_DIM_MASK;
             std::string cs = dim == TEX_2D ? "(" + coord + ").xy" : "(" + coord + ").xyz";
             if (key.texdim[tex] & TEX_UNNORM) cs = "(" + cs + " * texscale[" + std::to_string(tex) + "].xy)";
+            // Shadow lookup: compare z against the stored depth, filtered (PCF); every component is the result.
+            if ((key.texdim[tex] & TEX_SHADOW) && dim == TEX_2D)
+                return texs + ".SampleCmpLevelZero(" + smp + ", " + cs + ", (" + coord + ").z).xxxx";
             return texs + "." + fn + "(" + smp + ", " + cs + extra + ")";
         };
         std::string e;
@@ -225,10 +228,11 @@ FpInfo translate_fp(const FpKey &key) {
     std::string h = w;
     for (int t = 0; t < 16; t++) {
         if (!used_tex[t]) continue;
-        uint8_t dim = key.texdim[t] & 0x7f;
+        uint8_t dim = key.texdim[t] & TEX_DIM_MASK;
         const char *ty = dim == TEX_CUBE ? "TextureCube" : dim == TEX_3D ? "Texture3D" : "Texture2D";
         h += std::string(ty) + " t" + std::to_string(t) + " : register(t" + std::to_string(t) + ");\n";
-        h += "SamplerState s" + std::to_string(t) + " : register(s" + std::to_string(t) + ");\n";
+        h += std::string(key.texdim[t] & TEX_SHADOW ? "SamplerComparisonState" : "SamplerState") + " s" +
+             std::to_string(t) + " : register(s" + std::to_string(t) + ");\n";
     }
     h += "cbuffer PX : register(b0) { float4 alpha_ref; float4 wpos_info; float4 texscale[16]; float4 fc[128]; };\n"
          "float4 pk4(float4 v) { uint4 b = (uint4)round(saturate(v) * 255); return asfloat((b.x | b.y << 8 | b.z << 16 | b.w << 24)).xxxx; }\n"

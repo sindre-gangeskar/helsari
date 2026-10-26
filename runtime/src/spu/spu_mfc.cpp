@@ -10,11 +10,37 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace spu {
 namespace {
 
 uint8_t *ea_ptr(uint32_t ea) { return (uint8_t *)mem::ptr(ea); }
+
+// KZ2_SPU_WATCH="ea:len,ea:len" logs every SPU transfer overlapping those
+// guest ranges (who reads or writes a buffer), at most 20000 lines.
+struct WatchRange { uint32_t ea, len; };
+const std::vector<WatchRange> &watch_ranges() {
+    static std::vector<WatchRange> v = [] {
+        std::vector<WatchRange> r;
+        if (const char *p = getenv("KZ2_SPU_WATCH"))
+            for (const char *s = p; *s;) {
+                char *end;
+                uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 4;
+                r.push_back({a, n});
+                s = *end == ',' ? end + 1 : end;
+            }
+        return r;
+    }();
+    return v;
+}
+void watch(const SpuThread &t, const char *what, uint32_t cmd, uint32_t ea, uint32_t lsa, uint32_t size) {
+    static std::atomic<int> logs{0};
+    for (auto &w : watch_ranges())
+        if (ea < w.ea + w.len && w.ea < ea + size && logs++ < 20000)
+            LOG("spu", "watch: %s %s cmd 0x%x ea 0x%x size 0x%x lsa 0x%x pc 0x%x", t.name.c_str(), what, cmd, ea, size, lsa,
+                t.pc);
+}
 
 // Decrementer ticks at the 79.8 MHz timebase.
 uint64_t ticks_now() {
@@ -55,6 +81,8 @@ void SpuThread::mfc_command(uint32_t cmd) {
     // A transfer touching the NULL page is a bug upstream (on hardware it is a DMA fault).
     bool ea_cmd = (cmd >= 0x20 && cmd <= 0x22) || (cmd >= 0x30 && cmd <= 0x32) || (cmd >= 0x40 && cmd <= 0x42) ||
                   cmd == 0xb0 || cmd == 0xb4 || cmd == 0xb8 || cmd == 0xd0;
+    if (ea_cmd && !watch_ranges().empty())
+        watch(*this, (cmd & 0xf0) == 0x40 || cmd == 0xd0 ? "get" : "put", cmd, ea, lsa, cmd >= 0xb0 ? 128 : size);
     if (ea_cmd && ea < 0x10000) {
         static std::atomic<int> logs{0};
         if (logs++ < 10)
@@ -118,6 +146,7 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
     bool get = cmd & 0x40;
     for (uint32_t i = first; i < count; i++) {
         uint32_t ts = ls32(list + 8 * i), eal = ls32(list + 8 * i + 4), sz = ts & 0x7fff;
+        if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, lsa, sz);
         if (get) memcpy(ls + lsa, ea_ptr(eal), sz);
         else memcpy(ea_ptr(eal), ls + lsa, sz);
         lsa = (lsa + sz + 15) & (LS_SIZE - 16);

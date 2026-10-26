@@ -64,6 +64,8 @@ int g_step_dumps;   // per-draw dumps taken in the current capture
 ID3D11VertexShader *g_present_vs;
 ID3D11PixelShader *g_present_ps;
 ID3D11PixelShader *g_depth_color_ps;    // depth -> RSX D24S8 bytes as A8R8G8B8
+ID3D11PixelShader *g_reinterpret_ps;    // A8R8G8B8 texels -> another 32-bit texture format
+ID3D11Buffer *g_cb_pass;                // mode constant for the conversion passes
 std::unordered_map<uint64_t, ID3D11VertexShader *> g_vs;
 struct PsEntry { ID3D11PixelShader *ps; std::vector<uint32_t> consts; };
 std::unordered_map<uint64_t, PsEntry> g_ps;
@@ -160,6 +162,11 @@ struct Surface {
     ID3D11Texture2D *as_color = nullptr;
     ID3D11RenderTargetView *as_color_rtv = nullptr;
     ID3D11ShaderResourceView *as_color_srv = nullptr;
+    // Colour surface read through a texture format with another layout, see reinterpret_view().
+    uint32_t view_fmt = 0;
+    ID3D11Texture2D *view = nullptr;
+    ID3D11RenderTargetView *view_rtv = nullptr;
+    ID3D11ShaderResourceView *view_srv = nullptr;
 };
 
 // The RSX lets a shader sample the surface it is rendering to; D3D11 does
@@ -203,6 +210,7 @@ Surface *get_surface(uint32_t ea, uint32_t fmt, uint32_t w, uint32_t h, bool dep
     uint32_t nw = std::max(w, s.fmt == fmt ? s.w : 0), nh = std::max(h, s.fmt == fmt ? s.h : 0);
     release(s.rtv); release(s.dsv); release(s.srv); release(s.tex); release(s.copy_srv); release(s.copy); release(s.staging);
     release(s.as_color_srv); release(s.as_color_rtv); release(s.as_color);
+    release(s.view_srv); release(s.view_rtv); release(s.view);
     s = Surface{};
     s.ea = ea, s.fmt = fmt, s.w = nw, s.h = nh, s.depth = depth, s.last_frame = g_frame;
     D3D11_TEXTURE2D_DESC d{};
@@ -320,6 +328,23 @@ DXGI_FORMAT decode(uint32_t ea, uint32_t fmt, uint32_t w, uint32_t h, uint32_t p
         memcpy(out.data(), mem::ptr(ea), out.size());
         return base == 0x86 ? DXGI_FORMAT_BC1_UNORM : base == 0x87 ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
     }
+    // One or two components per big-endian word: swap each word into a
+    // matching D3D format (Y16_X16: Y in the high half, so X lands in R).
+    if (base == 0x94 || base == 0x95 || base == 0x9c || base == 0x9f) {
+        uint32_t bpp = base == 0x94 ? 2 : 4;
+        if (!pitch || !linear) pitch = w * bpp;
+        uint32_t lw = log2u(w), lh = log2u(h);
+        const uint8_t *src = (const uint8_t *)mem::ptr(ea);
+        row = w * bpp;
+        out.resize((size_t)row * h);
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                size_t o = linear ? (size_t)y * pitch + (size_t)x * bpp : (size_t)swizzled_offset(x, y, lw, lh) * bpp;
+                for (uint32_t k = 0; k < bpp; k++) out[(size_t)y * row + x * bpp + k] = src[o + bpp - 1 - k];
+            }
+        return base == 0x94 ? DXGI_FORMAT_R16_UNORM : base == 0x95 ? DXGI_FORMAT_R16G16_UNORM
+             : base == 0x9c ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16_FLOAT;
+    }
     uint32_t bpp;
     switch (base) {
     case 0x81: bpp = 1; break;
@@ -422,20 +447,11 @@ void write_back_surface(uint32_t ea, Surface &s) {
     if (logs++ < 10) LOG("rsx", "write-back surface 0x%x fmt %u %ux%u pitch 0x%x", ea, s.fmt, w, h, s.pitch);
 }
 
-// Games read the depth buffer through an A8R8G8B8 texture and rebuild the
-// 24-bit depth from its bytes. In memory a D24S8 word is depth[23:16],
-// depth[15:8], depth[7:0], stencil, i.e. A, R, G, B. Render that encoding
-// into a colour texture (stencil reads as 0).
-ID3D11ShaderResourceView *depth_as_color(Surface &s) {
-    if (!s.as_color) {
-        D3D11_TEXTURE2D_DESC d{};
-        d.Width = s.w, d.Height = s.h, d.MipLevels = 1, d.ArraySize = 1, d.SampleDesc.Count = 1;
-        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &s.as_color))) return nullptr;
-        g_dev->CreateRenderTargetView(s.as_color, nullptr, &s.as_color_rtv);
-        g_dev->CreateShaderResourceView(s.as_color, nullptr, &s.as_color_srv);
-    }
+// Full-screen conversion pass from src into dst (w x h) with pixel shader ps
+// and a mode constant. Runs while a draw is being set up, so the bound
+// targets and viewport are restored (everything else is set again later).
+void run_pass(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, uint32_t w, uint32_t h,
+              ID3D11PixelShader *ps, uint32_t mode = 0) {
     ID3D11RenderTargetView *rtv[4];
     ID3D11DepthStencilView *dsv;
     g_ctx->OMGetRenderTargets(4, rtv, &dsv);
@@ -445,16 +461,19 @@ ID3D11ShaderResourceView *depth_as_color(Surface &s) {
 
     ID3D11ShaderResourceView *none[16] = {};
     g_ctx->PSSetShaderResources(0, 16, none);
-    g_ctx->OMSetRenderTargets(1, &s.as_color_rtv, nullptr);
-    D3D11_VIEWPORT cv{0, 0, (float)s.w, (float)s.h, 0, 1};
+    g_ctx->OMSetRenderTargets(1, &dst, nullptr);
+    D3D11_VIEWPORT cv{0, 0, (float)w, (float)h, 0, 1};
     g_ctx->RSSetViewports(1, &cv);
     g_ctx->RSSetState(nullptr);
     g_ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
     g_ctx->OMSetDepthStencilState(nullptr, 0);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_ctx->VSSetShader(g_present_vs, nullptr, 0);
-    g_ctx->PSSetShader(g_depth_color_ps, nullptr, 0);
-    g_ctx->PSSetShaderResources(0, 1, &s.srv);
+    g_ctx->PSSetShader(ps, nullptr, 0);
+    uint32_t m[4] = {mode, 0, 0, 0};
+    upload_cb(g_cb_pass, m, sizeof m);
+    g_ctx->PSSetConstantBuffers(0, 1, &g_cb_pass);
+    g_ctx->PSSetShaderResources(0, 1, &src);
     g_ctx->Draw(3, 0);
     g_ctx->PSSetShaderResources(0, 16, none);
 
@@ -462,7 +481,58 @@ ID3D11ShaderResourceView *depth_as_color(Surface &s) {
     if (nvp) g_ctx->RSSetViewports(1, &vp);
     for (auto *r : rtv) release(r);
     release(dsv);
+}
+
+// A render target texture of w x h in format f, with views.
+bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, ID3D11Texture2D *&tex, ID3D11RenderTargetView *&rtv,
+                 ID3D11ShaderResourceView *&srv) {
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = w, d.Height = h, d.MipLevels = 1, d.ArraySize = 1, d.SampleDesc.Count = 1;
+    d.Format = f;
+    d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &tex))) return false;
+    g_dev->CreateRenderTargetView(tex, nullptr, &rtv);
+    g_dev->CreateShaderResourceView(tex, nullptr, &srv);
+    return true;
+}
+
+// Games read the depth buffer through an A8R8G8B8 texture and rebuild the
+// 24-bit depth from its bytes. In memory a D24S8 word is depth[23:16],
+// depth[15:8], depth[7:0], stencil, i.e. A, R, G, B. Render that encoding
+// into a colour texture (stencil reads as 0).
+ID3D11ShaderResourceView *depth_as_color(Surface &s) {
+    if (!s.as_color && !make_target(s.w, s.h, DXGI_FORMAT_R8G8B8A8_UNORM, s.as_color, s.as_color_rtv, s.as_color_srv))
+        return nullptr;
+    run_pass(s.srv, s.as_color_rtv, s.w, s.h, g_depth_color_ps);
     return s.as_color_srv;
+}
+
+// A 32-bit colour surface read through a texture format with another
+// layout: rebuild each pixel's RSX word (A<<24 | R<<16 | G<<8 | B) and decode
+// it as the texture format would. Killzone 2 packs two half floats per pixel
+// into an A8R8G8B8 G-buffer target and reads them back as Y16_X16_FLOAT.
+bool reinterpretable(uint32_t base) { return base == 0x9f || base == 0x95 || base == 0x9c; }
+ID3D11ShaderResourceView *reinterpret_view(Surface &s, uint32_t base) {
+    if (s.view_fmt != base) {
+        release(s.view_srv), release(s.view_rtv), release(s.view);
+        s.view_fmt = 0;
+        if (!make_target(s.w, s.h, DXGI_FORMAT_R32G32B32A32_FLOAT, s.view, s.view_rtv, s.view_srv)) return nullptr;
+        s.view_fmt = base;
+    }
+    run_pass(s.srv, s.view_rtv, s.w, s.h, g_reinterpret_ps, base);
+    return s.view_srv;
+}
+
+// Does a surface of format sfmt hold texels exactly as texture format base reads them?
+bool same_layout(uint32_t sfmt, uint32_t base) {
+    switch (sfmt) {
+    case 0x9: return base == 0x81;                                  // B8
+    case 0xa: return base == 0x8b;                                  // G8B8
+    case 0xb: return base == 0x9a;                                  // RGBA16F
+    case 0xc: return base == 0x9b;                                  // RGBA32F
+    case 0xd: return base == 0x9c;                                  // X32F
+    default: return base == 0x85 || base == 0x9e;                   // 32-bit ARGB
+    }
 }
 
 ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
@@ -484,15 +554,23 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         bool depth_fmt = base >= 0x90 && base <= 0x93;
         auto ds = g_depth_surfaces.find(ea);
         bool ds_fits = ds != g_depth_surfaces.end() && ds->second.w == w && ds->second.h == h;
-        if (depth_fmt && ds_fits) return ds->second.srv;
+        if (depth_fmt && ds_fits) {
+            if (reg(b + 8) >> 28) dim = (TexDim)(dim | TEX_SHADOW);           // compare function set
+            return ds->second.srv;
+        }
         // The same memory is often reused for buffers of another size (a shadow
         // map, later a 640x360 post-processing target): only a surface of the
         // texture's size can stand in for it; otherwise read guest memory,
         // where the surface was written back.
         auto s = g_surfaces.find(ea);
         if (s != g_surfaces.end()) {
-            if (s->second.w == w && s->second.h == h) return s->second.srv;
-            write_back_surface(ea, s->second);
+            Surface &rt = s->second;
+            if (rt.w == w && rt.h == h) {
+                if (same_layout(rt.fmt, base)) return rt.srv;
+                if (color_format(rt.fmt) == DXGI_FORMAT_R8G8B8A8_UNORM && reinterpretable(base))
+                    return reinterpret_view(rt, base);
+            }
+            write_back_surface(ea, rt);
         }
         if (ds_fits && base == 0x85) return depth_as_color(ds->second);    // A8R8G8B8 view of D24S8
         if (ds != g_depth_surfaces.end()) write_back_surface(ea, ds->second);
@@ -543,10 +621,11 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
 }
 
 std::unordered_map<uint64_t, ID3D11SamplerState *> g_samplers;
-ID3D11SamplerState *get_sampler(int unit) {
+// shadow: depth texture compared against the lookup z with the address register's zfunc.
+ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     uint32_t b = 0x1a00 + unit * 32;
     uint32_t addr = reg(b + 8), filt = reg(b + 0x14);
-    uint64_t key = ((uint64_t)addr << 32) | (filt & 0xffff0000);
+    uint64_t key = ((uint64_t)addr << 32) | (filt & 0xffff0000) | shadow;
     auto it = g_samplers.find(key);
     if (it != g_samplers.end()) return it->second;
     auto wrap = [](uint32_t m) {
@@ -561,11 +640,13 @@ ID3D11SamplerState *get_sampler(int unit) {
     D3D11_SAMPLER_DESC d{};
     bool lin = ((filt >> 24) & 0xff) != 1;
     d.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (shadow) d.Filter = lin ? D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT : D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
     d.AddressU = wrap(addr & 0xf);
     d.AddressV = wrap((addr >> 8) & 0xf);
     d.AddressW = wrap((addr >> 16) & 0xf);
     d.MaxLOD = D3D11_FLOAT32_MAX;
-    d.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    // RSX zfunc 0..7 (never, less, equal, lequal, greater, notequal, gequal, always) = D3D11 func - 1
+    d.ComparisonFunc = shadow ? (D3D11_COMPARISON_FUNC)((addr >> 28) + 1) : D3D11_COMPARISON_NEVER;
     ID3D11SamplerState *s = nullptr;
     g_dev->CreateSamplerState(&d, &s);
     g_samplers[key] = s;
@@ -758,6 +839,7 @@ D3D11_PRIMITIVE_TOPOLOGY gen_indices(uint32_t prim, const uint32_t *idx, uint32_
 }
 
 /* ---------------- shaders for a draw ---------------- */
+uint64_t g_vs_hash;   // of the program used by the current draw (frame capture log)
 ID3D11VertexShader *vertex_shader() {
     uint32_t start = reg(0x1ea0) & 511;
     uint64_t h = 1469598103934665603ull;
@@ -765,6 +847,7 @@ ID3D11VertexShader *vertex_shader() {
         h = fnv(&vp_ucode[i * 4], 16, h);
         if (vp_ucode[i * 4 + 3] & 1) break;
     }
+    g_vs_hash = h;
     auto it = g_vs.find(h);
     if (it != g_vs.end()) return it->second;
     VpInfo vi = translate_vp(start);
@@ -914,7 +997,7 @@ void draw() {
         srv[t] = get_texture(t, d);
         texdim[t] = d;
         if ((reg(0x1a04 + t * 32) >> 8) & 0x40) texdim[t] |= TEX_UNNORM;
-        smp[t] = get_sampler(t);
+        smp[t] = get_sampler(t, texdim[t] & TEX_SHADOW);
     }
     PsEntry *ps = pixel_shader(fp_ea, texdim);
     if (!vs || !ps->ps) return;
@@ -968,12 +1051,23 @@ void draw() {
                                               std::to_string(rt->second.w) + "x" + std::to_string(rt->second.h) + ")").c_str()
                                            : "");
             }
+        // Vertex shader and the first vertices' attributes: every full-screen pass, or KZ2_LOG_ATTRS=<draw>.
         static int attr_draw = getenv("KZ2_LOG_ATTRS") ? atoi(getenv("KZ2_LOG_ATTRS")) : -1;
-        if (g_draws_this_frame == attr_draw) {
-            float vv[64];
-            fetch_vertex(vv, vmin);
-            for (int a = 0; a < 16; a++) if (reg(0x1ff0) & (1 << a))
-                LOG("draw", "   attr%d fmt=%08x off=%08x: %g %g %g %g", a, reg(0x1740 + a * 4), reg(0x1680 + a * 4), vv[a * 4], vv[a * 4 + 1], vv[a * 4 + 2], vv[a * 4 + 3]);
+        if (g_draws_this_frame == attr_draw || list.size() <= 6) {
+            LOG("draw", "   vs=%016llx inputs=%04x outputs=%08x", (unsigned long long)g_vs_hash, reg(0x1ff0), reg(0x1ff4));
+            for (int k = 464; k < 468; k++)
+                LOG("draw", "   c[%d] = %g %g %g %g", k, vp_consts[k * 4], vp_consts[k * 4 + 1], vp_consts[k * 4 + 2],
+                    vp_consts[k * 4 + 3]);
+            LOG("draw", "   viewport scale %g %g %g offset %g %g %g, clip %08x %08x, origin %08x", regf(0x0a30),
+                regf(0x0a34), regf(0x0a38), regf(0x0a20), regf(0x0a24), regf(0x0a28), reg(0x0200), reg(0x0204),
+                reg(0x1d88));
+            for (uint32_t v = 0; v < 3; v++) {
+                float vv[64];
+                fetch_vertex(vv, vmin + v);
+                for (int a = 0; a < 16; a++) if (reg(0x1ff0) & (1 << a))
+                    LOG("draw", "   v%u attr%d fmt=%08x off=%08x: %g %g %g %g", v, a, reg(0x1740 + a * 4), reg(0x1680 + a * 4),
+                        vv[a * 4], vv[a * 4 + 1], vv[a * 4 + 2], vv[a * 4 + 3]);
+            }
         }
     }
 
@@ -994,8 +1088,11 @@ void draw() {
     g_ctx->IASetIndexBuffer(g_ibuf.buf, DXGI_FORMAT_R32_UINT, 0);
     g_ctx->IASetPrimitiveTopology(topo);
     g_ctx->DrawIndexed((UINT)list.size(), 0, 0);
-    for (auto *c : b.color) if (c) c->dirty = true;
-    if (b.depth) b.depth->dirty = true;
+    // Only what the RSX would write is dirty: a zeta buffer stays bound while depth
+    // and stencil are off, and depth-only passes mask colour writes.
+    if (reg(0x0324)) for (auto *c : b.color) if (c) c->dirty = true;
+    bool zwrite = ((reg(0x0a74) & 1) && (reg(0x0a70) & 1)) || (reg(0x0328) & 1);
+    if (b.depth && zwrite) b.depth->dirty = true;
     // Capture: after each small draw (post-processing quads), save its target.
     // (Square targets are shadow maps: skipped.)
     if ((int)g_frame == g_log_frame && list.size() <= 96 && b.color[0] && b.color[0]->w != b.color[0]->h &&
@@ -1048,6 +1145,24 @@ bool create_device() {
     D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &code, &err);
     g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_present_ps);
     code->Release();
+    static const char REINTERPRET_HLSL[] =
+        "Texture2D<float4> c : register(t0);\n"
+        "cbuffer M : register(b0) { uint4 mode; };\n"
+        "float4 ps(float4 p : SV_Position) : SV_Target {\n"
+        "  uint4 b = (uint4)round(saturate(c.Load(int3(p.xy, 0))) * 255);\n"
+        "  uint w = b.a << 24 | b.r << 16 | b.g << 8 | b.b;\n"
+        "  if (mode.x == 0x9f) return float4(f16tof32(w & 0xffff), f16tof32(w >> 16), 0, 1);\n"
+        "  if (mode.x == 0x95) return float4((w & 0xffff) / 65535.0, (w >> 16) / 65535.0, 0, 1);\n"
+        "  if (mode.x == 0x9c) return asfloat(w).xxxx;\n"
+        "  return float4(b) / 255.0; }\n";
+    if (FAILED(D3DCompile(REINTERPRET_HLSL, sizeof REINTERPRET_HLSL - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0,
+                          &code, &err))) {
+        LOG("rsx", "reinterpret shader: %s", err ? (const char *)err->GetBufferPointer() : "?");
+    } else {
+        g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_reinterpret_ps);
+        code->Release();
+    }
+    g_cb_pass = make_cb(16);
     static const char DEPTH_COLOR_HLSL[] =
         "Texture2D<float> d : register(t0);\n"
         "float4 ps(float4 p : SV_Position) : SV_Target {\n"
@@ -1213,8 +1328,11 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     g_swap->Present(0, 0);
 }
 
+void write_back();
 void copy_m2mf() {
-    // NV0039: line-by-line copy between local and main memory
+    // NV0039: line-by-line copy between local and main memory. The source may
+    // be a surface rendered earlier in the stream: write it back first.
+    write_back();
     uint32_t in = ea_for(dma_location(reg(0x2184)), reg(0x230c));
     uint32_t out = ea_for(dma_location(reg(0x2188)), reg(0x2310));
     int32_t pin = (int32_t)reg(0x2314), pout = (int32_t)reg(0x2318);
