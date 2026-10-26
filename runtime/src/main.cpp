@@ -21,6 +21,7 @@ void register_spurs();
 void register_spurs_kernel();
 void register_spurs_tasks();
 void register_sync();
+void register_savedata();
 void hle_dump_counts();
 void rsx_dump_methods();
 void spurs_tasks_dump();
@@ -33,6 +34,7 @@ void hle_register_all() {
     register_spurs_kernel();
     register_spurs_tasks();
     register_sync();
+    register_savedata();
 }
 
 static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }

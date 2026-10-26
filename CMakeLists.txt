@@ -52,6 +52,7 @@ add_executable(kz2
   runtime/src/spurs_kernel.cpp
   runtime/src/spurs_tasks.cpp
   runtime/src/sync.cpp
+  runtime/src/savedata.cpp
   runtime/src/spu/spu_interp.cpp
   runtime/src/spu/spu_mfc.cpp
   runtime/src/inflate.cpp
