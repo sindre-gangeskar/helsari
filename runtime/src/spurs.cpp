@@ -38,6 +38,7 @@ TaskKind identify_task(uint32_t elf) {
 // The u16 event bits are the high half of the big-endian word at +0.
 uint32_t *flag_word(uint32_t ef) { return (uint32_t *)mem::ptr(ef); }
 void flag_set(uint32_t ef, uint16_t bits) {
+    mem::LineGuard g(ef);
     __atomic_fetch_or(flag_word(ef), __builtin_bswap32((uint32_t)bits << 16), __ATOMIC_SEQ_CST);
 }
 
@@ -61,6 +62,7 @@ void edge_zlib(uint32_t e) {
     static int logged;
     if (logged++ < 8) LOG("spurs", "edge zlib: 0x%x (%u bytes) -> 0x%x: %ld of %u bytes, flag 0x%x bits 0x%x", src, csize, dst, n, usize, ef, bits);
     if (uint32_t ctr = outv & ~3u) {
+        mem::LineGuard g(ctr);
         auto *p = (uint32_t *)mem::ptr(ctr);
         uint32_t old = __atomic_load_n(p, __ATOMIC_SEQ_CST);
         while (!__atomic_compare_exchange_n(p, &old, __builtin_bswap32(__builtin_bswap32(old) - 1), false,
@@ -90,6 +92,7 @@ HLE(cellSpursEventFlagWait) {
         uint16_t bits = (uint16_t)(__builtin_bswap32(old) >> 16), got = bits & want;
         if (mode ? got == want : got != 0) {
             uint32_t now = auto_clear ? __builtin_bswap32(__builtin_bswap32(old) & ~((uint32_t)got << 16)) : old;
+            mem::LineGuard g(ef);
             if (!__atomic_compare_exchange_n(flag_word(ef), &old, now, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
                 continue;
             st16(mp, got);
@@ -100,6 +103,7 @@ HLE(cellSpursEventFlagWait) {
     RET(0);
 }
 HLE(cellSpursEventFlagClear) {
+    mem::LineGuard g(ARG32(0));
     __atomic_fetch_and(flag_word(ARG32(0)), ~__builtin_bswap32((uint32_t)(uint16_t)ARG32(1) << 16), __ATOMIC_SEQ_CST);
     RET(0);
 }

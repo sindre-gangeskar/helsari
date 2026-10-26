@@ -112,14 +112,14 @@ void workload_thread(Workload *w) {
         s.interrupts = false, s.event_mask = 0, s.event_stat = 0, s.dec_armed = false, s.stall_stat = 0;
         for (auto &l : s.stalled) l.active = false;
         w->running = true;
-        __atomic_store_n(w->contention_byte(), 1, __ATOMIC_SEQ_CST);
+        { mem::LineGuard g(w->spurs); __atomic_store_n(w->contention_byte(), 1, __ATOMIC_SEQ_CST); }
         // Log the first few runs of each workload, then every 1000th.
         bool log = runs < 5 || runs % 1000 == 0;
         if (log) LOG("spurs", "%s: run #%llu (ready %d)", s.name.c_str(), (unsigned long long)runs, w->ready());
         s.run();
         if (log) LOG("spurs", "%s: exited at 0x%x", s.name.c_str(), s.pc);
         runs++;
-        __atomic_store_n(w->contention_byte(), 0, __ATOMIC_SEQ_CST);
+        { mem::LineGuard g(w->spurs); __atomic_store_n(w->contention_byte(), 0, __ATOMIC_SEQ_CST); }
         w->running = false;
     }
 }
@@ -239,7 +239,7 @@ HLE(cellSpursReadyCountStore) {
     if (!w) { RET(0x80410711); return; }                 // CELL_SPURS_CORE_ERROR_INVAL
     static std::atomic<int> logged{0};
     if (logged++ < 30) LOG("spurs", "ready count of workload %u '%s' = %d", w->id, w->name.c_str(), (int32_t)ARG32(2));
-    __atomic_store_n(w->ready_byte(), (uint8_t)ARG32(2), __ATOMIC_SEQ_CST);
+    { mem::LineGuard g(w->spurs); __atomic_store_n(w->ready_byte(), (uint8_t)ARG32(2), __ATOMIC_SEQ_CST); }
     w->cv.notify_all();
     RET(0);
 }

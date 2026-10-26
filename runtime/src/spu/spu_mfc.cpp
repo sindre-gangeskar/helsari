@@ -164,6 +164,7 @@ uint32_t SpuThread::read_channel(int ch) {
 void SpuThread::write_channel(int ch, uint32_t v) {
     switch (ch) {
     case SPU_WrOutMbox: out_mbox = v; break;
+    case 69: case 70: case 71: break;               // performance bookmark / monitor start, stop: no effect
     case SPU_WrEventMask: event_mask = v; break;
     case SPU_WrEventAck: event_stat &= ~v; break;
     case SPU_WrDec: dec_value = v, dec_start = ticks_now(), dec_armed = (int32_t)v >= 0; break;

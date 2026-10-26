@@ -57,8 +57,8 @@ std::map<uint32_t, bool> g_shutdown;
 // Task bitsets are u32[4] big-endian; task i is bit (31 - i % 32) of word i / 32.
 uint32_t *bit_word(uint32_t set_ea, uint32_t task) { return (uint32_t *)mem::ptr(set_ea + 4 * (task / 32)); }
 uint32_t bit_mask(uint32_t task) { return __builtin_bswap32(0x80000000u >> (task % 32)); }
-void bit_set(uint32_t ea, uint32_t t) { __atomic_fetch_or(bit_word(ea, t), bit_mask(t), __ATOMIC_SEQ_CST); }
-void bit_clear(uint32_t ea, uint32_t t) { __atomic_fetch_and(bit_word(ea, t), ~bit_mask(t), __ATOMIC_SEQ_CST); }
+void bit_set(uint32_t ea, uint32_t t) { mem::LineGuard g(ea); __atomic_fetch_or(bit_word(ea, t), bit_mask(t), __ATOMIC_SEQ_CST); }
+void bit_clear(uint32_t ea, uint32_t t) { mem::LineGuard g(ea); __atomic_fetch_and(bit_word(ea, t), ~bit_mask(t), __ATOMIC_SEQ_CST); }
 bool bit_test(uint32_t ea, uint32_t t) { return __atomic_load_n(bit_word(ea, t), __ATOMIC_SEQ_CST) & bit_mask(t); }
 
 // Load an SPU ELF's PT_LOAD segments into LS. Returns the entry point (0 on error).
@@ -335,7 +335,24 @@ void spurs_tasks_dump() {
         static std::map<const Task *, int> shown;
         for (auto &t : tasks) {
             if (!t->spu || t->done) continue;
-            LOG("watchdog", "    task %u (ELF 0x%x) at pc 0x%x", t->id, t->elf, t->spu->pc);
+            auto &s = *t->spu;
+            LOG("watchdog", "    task %u (ELF 0x%x) at pc 0x%x, reservation 0x%x, events mask 0x%x stat 0x%x, "
+                "r5=%x r6=%x r7=%x r14=%x r16=%x", t->id, t->elf, s.pc, s.raddr, s.event_mask, s.event_stat,
+                s.gpr[5].w[0], s.gpr[6].w[0], s.gpr[7].w[0], s.gpr[14].w[0], s.gpr[16].w[0]);
+            if (s.raddr) {
+                for (int half = 0; half < 2; half++) {
+                    std::string mem_s, res_s;
+                    for (int i = 0; i < 64; i += 4) {
+                        char b[10];
+                        snprintf(b, sizeof b, "%08x ", ld32(s.raddr + 64 * half + i)), mem_s += b;
+                        uint32_t r;
+                        memcpy(&r, s.rdata + 64 * half + i, 4);
+                        snprintf(b, sizeof b, "%08x ", __builtin_bswap32(r)), res_s += b;
+                    }
+                    LOG("watchdog", "      line+%02x now %s", 64 * half, mem_s.c_str());
+                    LOG("watchdog", "      line+%02x got %s", 64 * half, res_s.c_str());
+                }
+            }
             if (!shown[t.get()]++) t->spu->dump_history();
         }
         for (uint32_t id = 0; id < 32; id++) {

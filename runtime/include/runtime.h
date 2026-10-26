@@ -41,6 +41,17 @@ uint32_t mmap_reserve(uint32_t size, uint32_t align);
 inline void *ptr(uint32_t ea) { return g_mem + ea; }
 std::string cstr(uint32_t ea);
 void write_cstr(uint32_t ea, const std::string &s, size_t max);
+
+/* Host code updating guest data that SPUs also update with lock-line atomics
+   must hold the line's lock across the read-modify-write; a PUTLLC commit
+   would otherwise overwrite the update (see line_lock in ppu.h). */
+struct LineGuard {
+    uint32_t ea;
+    explicit LineGuard(uint32_t a) : ea(a) { line_lock(a); }
+    ~LineGuard() { line_unlock(ea); }
+    LineGuard(const LineGuard &) = delete;
+    LineGuard &operator=(const LineGuard &) = delete;
+};
 }
 
 /* Report a guest write to the NULL page (the game's deliberate crash after a

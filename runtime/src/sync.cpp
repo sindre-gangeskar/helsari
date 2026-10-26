@@ -27,15 +27,17 @@ int32_t check(uint32_t m) { return !m ? SYNC_ERROR_NULL_POINTER : (m & 3) ? SYNC
 HLE(cellSyncMutexInitialize) {
     uint32_t m = ARG32(0);
     if (int32_t e = check(m)) { RET(e); return; }
-    __atomic_store_n(word(m), 0u, __ATOMIC_SEQ_CST);
+    { mem::LineGuard g(m); __atomic_store_n(word(m), 0u, __ATOMIC_SEQ_CST); }
     RET(0);
 }
 HLE(cellSyncMutexLock) {
     uint32_t m = ARG32(0);
     if (int32_t e = check(m)) { RET(e); return; }
-    uint32_t old = __atomic_load_n(word(m), __ATOMIC_SEQ_CST);
-    while (!__atomic_compare_exchange_n(word(m), &old, make(rel_of(old), acq_of(old) + 1), false, __ATOMIC_SEQ_CST,
-                                        __ATOMIC_SEQ_CST)) {
+    uint32_t old;
+    {
+        mem::LineGuard g(m);
+        old = __atomic_load_n(word(m), __ATOMIC_SEQ_CST);
+        __atomic_store_n(word(m), make(rel_of(old), acq_of(old) + 1), __ATOMIC_SEQ_CST);
     }
     uint16_t ticket = acq_of(old);
     while (rel_of(__atomic_load_n(word(m), __ATOMIC_SEQ_CST)) != ticket) std::this_thread::yield();
@@ -44,19 +46,21 @@ HLE(cellSyncMutexLock) {
 HLE(cellSyncMutexTryLock) {
     uint32_t m = ARG32(0);
     if (int32_t e = check(m)) { RET(e); return; }
-    uint32_t old = __atomic_load_n(word(m), __ATOMIC_SEQ_CST);
-    do {
+    {
+        mem::LineGuard g(m);
+        uint32_t old = __atomic_load_n(word(m), __ATOMIC_SEQ_CST);
         if (rel_of(old) != acq_of(old)) { RET(SYNC_ERROR_BUSY); return; }
-    } while (!__atomic_compare_exchange_n(word(m), &old, make(rel_of(old), acq_of(old) + 1), false, __ATOMIC_SEQ_CST,
-                                          __ATOMIC_SEQ_CST));
+        __atomic_store_n(word(m), make(rel_of(old), acq_of(old) + 1), __ATOMIC_SEQ_CST);
+    }
     RET(0);
 }
 HLE(cellSyncMutexUnlock) {
     uint32_t m = ARG32(0);
     if (int32_t e = check(m)) { RET(e); return; }
-    uint32_t old = __atomic_load_n(word(m), __ATOMIC_SEQ_CST);
-    while (!__atomic_compare_exchange_n(word(m), &old, make(rel_of(old) + 1, acq_of(old)), false, __ATOMIC_SEQ_CST,
-                                        __ATOMIC_SEQ_CST)) {
+    {
+        mem::LineGuard g(m);
+        uint32_t old = __atomic_load_n(word(m), __ATOMIC_SEQ_CST);
+        __atomic_store_n(word(m), make(rel_of(old) + 1, acq_of(old)), __ATOMIC_SEQ_CST);
     }
     RET(0);
 }
