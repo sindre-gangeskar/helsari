@@ -23,6 +23,35 @@ uint32_t g_stack_next = STACK_BASE;
 uint32_t g_mmap_next = MMAP_BASE;
 int g_fault_logs;
 
+// "module+offset" for each of the first few host frames of a fault context,
+// so a fault inside a system DLL (memcpy) still names its caller in kz2.exe.
+std::string host_backtrace(const CONTEXT *ctx) {
+    CONTEXT c = *ctx;
+    std::string out;
+    for (int i = 0; i < 6 && c.Rip; i++) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?", buf[MAX_PATH + 32];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)c.Rip, &mod)) {
+            GetModuleFileNameA(mod, name, sizeof name);
+        }
+        const char *base = strrchr(name, '\\');
+        snprintf(buf, sizeof buf, " %s+0x%llx", base ? base + 1 : name, (unsigned long long)(c.Rip - (uintptr_t)mod));
+        out += buf;
+        DWORD64 image = 0;
+        auto *fn = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+        if (!fn) {                                                   // leaf function: return address on top of stack
+            c.Rip = *(DWORD64 *)c.Rsp;
+            c.Rsp += 8;
+            continue;
+        }
+        void *handler_data;
+        DWORD64 frame;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fn, &c, &handler_data, &frame, nullptr);
+    }
+    return out;
+}
+
 LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
     auto *er = ep->ExceptionRecord;
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
@@ -34,7 +63,8 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
     if (ea < ELF_BASE && er->ExceptionInformation[0] == 1) guest_null_write((uint32_t)ea);
     if (ea < ELF_BASE && g_fault_logs < 20) {
         g_fault_logs++;
-        LOG("mem", "guest NULL-page access at 0x%llx (rip=%p) - committing zero page", ea, (void *)ep->ContextRecord->Rip);
+        LOG("mem", "guest NULL-page access at 0x%llx (host:%s) - committing zero page", ea,
+            host_backtrace(ep->ContextRecord).c_str());
     }
     void *page = (void *)((uintptr_t)addr & ~(uintptr_t)0xffff);
     if (!VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_SEARCH;

@@ -29,8 +29,6 @@ constexpr uint32_t TASK_TOP = 0x3000, TASK_BOTTOM = 0x40000;
 constexpr uint32_t SYSCALL_ADDR = 0xa70;
 constexpr uint32_t TASK_RETURN_ADDR = 0xa80;     // where a task's main() returns to
 constexpr uint32_t KERNEL_CTX = 0x100, TASKSET_CTX = 0x2700;
-// Inside the PM's stack area (0x2850..0x2C80), unused by tasks.
-constexpr uint32_t SERVICE_TRAPS = 0x2900, SERVICE_TABLE = 0x2a00, SERVICE_SPAN = 0x100;
 enum { SYS_EXIT = 0, SYS_YIELD = 1, SYS_WAIT_SIGNAL = 2, SYS_POLL = 3, SYS_RECV_WKL_FLAG = 4 };
 
 // CellSpursTaskset offsets
@@ -104,6 +102,7 @@ void task_thread(std::shared_ptr<Task> tp) {
     s.set_ls32(KERNEL_CTX + 0xc4, spurs);
     s.set_ls32(KERNEL_CTX + 0xdc, ld32(ts + TS_WID));
     s.set_ls32(TASKSET_CTX + 0xb8, 0), s.set_ls32(TASKSET_CTX + 0xbc, ts);   // 0x27B8 taskset
+    s.set_ls32(TASKSET_CTX + 0xc0, KERNEL_CTX);                             // 0x27C0 kernelMgmtAddr
     s.set_ls32(TASKSET_CTX + 0xc4, SYSCALL_ADDR);                           // 0x27C4 syscallAddr
     s.set_ls32(TASKSET_CTX + 0xcc, 0);                                      // 0x27CC spuNum
     s.set_ls32(TASKSET_CTX + 0xd0, 31);                                     // 0x27D0 dmaTagId
@@ -112,32 +111,17 @@ void task_thread(std::shared_ptr<Task> tp) {
     s.set_ls32(0x2fbc, TASK_TOP);                                           // guidAddr
     memcpy(s.ls + 0x2780, mem::ptr(info), TI_SIZE);                          // task info copy
 
-    // Taskset PM service table (tasksetMgmtAddr, 0x2FB8): libspurs calls
-    // entries through it (e.g. +0xC4). Each entry points at its own trapped
-    // address; calls are logged until the services are implemented.
-    for (uint32_t k = 0; k < SERVICE_SPAN; k += 4) {
-        s.set_ls32(SERVICE_TABLE + k, SERVICE_TRAPS + k);
-        s.set_trap(SERVICE_TRAPS + k);
-    }
-    s.set_ls32(0x2fb8, SERVICE_TABLE);
+    // tasksetMgmtAddr: libspurs task code reaches the taskset context through
+    // it, e.g. the syscall entry at +0xC4 and the taskset address at +0xB8.
+    s.set_ls32(0x2fb8, TASKSET_CTX);
     s.set_trap(SYSCALL_ADDR);
     s.set_trap(TASK_RETURN_ADDR);
     s.on_trap = [&t, ts](spu::SpuThread &c) {
         if (c.pc == TASK_RETURN_ADDR) { finish(t, c.gpr[3].w[0]); return false; }
-        if (c.pc >= SERVICE_TRAPS && c.pc < SERVICE_TRAPS + SERVICE_SPAN) {
-            static std::atomic<uint64_t> seen{0};
-            uint32_t off = c.pc - SERVICE_TRAPS;
-            if (!(seen.fetch_or(1ull << (off / 4)) & (1ull << (off / 4))))
-                LOG("spurs", "%s: taskset service +0x%x called (r3=0x%x r4=0x%x r5=0x%x) - not implemented, returns 0",
-                    c.name.c_str(), off, c.gpr[3].w[0], c.gpr[4].w[0], c.gpr[5].w[0]);
-            c.gpr[3] = spu::V{{0, 0, 0, 0}};
-            c.pc = c.gpr[0].w[0] & (spu::LS_SIZE - 4);
-            return true;
-        }
         uint32_t num = c.gpr[3].w[0] & 0xf, ret = 0;
         switch (num) {
         case SYS_EXIT:
-            finish(t, c.gpr[4].w[0]);
+            finish(t, c.ls32(0x2fd0));                                      // taskExitCode
             return false;
         case SYS_WAIT_SIGNAL:
             // Block until the task's signalled bit is set, then consume it.
