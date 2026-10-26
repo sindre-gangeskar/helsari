@@ -141,7 +141,13 @@ int32_t read(uint32_t fd, uint32_t buf, uint64_t n, uint64_t *got) {
         uint64_t chunk = std::min(n - done, part_end - f->pos);
         _fseeki64(f->parts[i], (int64_t)(f->pos - f->starts[i]), SEEK_SET);
         mem::ensure(buf + (uint32_t)done, (uint32_t)chunk);
+        char what[160];
+        snprintf(what, sizeof what, "read '%s' at 0x%llx", f->path.c_str(), (unsigned long long)f->pos);
+        mem::watch_host_write(buf + (uint32_t)done, (uint32_t)chunk, what);
         size_t r = fread(mem::ptr(buf + (uint32_t)done), 1, (size_t)chunk, f->parts[i]);
+        if (mem::hook_watched(buf + (uint32_t)done, (uint32_t)chunk))
+            LOG("hook", "fs %s: 0x%zx of 0x%llx bytes -> 0x%x, first %08x %08x", what, r, (unsigned long long)chunk,
+                buf + (uint32_t)done, ld32(buf + (uint32_t)done), ld32(buf + (uint32_t)done + 4));
         done += r, f->pos += r;
         if (r < chunk) break;
     }

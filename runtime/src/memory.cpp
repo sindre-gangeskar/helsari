@@ -9,7 +9,11 @@
 #include <windows.h>
 
 #include <map>
+#include <atomic>
+#include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 uint8_t *g_mem;
 uint32_t g_line_locks[LINE_LOCKS];
@@ -53,11 +57,97 @@ std::string host_backtrace(const CONTEXT *ctx) {
     return out;
 }
 
+// KZ2_WATCH_WRITE="ea:len,..." finds who writes guest memory: the host pages
+// are made read-only once committed, a write faults here and is logged with a
+// host backtrace (generated f_XXXXXXXX functions or runtime code), then the
+// page is made writable and re-armed shortly after by watch_thread.
+struct WatchPage { uintptr_t page; std::atomic<uint64_t> rearm_at{0}; };
+std::vector<std::unique_ptr<WatchPage>> g_watch;
+std::vector<std::pair<uint32_t, uint32_t>> g_watch_ranges;   // exact ranges; other writes to the pages pass silently
+
+bool in_watch_range(uint32_t ea, uint32_t size) {
+    for (auto &[a, n] : g_watch_ranges)
+        if (ea < a + n && a < ea + size) return true;
+    return false;
+}
+std::atomic<int> g_watch_logs{0};
+
+uint64_t now_ms() { return GetTickCount64(); }
+
+void watch_thread() {
+    for (;;) {
+        for (auto &w : g_watch) {
+            MEMORY_BASIC_INFORMATION mi;
+            if (!VirtualQuery((void *)w->page, &mi, sizeof mi) || mi.State != MEM_COMMIT) continue;
+            if (mi.Protect == PAGE_READWRITE && now_ms() >= w->rearm_at) {
+                DWORD old;
+                VirtualProtect((void *)w->page, 0x1000, PAGE_READONLY, &old);
+            }
+        }
+        Sleep(1);
+    }
+}
+
+bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
+    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xfff;
+    for (auto &w : g_watch) {
+        if (w->page != page) continue;
+        if (ep->ExceptionRecord->ExceptionInformation[0] != 1) return false;   // reads never fault here
+        uint32_t ea = (uint32_t)(addr - g_mem);
+        if (in_watch_range(ea, 1) && g_watch_logs++ < 300) {
+            PPUContext *ctx = thread::current();
+            LOG("mem", "watched write to 0x%x (guest lr 0x%llx, host:%s)", (uint32_t)(addr - g_mem),
+                ctx ? (unsigned long long)ctx->lr : 0ull, host_backtrace(ep->ContextRecord).c_str());
+            if (ctx) {   // in a memcpy: r3 dst, r4 source cursor, r5 length (backward copies start at the end)
+                auto hex = [](uint32_t ea) {
+                    std::string h;
+                    for (int k = 0; k < 32; k += 4) {
+                        uint32_t v;
+                        memcpy(&v, g_mem + ea + k, 4);
+                        char b[12];
+                        snprintf(b, sizeof b, " %08x", __builtin_bswap32(v));
+                        h += b;
+                    }
+                    return h;
+                };
+                uint32_t cur = (uint32_t)ctx->r[4], n = (uint32_t)ctx->r[5];
+                LOG("mem", "  r3=0x%x r4=0x%x r5=0x%x; before r4:%s; at r4-r5:%s", (uint32_t)ctx->r[3], cur, n,
+                    hex(cur - 32).c_str(), hex(cur - n).c_str());
+            }
+        }
+        DWORD old;
+        VirtualProtect((void *)page, 0x1000, PAGE_READWRITE, &old);
+        w->rearm_at = now_ms() + 5;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool watch_host_write(uint32_t ea, uint32_t size, const char *what) {
+    bool hit = false;
+    for (auto &w : g_watch) {
+        uintptr_t lo = (uintptr_t)(g_mem + ea), hi = lo + size;
+        if (w->page + 0x1000 <= lo || w->page >= hi) continue;
+        if (!hit && in_watch_range(ea, size) && g_watch_logs++ < 300)
+            LOG("mem", "watched range written by host I/O: 0x%x+0x%x (%s)", ea, size, what);
+        hit = true;
+        DWORD old;
+        w->rearm_at = now_ms() + 5000;
+        VirtualProtect((void *)w->page, 0x1000, PAGE_READWRITE, &old);
+    }
+    return hit;
+}
+
+namespace {
+
 LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
     auto *er = ep->ExceptionRecord;
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     auto addr = (uint8_t *)er->ExceptionInformation[1];
     if (addr < g_mem || addr >= g_mem + RESERVE) return EXCEPTION_CONTINUE_SEARCH;
+    if (!g_watch.empty() && watch_fault(ep, addr)) return EXCEPTION_CONTINUE_EXECUTION;
     uint64_t ea = (uint64_t)(addr - g_mem);
     // A write to the NULL page is how the game crashes on purpose after a
     // fatal error (it stores 0x0deadca7 to address 0); on hardware it faults.
@@ -78,6 +168,20 @@ void init() {
     if (!g_mem) fatal("could not reserve 4 GiB of address space for guest memory");
     AddVectoredExceptionHandler(1, on_fault);
     g_free[USER_BASE] = USER_SIZE;
+    if (const char *p = getenv("KZ2_WATCH_WRITE")) {
+        for (const char *s = p; *s;) {
+            char *end;
+            uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 4;
+            g_watch_ranges.push_back({a, n});
+            for (uint32_t pg = a & ~0xfffu; pg < a + n; pg += 0x1000) {
+                g_watch.push_back(std::make_unique<WatchPage>());
+                g_watch.back()->page = (uintptr_t)(g_mem + pg);
+            }
+            s = *end == ',' ? end + 1 : end;
+        }
+        std::thread(watch_thread).detach();
+        LOG("mem", "watching writes to %zu pages", g_watch.size());
+    }
 }
 
 uint32_t alloc(uint32_t size, uint32_t align) {

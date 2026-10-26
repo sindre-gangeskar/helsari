@@ -262,7 +262,7 @@ Bound bind_surfaces() {
     uint32_t target = reg(0x0220);
     static const uint32_t off_m[4] = {0x0210, 0x0218, 0x0288, 0x028c};     // COLOR_A..D_OFFSET
     static const uint32_t pitch_m[4] = {0x020c, 0x021c, 0x0280, 0x0284};   // SURFACE_PITCH_A..D
-    static const uint32_t dma_m[4] = {0x0184, 0x0188, 0x018c, 0x01b4};
+    static const uint32_t dma_m[4] = {0x0194, 0x018c, 0x01b4, 0x01b8};     // CONTEXT_DMA_COLOR_A..D
     int mask = 0;
     switch (target) {
     case 0x01: mask = 1; break;
@@ -280,7 +280,7 @@ Bound bind_surfaces() {
     }
     ID3D11DepthStencilView *dsv = nullptr;
     if (zfmt) {
-        uint32_t ea = ea_for(dma_location(reg(0x0194)), reg(0x0214));
+        uint32_t ea = ea_for(dma_location(reg(0x0198)), reg(0x0214));          // CONTEXT_DMA_ZETA
         b.depth = get_surface(ea, zfmt, sw, shh, true);
         if (b.depth) dsv = b.depth->dsv, b.depth->pitch = reg(0x022c);           // SURFACE_PITCH_Z
     }
@@ -860,15 +860,16 @@ ID3D11VertexShader *vertex_shader() {
     return vs;
 }
 
-PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16]) {
+PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t remap[16]) {
     FpScan sc = scan_fp(fp_ea);
     uint32_t control = reg(0x1d60);
     uint32_t alpha = (reg(0x0304) & 1) ? reg(0x0308) : 0;
-    uint64_t h = fnv(texdim, 16, fnv(&control, 4, fnv(&alpha, 4, sc.hash)));
+    uint64_t h = fnv(remap, 32, fnv(texdim, 16, fnv(&control, 4, fnv(&alpha, 4, sc.hash))));
     auto it = g_ps.find(h);
     if (it != g_ps.end()) return &it->second;
-    FpKey key{fp_ea, control, {}, alpha};
+    FpKey key{fp_ea, control, {}, alpha, {}};
     memcpy(key.texdim, texdim, 16);
+    memcpy(key.remap, remap, 32);
     FpInfo fi = translate_fp(key);
     PsEntry e{nullptr, sc.consts};
     if (ID3DBlob *b = compile(fi.hlsl, "ps_5_0", h)) {
@@ -999,7 +1000,9 @@ void draw() {
         if ((reg(0x1a04 + t * 32) >> 8) & 0x40) texdim[t] |= TEX_UNNORM;
         smp[t] = get_sampler(t, texdim[t] & TEX_SHADOW);
     }
-    PsEntry *ps = pixel_shader(fp_ea, texdim);
+    uint16_t remap[16];
+    for (int t = 0; t < 16; t++) remap[t] = (reg(0x1a0c + t * 32) & 0x80000000) ? reg(0x1a10 + t * 32) & 0xffff : 0xaae4;
+    PsEntry *ps = pixel_shader(fp_ea, texdim, remap);
     if (!vs || !ps->ps) return;
 
     // constants
@@ -1337,6 +1340,9 @@ void copy_m2mf() {
     uint32_t out = ea_for(dma_location(reg(0x2188)), reg(0x2310));
     int32_t pin = (int32_t)reg(0x2314), pout = (int32_t)reg(0x2318);
     uint32_t len = reg(0x231c), lines = reg(0x2320);
+    static int logs;
+    if (logs++ < 40)
+        LOG("rsx", "m2mf copy 0x%x -> 0x%x: %u lines of %u bytes (pitch in %d out %d)", in, out, lines, len, pin, pout);
     for (uint32_t l = 0; l < lines; l++)
         memmove(mem::ptr(out + l * pout), mem::ptr(in + l * pin), len);
 }

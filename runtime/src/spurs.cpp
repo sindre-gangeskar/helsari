@@ -55,10 +55,31 @@ void edge_zlib(uint32_t e) {
     if (outv & 1) {
         n = inflate_raw((const uint8_t *)mem::ptr(src), csize, (uint8_t *)mem::ptr(dst), usize);
         if (n < 0) LOG("spurs", "edge zlib: corrupt stream src=0x%x csize=%u usize=%u", src, csize, usize);
+        // KZ2_DUMP_INFLATE: save input/output of blocks whose output has a long zero run, to check
+        // the decoder against a reference (zlib) offline.
+        static const bool dump = getenv("KZ2_DUMP_INFLATE") != nullptr;
+        static std::atomic<int> dumps{0};
+        if (dump && n > 0 && dumps < 40) {
+            const uint8_t *o = (const uint8_t *)mem::ptr(dst);
+            long run = 0, best = 0;
+            for (long k = 0; k < n; k++) run = o[k] ? 0 : run + 1, best = std::max(best, run);
+            if (best >= 8192) {
+                int id = dumps++;
+                char path[64];
+                snprintf(path, sizeof path, "inflate_%02d.in", id);
+                if (FILE *f = fopen(path, "wb")) { fwrite(mem::ptr(src), 1, csize, f); fclose(f); }
+                snprintf(path, sizeof path, "inflate_%02d.out", id);
+                if (FILE *f = fopen(path, "wb")) { fwrite(o, 1, n, f); fclose(f); }
+                LOG("spurs", "edge zlib: dumped block %d (zero run %ld) src=0x%x dst=0x%x", id, best, src, dst);
+            }
+        }
     } else {
         memmove(mem::ptr(dst), mem::ptr(src), csize);
         n = csize;
     }
+    if (mem::hook_watched(dst, usize))
+        LOG("hook", "edge zlib %s 0x%x (%u bytes) -> 0x%x (%u): %ld; out %08x %08x %08x %08x", outv & 1 ? "inflate" : "copy",
+            src, csize, dst, usize, n, ld32(dst), ld32(dst + 4), ld32(dst + 8), ld32(dst + 12));
     static int logged;
     if (logged++ < 8) LOG("spurs", "edge zlib: 0x%x (%u bytes) -> 0x%x: %ld of %u bytes, flag 0x%x bits 0x%x", src, csize, dst, n, usize, ef, bits);
     if (uint32_t ctr = outv & ~3u) {

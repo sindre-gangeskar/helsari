@@ -112,7 +112,12 @@ FpInfo translate_fp(const FpKey &key) {
             // Shadow lookup: compare z against the stored depth, filtered (PCF); every component is the result.
             if ((key.texdim[tex] & TEX_SHADOW) && dim == TEX_2D)
                 return texs + ".SampleCmpLevelZero(" + smp + ", " + cs + ", (" + coord + ").z).xxxx";
-            return texs + "." + fn + "(" + smp + ", " + cs + extra + ")";
+            std::string e = texs + "." + fn + "(" + smp + ", " + cs + extra + ")";
+            // TEXTURE_CONTROL1 remap: per output channel a source (A, R, G, B) or the constant 0 / 1.
+            uint16_t rm = key.remap[tex];
+            if (rm && rm != 0xaae4)
+                e = "remap(" + e + ", uint4(" + std::to_string(rm & 0xff) + ", " + std::to_string(rm >> 8) + ", 0, 0))";
+            return e;
         };
         std::string e;
         bool scalar = false;
@@ -239,6 +244,10 @@ FpInfo translate_fp(const FpKey &key) {
          "float4 up4(float4 v) { uint u = asuint(v.x); return float4(u & 255, (u >> 8) & 255, (u >> 16) & 255, u >> 24) / 255.0; }\n"
          "float4 pk2(float4 v) { return asfloat(f32tof16(v.x) | (f32tof16(v.y) << 16)).xxxx; }\n"
          "float4 up2(float4 v) { uint u = asuint(v.x); return float4(f16tof32(u & 0xffff), f16tof32(u >> 16), 0, 0); }\n"
+         // m.x: 2-bit sources (0 A, 1 R, 2 G, 3 B) for outputs A, R, G, B; m.y: their types (0 zero, 1 one, 2 source)
+         "float rmc(float4 t, uint2 m, uint i) { uint s = (m.x >> (2 * i)) & 3, k = (m.y >> (2 * i)) & 3;\n"
+         "  return k == 2 ? (s == 0 ? t.a : s == 1 ? t.r : s == 2 ? t.g : t.b) : k == 1 ? 1 : 0; }\n"
+         "float4 remap(float4 t, uint4 m) { return float4(rmc(t, m.xy, 1), rmc(t, m.xy, 2), rmc(t, m.xy, 3), rmc(t, m.xy, 0)); }\n"
          "struct PIn { float4 pos : SV_Position;\n";
     for (int k = 1; k < 16; k++) h += "  float4 o" + std::to_string(k) + " : TEXCOORD" + std::to_string(k) + ";\n";
     h += "  bool front : SV_IsFrontFace; };\n"

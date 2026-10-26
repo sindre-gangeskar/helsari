@@ -36,6 +36,11 @@ void init();
 uint32_t alloc(uint32_t size, uint32_t align = 16);  /* user region */
 void free(uint32_t addr);
 void ensure(uint32_t ea, uint32_t size);  /* commit before host (kernel) I/O touches it */
+/* KZ2_WATCH_WRITE: kernel I/O into watched memory doesn't fault, so host I/O
+   reports itself here (and the pages are unprotected for it). True if watched. */
+bool watch_host_write(uint32_t ea, uint32_t size, const char *what);
+/* KZ2_HOOK_WATCH="ea:len": does [ea, ea+size) overlap it? (debug_hooks.cpp) */
+bool hook_watched(uint32_t ea, uint32_t size);
 uint32_t alloc_stack(uint32_t size);
 uint32_t mmap_reserve(uint32_t size, uint32_t align);
 inline void *ptr(uint32_t ea) { return g_mem + ea; }
