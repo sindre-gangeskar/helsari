@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <string>
@@ -125,5 +126,10 @@ struct SpuThread {
 
 // Disassemble one instruction (for traces).
 std::string disasm(uint32_t pc, uint32_t insn);
+
+// Totals over all SPU threads, for the flip log: instructions executed, and
+// nanoseconds spent in run() and blocked reading SPU_RdEventStat.
+extern std::atomic<uint64_t> g_insns, g_run_ns, g_wait_ns;
+std::string stats_line(double secs, uint32_t frames);   // since the previous call
 
 } // namespace spu

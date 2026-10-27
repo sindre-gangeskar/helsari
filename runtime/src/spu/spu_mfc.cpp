@@ -166,10 +166,14 @@ uint32_t SpuThread::read_channel(int ch) {
     switch (ch) {
     case SPU_RdEventStat:
         // Blocks until an enabled event is pending.
-        for (;;) {
-            if (uint32_t e = pending_events()) return e;
-            if (!event_mask) return 0;
-            std::this_thread::yield();
+        if (uint32_t e = pending_events()) return e;
+        if (!event_mask) return 0;
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            uint32_t e;
+            while (!(e = pending_events()) && event_mask) std::this_thread::yield();
+            g_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            return e;
         }
     case SPU_RdEventMask: return event_mask;
     case SPU_RdDec: return dec_value - (uint32_t)(ticks_now() - dec_start);

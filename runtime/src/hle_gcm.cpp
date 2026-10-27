@@ -17,6 +17,8 @@
 
 #define REG(n) hle_register(#n, hle_##n)
 
+namespace spu { std::string stats_line(double secs, uint32_t frames); }
+
 namespace {
 constexpr uint32_t CTX_ADDR = mem::RSX_IO + 0x0000;       // CellGcmContextData
 constexpr uint32_t CTRL_ADDR = mem::RSX_IO + 0x100040;    // CellGcmControl {put, get, ref}
@@ -87,13 +89,15 @@ void window_thread() {
 
 void flip(uint32_t id) {
     static uint32_t n;
-    // Every 60 flips: how fast the game is presenting.
+    // Every 60 flips or 5 s: how fast the game is presenting, and the SPU work behind it.
     static auto last = std::chrono::steady_clock::now();
-    if (n++ % 60 == 0) {
-        auto now = std::chrono::steady_clock::now();
-        double secs = std::chrono::duration<double>(now - last).count();
-        last = now;
-        LOG("gcm", "flip #%u (buffer %u), %.1f fps", n, id, n > 1 ? 60 / secs : 0.0);
+    static uint32_t last_n = 0;
+    auto now = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration<double>(now - last).count();
+    if (++n - last_n >= 60 || secs >= 5) {
+        uint32_t frames = n - last_n;
+        last = now, last_n = n;
+        LOG("gcm", "flip #%u (buffer %u), %.1f fps; %s", n, id, frames / secs, spu::stats_line(secs, frames).c_str());
     }
     g_last_flip = id;
     if (id < 8) rsx::flip(g_disp[id].offset, g_disp[id].width, g_disp[id].height, g_disp[id].pitch);
