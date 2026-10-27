@@ -17,6 +17,7 @@
 
 uint8_t *g_mem;
 uint32_t g_line_locks[LINE_LOCKS];
+uint32_t g_line_seq[LINE_LOCKS];
 
 namespace mem {
 namespace {
@@ -61,13 +62,27 @@ std::string host_backtrace(const CONTEXT *ctx) {
 // are made read-only once committed, a write faults here and is logged with a
 // host backtrace (generated f_XXXXXXXX functions or runtime code), then the
 // page is made writable and re-armed shortly after by watch_thread.
+// Fixed tables so watch_add can extend them while the fault handler and
+// watch_thread read them: an entry is filled in before the count covers it.
 struct WatchPage { uintptr_t page; std::atomic<uint64_t> rearm_at{0}; };
-std::vector<std::unique_ptr<WatchPage>> g_watch;
-std::vector<std::pair<uint32_t, uint32_t>> g_watch_ranges;   // exact ranges; other writes to the pages pass silently
+constexpr int MAX_WATCH_PAGES = 1024, MAX_WATCH_RANGES = 64;
+WatchPage g_watch_pages[MAX_WATCH_PAGES];
+std::atomic<int> g_watch_count{0};
+std::pair<uint32_t, uint32_t> g_watch_ranges[MAX_WATCH_RANGES];   // exact ranges; other writes to the pages pass silently
+std::atomic<int> g_watch_range_count{0};
+std::mutex g_watch_add_lock;
+
+struct WatchList {
+    WatchPage *begin() const { return g_watch_pages; }
+    WatchPage *end() const { return g_watch_pages + g_watch_count.load(); }
+    bool empty() const { return g_watch_count.load() == 0; }
+} g_watch;
 
 bool in_watch_range(uint32_t ea, uint32_t size) {
-    for (auto &[a, n] : g_watch_ranges)
-        if (ea < a + n && a < ea + size) return true;
+    for (int i = 0, n = g_watch_range_count.load(); i < n; i++) {
+        auto [a, len] = g_watch_ranges[i];
+        if (ea < a + len && a < ea + size) return true;
+    }
     return false;
 }
 std::atomic<int> g_watch_logs{0};
@@ -78,10 +93,10 @@ void watch_thread() {
     for (;;) {
         for (auto &w : g_watch) {
             MEMORY_BASIC_INFORMATION mi;
-            if (!VirtualQuery((void *)w->page, &mi, sizeof mi) || mi.State != MEM_COMMIT) continue;
-            if (mi.Protect == PAGE_READWRITE && now_ms() >= w->rearm_at) {
+            if (!VirtualQuery((void *)w.page, &mi, sizeof mi) || mi.State != MEM_COMMIT) continue;
+            if (mi.Protect == PAGE_READWRITE && now_ms() >= w.rearm_at) {
                 DWORD old;
-                VirtualProtect((void *)w->page, 0x1000, PAGE_READONLY, &old);
+                VirtualProtect((void *)w.page, 0x1000, PAGE_READONLY, &old);
             }
         }
         Sleep(1);
@@ -91,10 +106,24 @@ void watch_thread() {
 bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
     uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xfff;
     for (auto &w : g_watch) {
-        if (w->page != page) continue;
+        if (w.page != page) continue;
         if (ep->ExceptionRecord->ExceptionInformation[0] != 1) return false;   // reads never fault here
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void *)page, &mi, sizeof mi) || mi.State != MEM_COMMIT) {
+            // First touch: commit the 64 KiB block and arm its watched pages now, so
+            // this very write faults again and is logged (a fast fill would otherwise
+            // complete before watch_thread arms the page).
+            uintptr_t block = page & ~(uintptr_t)0xffff;
+            if (!VirtualAlloc((void *)block, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return false;
+            for (auto &o : g_watch)
+                if ((o.page & ~(uintptr_t)0xffff) == block) {
+                    DWORD old;
+                    VirtualProtect((void *)o.page, 0x1000, PAGE_READONLY, &old);
+                }
+            return true;
+        }
         uint32_t ea = (uint32_t)(addr - g_mem);
-        if (in_watch_range(ea, 1) && g_watch_logs++ < 300) {
+        if (in_watch_range((uint32_t)(page - (uintptr_t)g_mem), 0x1000) && g_watch_logs++ < 300) {
             PPUContext *ctx = thread::current();
             LOG("mem", "watched write to 0x%x (guest lr 0x%llx, host:%s)", (uint32_t)(addr - g_mem),
                 ctx ? (unsigned long long)ctx->lr : 0ull, host_backtrace(ep->ContextRecord).c_str());
@@ -113,11 +142,26 @@ bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
                 uint32_t cur = (uint32_t)ctx->r[4], n = (uint32_t)ctx->r[5];
                 LOG("mem", "  r3=0x%x r4=0x%x r5=0x%x; before r4:%s; at r4-r5:%s", (uint32_t)ctx->r[3], cur, n,
                     hex(cur - 32).c_str(), hex(cur - n).c_str());
+                // the caller's saved state: non-volatile registers and what they point at
+                for (int r = 26; r < 32; r++) {
+                    uint32_t v = (uint32_t)ctx->r[r];
+                    bool ptr = v >= 0x10000 && v < 0xf0000000;
+                    LOG("mem", "  r%d=0x%x%s%s", r, v, ptr ? ":" : "", ptr ? hex(v & ~3u).c_str() : "");
+                }
+                if (const char *e = getenv("KZ2_WATCH_PEEK")) {   // temporary: "reg:off,..." dump [r<reg>+off]
+                    for (const char *s = e; *s;) {
+                        char *end;
+                        int r = (int)strtol(s, &end, 10);
+                        uint32_t off = *end == ':' ? strtoul(end + 1, &end, 16) : 0;
+                        if (r >= 0 && r < 32) LOG("mem", "  [r%d+0x%x]:%s", r, off, hex((uint32_t)ctx->r[r] + off).c_str());
+                        s = *end == ',' ? end + 1 : end;
+                    }
+                }
             }
         }
         DWORD old;
         VirtualProtect((void *)page, 0x1000, PAGE_READWRITE, &old);
-        w->rearm_at = now_ms() + 5;
+        w.rearm_at = now_ms() + 5;
         return true;
     }
     return false;
@@ -129,13 +173,13 @@ bool watch_host_write(uint32_t ea, uint32_t size, const char *what) {
     bool hit = false;
     for (auto &w : g_watch) {
         uintptr_t lo = (uintptr_t)(g_mem + ea), hi = lo + size;
-        if (w->page + 0x1000 <= lo || w->page >= hi) continue;
+        if (w.page + 0x1000 <= lo || w.page >= hi) continue;
         if (!hit && in_watch_range(ea, size) && g_watch_logs++ < 300)
             LOG("mem", "watched range written by host I/O: 0x%x+0x%x (%s)", ea, size, what);
         hit = true;
         DWORD old;
-        w->rearm_at = now_ms() + 5000;
-        VirtualProtect((void *)w->page, 0x1000, PAGE_READWRITE, &old);
+        w.rearm_at = now_ms() + 5000;
+        VirtualProtect((void *)w.page, 0x1000, PAGE_READWRITE, &old);
     }
     return hit;
 }
@@ -172,16 +216,32 @@ void init() {
         for (const char *s = p; *s;) {
             char *end;
             uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 4;
-            g_watch_ranges.push_back({a, n});
-            for (uint32_t pg = a & ~0xfffu; pg < a + n; pg += 0x1000) {
-                g_watch.push_back(std::make_unique<WatchPage>());
-                g_watch.back()->page = (uintptr_t)(g_mem + pg);
-            }
+            watch_add(a, n);
             s = *end == ',' ? end + 1 : end;
         }
-        std::thread(watch_thread).detach();
-        LOG("mem", "watching writes to %zu pages", g_watch.size());
     }
+}
+
+// Starts logging writes to [ea, ea+size) from now on (see KZ2_WATCH_WRITE).
+void watch_add(uint32_t ea, uint32_t size) {
+    std::lock_guard<std::mutex> lk(g_watch_add_lock);
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(watch_thread).detach(); });
+    int r = g_watch_range_count.load();
+    if (r == MAX_WATCH_RANGES) return;
+    g_watch_ranges[r] = {ea, size};
+    g_watch_range_count = r + 1;
+    for (uint32_t pg = ea & ~0xfffu; pg < ea + size; pg += 0x1000) {
+        uintptr_t page = (uintptr_t)(g_mem + pg);
+        bool have = false;
+        for (auto &w : g_watch) have |= w.page == page;
+        int n = g_watch_count.load();
+        if (have || n == MAX_WATCH_PAGES) continue;
+        g_watch_pages[n].page = page;
+        g_watch_pages[n].rearm_at = 0;
+        g_watch_count = n + 1;
+    }
+    LOG("mem", "watching writes to 0x%x+0x%x (%d pages watched)", ea, size, g_watch_count.load());
 }
 
 uint32_t alloc(uint32_t size, uint32_t align) {

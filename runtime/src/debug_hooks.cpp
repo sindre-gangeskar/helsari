@@ -7,6 +7,7 @@
 #include <vector>
 
 extern "C" void f_00a4a99c_guest(PPU_CTX);
+void edge_zlib_explain(uint32_t ea, uint32_t size);
 
 // KZ2_HOOK_WATCH="ea:len,ea:len": hooks and host writers log only what overlaps.
 bool mem::hook_watched(uint32_t ea, uint32_t size) {
@@ -50,6 +51,7 @@ extern "C" void f_00a4a99c(PPU_CTX) {
         LOG("hook", "stream read 0x%x bytes -> 0x%x: reader 0x%x cursor 0x%x end 0x%x (%s); src:%s", size, dst,
             (uint32_t)ctx->r[3], cur, end, (int32_t)(end - cur) < (int32_t)size ? "refill" : "buffered",
             hex(cur, 32).c_str());
+        if ((int32_t)(end - cur) >= (int32_t)size) edge_zlib_explain(cur, size);
         f_00a4a99c_guest(ctx);
         LOG("hook", "  -> dst now:%s", hex(dst, 32).c_str());
         return;

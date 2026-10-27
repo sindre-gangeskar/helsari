@@ -1267,6 +1267,85 @@ void write_back() {
     for (auto &[ea, s] : g_depth_surfaces) write_back_surface(ea, s);
 }
 
+// Debug: KZ2_SCREENSHOT=<sec> writes the presented frame, half size, to
+// shot_<seconds since start>.png every that many seconds.
+void write_png(const char *path, const uint8_t *rgb, uint32_t w, uint32_t h) {
+    static uint32_t crc_table[256] = {};
+    if (!crc_table[1])
+        for (uint32_t n = 0; n < 256; n++) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; k++) c = c & 1 ? 0xedb88320u ^ (c >> 1) : c >> 1;
+            crc_table[n] = c;
+        }
+    std::vector<uint8_t> out = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    auto be32 = [](std::vector<uint8_t> &v, uint32_t x) { for (int s = 24; s >= 0; s -= 8) v.push_back((uint8_t)(x >> s)); };
+    auto chunk = [&](const char *type, const std::vector<uint8_t> &data) {
+        be32(out, (uint32_t)data.size());
+        size_t start = out.size();
+        out.insert(out.end(), type, type + 4);
+        out.insert(out.end(), data.begin(), data.end());
+        uint32_t c = 0xffffffffu;
+        for (size_t i = start; i < out.size(); i++) c = crc_table[(c ^ out[i]) & 0xff] ^ (c >> 8);
+        be32(out, c ^ 0xffffffffu);
+    };
+    std::vector<uint8_t> ihdr;
+    be32(ihdr, w), be32(ihdr, h);
+    ihdr.insert(ihdr.end(), {8, 2, 0, 0, 0});              // 8-bit RGB
+    chunk("IHDR", ihdr);
+    // zlib stream of stored (uncompressed) deflate blocks
+    std::vector<uint8_t> raw;
+    for (uint32_t y = 0; y < h; y++) {
+        raw.push_back(0);
+        raw.insert(raw.end(), rgb + (size_t)y * w * 3, rgb + (size_t)(y + 1) * w * 3);
+    }
+    std::vector<uint8_t> z = {0x78, 0x01};
+    for (size_t i = 0; i < raw.size(); i += 65535) {
+        uint16_t n = (uint16_t)std::min<size_t>(65535, raw.size() - i);
+        z.insert(z.end(), {(uint8_t)(i + n == raw.size()), (uint8_t)n, (uint8_t)(n >> 8), (uint8_t)~n, (uint8_t)(~n >> 8)});
+        z.insert(z.end(), raw.begin() + i, raw.begin() + i + n);
+    }
+    uint32_t a = 1, b = 0;
+    for (uint8_t c : raw) a = (a + c) % 65521, b = (b + a) % 65521;
+    be32(z, b << 16 | a);
+    chunk("IDAT", z);
+    chunk("IEND", {});
+    if (FILE *f = fopen(path, "wb")) { fwrite(out.data(), 1, out.size(), f); fclose(f); }
+}
+
+void maybe_screenshot() {
+    static const double interval = getenv("KZ2_SCREENSHOT") ? atof(getenv("KZ2_SCREENSHOT")) : 0;
+    static const ULONGLONG t0 = GetTickCount64();
+    static double next = interval;
+    if (interval <= 0) return;
+    double now = (GetTickCount64() - t0) / 1000.0;
+    if (now < next) return;
+    next = now + interval;
+    ID3D11Resource *bb = nullptr;
+    g_backbuffer->GetResource(&bb);
+    D3D11_TEXTURE2D_DESC d;
+    ((ID3D11Texture2D *)bb)->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ, d.MiscFlags = 0;
+    ID3D11Texture2D *st = nullptr;
+    if (SUCCEEDED(g_dev->CreateTexture2D(&d, nullptr, &st))) {
+        g_ctx->CopyResource(st, bb);
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+            uint32_t w = d.Width / 2, h = d.Height / 2;
+            std::vector<uint8_t> rgb((size_t)w * h * 3);
+            for (uint32_t y = 0; y < h; y++)
+                for (uint32_t x = 0; x < w; x++)
+                    memcpy(&rgb[((size_t)y * w + x) * 3], (const uint8_t *)m.pData + (size_t)y * 2 * m.RowPitch + x * 8, 3);
+            char path[64];
+            snprintf(path, sizeof path, "shot_%04d.png", (int)now);
+            write_png(path, rgb.data(), w, h);
+            LOG("rsx", "screenshot %s (frame %u)", path, g_frame);
+            g_ctx->Unmap(st, 0);
+        }
+        st->Release();
+    }
+    bb->Release();
+}
+
 void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     if (!g_ok) return;
     g_frame++;
@@ -1343,6 +1422,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     g_ctx->PSSetSamplers(0, 1, &g_present_smp);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_ctx->Draw(3, 0);
+    maybe_screenshot();
     g_swap->Present(0, 0);
 }
 

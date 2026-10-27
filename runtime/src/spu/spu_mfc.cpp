@@ -118,6 +118,7 @@ void SpuThread::mfc_command(uint32_t cmd) {
             for (int i = 0; ok && i < 16; i++) ok = __atomic_load_n(&mem64[i], __ATOMIC_SEQ_CST) == want[i];
             for (int i = 0; ok && i < 16; i++)
                 if (want[i] != src[i]) __atomic_store_n(&mem64[i], src[i], __ATOMIC_SEQ_CST);
+            if (ok) line_commit(line);
             line_unlock(line);
         }
         raddr = 0;
@@ -127,6 +128,7 @@ void SpuThread::mfc_command(uint32_t cmd) {
     case 0xb0: case 0xb8: {                         // PUTLLUC, PUTQLLUC
         line_lock(ea);
         memcpy(ea_ptr(ea & ~127u), ls + (lsa & ~127u), 128);
+        line_commit(ea);
         line_unlock(ea);
         if (cmd == 0xb0) atomic_stat = 2;           // MFC_PUTLLUC_SUCCESS
         break;

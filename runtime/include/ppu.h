@@ -38,6 +38,7 @@ typedef struct PPUContext {
     uint32_t fpscr, vscr, vrsave;
     uint32_t jt;   /* target of an indirect tail jump (see ppu_dispatch) */
     uint64_t reserve_addr, reserve_val;
+    uint32_t reserve_seq;   /* line commit count at lwarx/ldarx (see line_commit) */
     uint32_t thread_id;
     void *host;    /* runtime-owned per-thread state */
 } PPUContext;
@@ -149,27 +150,43 @@ static inline uint64_t divdu_(uint64_t a, uint64_t b) { return b ? a / b : 0; }
 static inline uint64_t cntlzw_(uint64_t x) { return (uint32_t)x ? __builtin_clz((uint32_t)x) : 32; }
 static inline uint64_t cntlzd_(uint64_t x) { return x ? __builtin_clzll(x) : 64; }
 
-/* ---- atomics (lwarx/stwcx. reservation emulated with CAS) ----
+/* ---- atomics (lwarx/stwcx. reservation) ----
  * Conditional stores take a spinlock per 128-byte line, shared with SPU
  * PUTLLC, so a lock-line commit (several 64-bit words) is atomic against
- * them, as on hardware. */
+ * them, as on hardware.
+ *
+ * A reservation is lost when anyone else commits to the line, not only when
+ * the word's value differs: every atomic commit (stwcx./stdcx., SPU
+ * PUTLLC/PUTLLUC, host LineGuard updates) bumps the line's commit count, and
+ * a conditional store fails if the count moved since lwarx. Comparing values
+ * alone let a pop from a lock-free list succeed after other threads popped
+ * and pushed the same head back (ABA), handing one item to two owners. */
 #define LINE_LOCKS 4096
 extern uint32_t g_line_locks[LINE_LOCKS];
+extern uint32_t g_line_seq[LINE_LOCKS];
+static inline uint32_t line_index(uint64_t ea) { return (uint32_t)(EA(ea) >> 7) & (LINE_LOCKS - 1); }
 static inline void line_lock(uint64_t ea) {
-    uint32_t *l = &g_line_locks[(EA(ea) >> 7) & (LINE_LOCKS - 1)];
+    uint32_t *l = &g_line_locks[line_index(ea)];
     while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE))
         while (__atomic_load_n(l, __ATOMIC_RELAXED)) __builtin_ia32_pause();
 }
 static inline void line_unlock(uint64_t ea) {
-    __atomic_store_n(&g_line_locks[(EA(ea) >> 7) & (LINE_LOCKS - 1)], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_line_locks[line_index(ea)], 0, __ATOMIC_RELEASE);
 }
+/* Under line_lock: record a commit to the line, breaking others' reservations. */
+static inline void line_commit(uint64_t ea) {
+    __atomic_store_n(&g_line_seq[line_index(ea)], g_line_seq[line_index(ea)] + 1, __ATOMIC_RELEASE);
+}
+static inline uint32_t line_seq(uint64_t ea) { return __atomic_load_n(&g_line_seq[line_index(ea)], __ATOMIC_ACQUIRE); }
 static inline uint64_t lwarx_(PPUContext *ctx, uint64_t ea) {
     ctx->reserve_addr = EA(ea);
+    ctx->reserve_seq = line_seq(ea);
     ctx->reserve_val = __builtin_bswap32(__atomic_load_n((uint32_t *)(g_mem + EA(ea)), __ATOMIC_SEQ_CST));
     return ctx->reserve_val;
 }
 static inline uint64_t ldarx_(PPUContext *ctx, uint64_t ea) {
     ctx->reserve_addr = EA(ea);
+    ctx->reserve_seq = line_seq(ea);
     ctx->reserve_val = __builtin_bswap64(__atomic_load_n((uint64_t *)(g_mem + EA(ea)), __ATOMIC_SEQ_CST));
     return ctx->reserve_val;
 }
@@ -178,8 +195,10 @@ static inline int stwcx_(PPUContext *ctx, uint64_t ea, uint64_t v) {
     ctx->reserve_addr = ~0ull;
     uint32_t expect = __builtin_bswap32((uint32_t)ctx->reserve_val);
     line_lock(ea);
-    int ok = __atomic_compare_exchange_n((uint32_t *)(g_mem + EA(ea)), &expect, __builtin_bswap32((uint32_t)v), 0,
+    int ok = g_line_seq[line_index(ea)] == ctx->reserve_seq &&
+             __atomic_compare_exchange_n((uint32_t *)(g_mem + EA(ea)), &expect, __builtin_bswap32((uint32_t)v), 0,
                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (ok) line_commit(ea);
     line_unlock(ea);
     return ok;
 }
@@ -188,8 +207,10 @@ static inline int stdcx_(PPUContext *ctx, uint64_t ea, uint64_t v) {
     ctx->reserve_addr = ~0ull;
     uint64_t expect = __builtin_bswap64(ctx->reserve_val);
     line_lock(ea);
-    int ok = __atomic_compare_exchange_n((uint64_t *)(g_mem + EA(ea)), &expect, __builtin_bswap64(v), 0,
+    int ok = g_line_seq[line_index(ea)] == ctx->reserve_seq &&
+             __atomic_compare_exchange_n((uint64_t *)(g_mem + EA(ea)), &expect, __builtin_bswap64(v), 0,
                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (ok) line_commit(ea);
     line_unlock(ea);
     return ok;
 }

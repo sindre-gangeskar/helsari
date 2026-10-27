@@ -39,6 +39,7 @@ void ensure(uint32_t ea, uint32_t size);  /* commit before host (kernel) I/O tou
 /* KZ2_WATCH_WRITE: kernel I/O into watched memory doesn't fault, so host I/O
    reports itself here (and the pages are unprotected for it). True if watched. */
 bool watch_host_write(uint32_t ea, uint32_t size, const char *what);
+void watch_add(uint32_t ea, uint32_t size);
 /* KZ2_HOOK_WATCH="ea:len": does [ea, ea+size) overlap it? (debug_hooks.cpp) */
 bool hook_watched(uint32_t ea, uint32_t size);
 uint32_t alloc_stack(uint32_t size);
@@ -53,7 +54,7 @@ void write_cstr(uint32_t ea, const std::string &s, size_t max);
 struct LineGuard {
     uint32_t ea;
     explicit LineGuard(uint32_t a) : ea(a) { line_lock(a); }
-    ~LineGuard() { line_unlock(ea); }
+    ~LineGuard() { line_commit(ea); line_unlock(ea); }
     LineGuard(const LineGuard &) = delete;
     LineGuard &operator=(const LineGuard &) = delete;
 };

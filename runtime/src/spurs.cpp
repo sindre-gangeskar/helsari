@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #define REG(n) hle_register(#n, hle_##n)
 
@@ -40,6 +41,23 @@ uint32_t *flag_word(uint32_t ef) { return (uint32_t *)mem::ptr(ef); }
 void flag_set(uint32_t ef, uint16_t bits) {
     mem::LineGuard g(ef);
     __atomic_fetch_or(flag_word(ef), __builtin_bswap32((uint32_t)bits << 16), __ATOMIC_SEQ_CST);
+}
+
+// Debug (with KZ2_HOOK_WATCH): the last output of every Edge Zlib request by
+// destination, so a later reader of a buffer can tell whether it still holds
+// what was written (edge_zlib_explain), and a copy whether its source still
+// holds what the inflate produced.
+struct Snap { uint32_t src = 0, size = 0; bool inflate = false; uint32_t caller = 0; uint64_t seq = 0; std::vector<uint8_t> data; };
+std::mutex g_snap_lock;
+std::map<uint32_t, Snap> g_snaps;
+std::atomic<uint64_t> g_snap_seq{0};
+const bool g_snap_on = getenv("KZ2_HOOK_WATCH") != nullptr;
+
+// First offset in [0, n) where guest memory at ea differs from want, or -1.
+long first_diff(uint32_t ea, const uint8_t *want, uint32_t n) {
+    const uint8_t *m = (const uint8_t *)mem::ptr(ea);
+    for (uint32_t k = 0; k < n; k++) if (m[k] != want[k]) return k;
+    return -1;
 }
 
 // Edge Zlib inflate queue element (32 bytes):
@@ -74,8 +92,37 @@ void edge_zlib(uint32_t e) {
             }
         }
     } else {
+        if (g_snap_on) {
+            std::lock_guard<std::mutex> lk(g_snap_lock);
+            auto it = g_snaps.find(src);
+            if (it != g_snaps.end() && it->second.inflate && it->second.size >= csize) {
+                long d = first_diff(src, it->second.data.data(), csize);
+                if (d >= 0)
+                    LOG("spurs", "edge zlib: copy 0x%x -> 0x%x: source differs from inflate #%llu (r13 0x%x) at +0x%lx "
+                        "(now %08x, inflated %08x)", src, dst, (unsigned long long)it->second.seq, it->second.caller, d,
+                        ld32(src + (uint32_t)(d & ~3)), __builtin_bswap32(*(uint32_t *)&it->second.data[d & ~3]));
+            }
+        }
         memmove(mem::ptr(dst), mem::ptr(src), csize);
         n = csize;
+    }
+    // KZ2_WATCH_ZLIB_COPY=<first word>:<offset>:<len>: when a copy writes a block that
+    // starts with that word, watch [offset, offset+len) of its output for later writes.
+    static const char *wzc = getenv("KZ2_WATCH_ZLIB_COPY");
+    if (wzc && !(outv & 1) && n > 0) {
+        uint32_t word = 0, off = 0, len = 0;
+        sscanf(wzc, "%x:%x:%x", &word, &off, &len);
+        if (ld32(dst) == word) {
+            LOG("spurs", "edge zlib: copy -> 0x%x starts with 0x%08x: watching 0x%x+0x%x", dst, word, dst + off, len);
+            mem::watch_add(dst + off, len);
+        }
+    }
+    if (g_snap_on && n > 0) {
+        std::lock_guard<std::mutex> lk(g_snap_lock);
+        if (g_snaps.size() > 256 && !g_snaps.count(dst)) g_snaps.erase(g_snaps.begin());
+        Snap &s = g_snaps[dst];
+        s.src = src, s.size = (uint32_t)n, s.inflate = outv & 1, s.seq = ++g_snap_seq;
+        s.data.assign((const uint8_t *)mem::ptr(dst), (const uint8_t *)mem::ptr(dst) + n);
     }
     if (mem::hook_watched(dst, usize))
         LOG("hook", "edge zlib %s 0x%x (%u bytes) -> 0x%x (%u): %ld; out %08x %08x %08x %08x", outv & 1 ? "inflate" : "copy",
@@ -93,6 +140,23 @@ void edge_zlib(uint32_t e) {
     if (ef) flag_set(ef, bits);
 }
 } // namespace
+
+// Debug: explain the contents of [ea, ea+size) against the Edge Zlib outputs written there.
+void edge_zlib_explain(uint32_t ea, uint32_t size) {
+    if (!g_snap_on) return;
+    std::lock_guard<std::mutex> lk(g_snap_lock);
+    for (auto &[dst, s] : g_snaps) {
+        if (ea >= dst + s.size || dst >= ea + size) continue;
+        uint32_t lo = std::max(ea, dst), hi = std::min(ea + size, dst + s.size);
+        long d = first_diff(lo, s.data.data() + (lo - dst), hi - lo);
+        uint32_t nz = 0;
+        for (uint32_t k = lo - dst; k < hi - dst; k++) nz += s.data[k] != 0;
+        LOG("spurs", "  0x%x..0x%x came from edge zlib %s #%llu (0x%x -> 0x%x, r13 0x%x, %u nonzero bytes then; latest #%llu): %s",
+            lo, hi, s.inflate ? "inflate" : "copy", (unsigned long long)s.seq, s.src, dst, s.caller, nz,
+            (unsigned long long)g_snap_seq.load(), d < 0 ? "unchanged since" : "CHANGED since");
+        if (d >= 0) LOG("spurs", "    first change at 0x%lx", lo + d);
+    }
+}
 
 HLE(_cellSpursEventFlagInitialize) {
     // (spurs, taskset, eventFlag, flagClearMode, flagDirection)
