@@ -33,6 +33,9 @@ std::atomic<uint32_t> g_shm_next{0x08000001};
 uint32_t syscall_dispatch(PPUContext *ctx, uint64_t n) {
     uint32_t id;
     int32_t r;
+    static const bool trace_mm = getenv("KZ2_TRACE_MMAPPER") != nullptr;   // memory/mmapper calls
+    if (trace_mm && n >= 324 && n <= 352)
+        LOG("sys", "syscall %llu (%llx, %llx, %llx, %llx)", (unsigned long long)n, ARG(0), ARG(1), ARG(2), ARG(3));
     switch (n) {
     /* ---- process ---- */
     case 1: return 1;                                    // sys_process_getpid

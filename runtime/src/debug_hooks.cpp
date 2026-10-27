@@ -3,6 +3,7 @@
 #include "runtime.h"
 
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,18 @@ std::string hex(uint32_t ea, int bytes) {
 extern "C" void f_00a4a99c(PPU_CTX) {
     uint32_t dst = (uint32_t)ctx->r[4], size = (uint32_t)ctx->r[5];
     if (mem::hook_watched(dst, size)) {
+        // KZ2_WATCH_WRITE_LATE="ea:len,...": write watches armed only once a watched
+        // asset is read (e.g. after level load), so earlier traffic does not fill the log.
+        static std::once_flag late;
+        std::call_once(late, [] {
+            if (const char *p = getenv("KZ2_WATCH_WRITE_LATE"))
+                for (const char *s = p; *s;) {
+                    char *e;
+                    uint32_t a = strtoul(s, &e, 16), n = *e == ':' ? strtoul(e + 1, &e, 16) : 4;
+                    mem::watch_add(a, n);
+                    s = *e == ',' ? e + 1 : e;
+                }
+        });
         uint32_t st = ld32((uint32_t)ctx->r[3] + 12), cur = ld32(st + 176), end = ld32(st + 180);
         LOG("hook", "stream read 0x%x bytes -> 0x%x: reader 0x%x cursor 0x%x end 0x%x (%s); src:%s", size, dst,
             (uint32_t)ctx->r[3], cur, end, (int32_t)(end - cur) < (int32_t)size ? "refill" : "buffered",

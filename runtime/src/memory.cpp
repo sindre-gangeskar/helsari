@@ -103,6 +103,10 @@ void watch_thread() {
     }
 }
 
+thread_local uintptr_t t_step_page;   // watched page unprotected for one single-stepped store
+thread_local uint32_t t_step_logged;  // in-range address of that store, to log the value it wrote
+thread_local std::string t_step_report;
+
 bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
     uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xfff;
     for (auto &w : g_watch) {
@@ -123,10 +127,15 @@ bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
             return true;
         }
         uint32_t ea = (uint32_t)(addr - g_mem);
-        if (in_watch_range((uint32_t)(page - (uintptr_t)g_mem), 0x1000) && g_watch_logs++ < 300) {
+        if (in_watch_range(ea, 16) && g_watch_logs < 300) {
+            // The report is logged after the store (on_fault, single step), and only if
+            // the word written matches KZ2_WATCH_VALUE when that is set.
+            t_step_logged = ea & ~3u;
             PPUContext *ctx = thread::current();
-            LOG("mem", "watched write to 0x%x (guest lr 0x%llx, host:%s)", (uint32_t)(addr - g_mem),
-                ctx ? (unsigned long long)ctx->lr : 0ull, host_backtrace(ep->ContextRecord).c_str());
+            char line[512];
+            snprintf(line, sizeof line, "watched write to 0x%x (guest lr 0x%llx, host:%s)\n", ea,
+                     ctx ? (unsigned long long)ctx->lr : 0ull, host_backtrace(ep->ContextRecord).c_str());
+            t_step_report = line;
             if (ctx) {   // in a memcpy: r3 dst, r4 source cursor, r5 length (backward copies start at the end)
                 auto hex = [](uint32_t ea) {
                     std::string h;
@@ -140,28 +149,37 @@ bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
                     return h;
                 };
                 uint32_t cur = (uint32_t)ctx->r[4], n = (uint32_t)ctx->r[5];
-                LOG("mem", "  r3=0x%x r4=0x%x r5=0x%x; before r4:%s; at r4-r5:%s", (uint32_t)ctx->r[3], cur, n,
-                    hex(cur - 32).c_str(), hex(cur - n).c_str());
+                snprintf(line, sizeof line, "  r3=0x%x r4=0x%x r5=0x%x; before r4:%s; at r4-r5:%s\n", (uint32_t)ctx->r[3], cur,
+                         n, hex(cur - 32).c_str(), hex(cur - n).c_str());
+                t_step_report += line;
                 // the caller's saved state: non-volatile registers and what they point at
                 for (int r = 26; r < 32; r++) {
                     uint32_t v = (uint32_t)ctx->r[r];
                     bool ptr = v >= 0x10000 && v < 0xf0000000;
-                    LOG("mem", "  r%d=0x%x%s%s", r, v, ptr ? ":" : "", ptr ? hex(v & ~3u).c_str() : "");
+                    snprintf(line, sizeof line, "  r%d=0x%x%s%s\n", r, v, ptr ? ":" : "", ptr ? hex(v & ~3u).c_str() : "");
+                    t_step_report += line;
                 }
-                if (const char *e = getenv("KZ2_WATCH_PEEK")) {   // temporary: "reg:off,..." dump [r<reg>+off]
+                if (const char *e = getenv("KZ2_WATCH_PEEK")) {   // "reg:off,..." dumps [r<reg>+off]
                     for (const char *s = e; *s;) {
                         char *end;
                         int r = (int)strtol(s, &end, 10);
                         uint32_t off = *end == ':' ? strtoul(end + 1, &end, 16) : 0;
-                        if (r >= 0 && r < 32) LOG("mem", "  [r%d+0x%x]:%s", r, off, hex((uint32_t)ctx->r[r] + off).c_str());
+                        if (r >= 0 && r < 32) {
+                            snprintf(line, sizeof line, "  [r%d+0x%x]:%s\n", r, off, hex((uint32_t)ctx->r[r] + off).c_str());
+                            t_step_report += line;
+                        }
                         s = *end == ',' ? end + 1 : end;
                     }
                 }
             }
         }
+        // Let this one store through, then single-step and re-protect (on_fault),
+        // so every store to the page is seen, not just the first of a burst.
         DWORD old;
         VirtualProtect((void *)page, 0x1000, PAGE_READWRITE, &old);
-        w.rearm_at = now_ms() + 5;
+        w.rearm_at = now_ms() + 1000;
+        t_step_page = page;
+        ep->ContextRecord->EFlags |= 0x100;   // trap flag
         return true;
     }
     return false;
@@ -188,6 +206,21 @@ namespace {
 
 LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
     auto *er = ep->ExceptionRecord;
+    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && t_step_page) {   // the watched store is done: re-arm
+        DWORD old;
+        VirtualProtect((void *)t_step_page, 0x1000, PAGE_READONLY, &old);
+        t_step_page = 0;
+        if (t_step_logged) {
+            uint32_t v;
+            memcpy(&v, g_mem + t_step_logged, 4);
+            v = __builtin_bswap32(v);
+            static const char *want = getenv("KZ2_WATCH_VALUE");
+            if ((!want || v == strtoul(want, nullptr, 16)) && g_watch_logs++ < 300)
+                LOG("mem", "%s  -> 0x%x now 0x%08x", t_step_report.c_str(), t_step_logged, v);
+            t_step_logged = 0;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     auto addr = (uint8_t *)er->ExceptionInformation[1];
     if (addr < g_mem || addr >= g_mem + RESERVE) return EXCEPTION_CONTINUE_SEARCH;
