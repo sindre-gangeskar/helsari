@@ -26,6 +26,7 @@ file(GLOB_RECURSE RECOMP_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/rec
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RECOMP_SOURCES})
 
 file(STRINGS ${GEN_DIR}/sources.txt GENERATED_SOURCES)
+file(STRINGS ${GEN_DIR}/spu_sources.txt GENERATED_SPU_SOURCES)
 
 # Translated PPU code: plain C, compiled for exact PowerPC semantics.
 add_library(kz2_ppu STATIC ${GENERATED_SOURCES})
@@ -56,6 +57,8 @@ add_executable(kz2
   runtime/src/profiler.cpp
   runtime/src/spu/spu_interp.cpp
   runtime/src/spu/spu_mfc.cpp
+  runtime/src/spu/spu_native.cpp
+  ${GENERATED_SPU_SOURCES}
   runtime/src/inflate.cpp
   runtime/src/rsx/vp.cpp
   runtime/src/rsx/fp.cpp

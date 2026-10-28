@@ -92,6 +92,7 @@ void SpuThread::mfc_command(uint32_t cmd) {
     switch (cmd) {
     case 0x40: case 0x41: case 0x42:                // GET, GETB, GETF
         memcpy(ls + lsa, ea_ptr(ea), size);
+        code_loaded(lsa, ea, size);                 // unmaps what it overwrote; maps a known image
         break;
     case 0x20: case 0x21: case 0x22:                // PUT, PUTB, PUTF
     case 0x30: case 0x31: case 0x32:                // PUTR variants
@@ -104,6 +105,7 @@ void SpuThread::mfc_command(uint32_t cmd) {
     case 0xd0: {                                    // GETLLAR
         raddr = ea & ~127u;
         memcpy(rdata, ea_ptr(raddr), 128);
+        ls_written(lsa & ~127u, 128);
         memcpy(ls + (lsa & ~127u), rdata, 128);
         atomic_stat = 4;                            // MFC_GETLLAR_SUCCESS
         break;
@@ -149,7 +151,7 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
     for (uint32_t i = first; i < count; i++) {
         uint32_t ts = ls32(list + 8 * i), eal = ls32(list + 8 * i + 4), sz = ts & 0x7fff;
         if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, lsa, sz);
-        if (get) memcpy(ls + lsa, ea_ptr(eal), sz);
+        if (get) ls_written(lsa, sz), memcpy(ls + lsa, ea_ptr(eal), sz);
         else memcpy(ea_ptr(eal), ls + lsa, sz);
         lsa = (lsa + sz + 15) & (LS_SIZE - 16);
         if (ts & 0x80000000u) {

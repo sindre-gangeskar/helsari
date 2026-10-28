@@ -186,6 +186,12 @@ void SpuThread::run() {
             if (!on_trap(*this)) { running = false; break; }
             continue;
         }
+        if (native && !interp_once)
+            if (NativeFn f = native[pc >> 2]) {
+                pc = f(*this, pc);
+                continue;
+            }
+        interp_once = false;
         uint32_t x = ls32(pc);
         history[history_pos++ & 63] = pc;
         if (traced < trace_limit && traced++ >= 0) LOG("spu", "%s %05x: %08x  %s", name.c_str(), pc, x, disasm(pc, x).c_str());

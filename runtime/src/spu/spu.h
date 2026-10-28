@@ -52,6 +52,14 @@ constexpr uint32_t EVENT_TM = 0x020;   // decrementer passed zero
 constexpr uint32_t EVENT_TG = 0x001;   // tag-group status update ready
 constexpr uint32_t EVENT_SN = 0x002;   // DMA list stall-and-notify
 
+// Recompiled SPU code (tools/recomp/spu.py, spu_native.cpp). A native function
+// enters at one of its block starts and returns the next pc to run.
+struct SpuThread;
+using NativeFn = uint32_t (*)(SpuThread &, uint32_t pc);
+struct NativeEntry { uint32_t pc; NativeFn fn; };
+// One compiled image: `size` bytes at guest address src_ea, executed at LS ls_base.
+struct NativeModule { const char *name; uint32_t src_ea, ls_base, size; const NativeEntry *entries; uint32_t count; };
+
 struct SpuThread {
     alignas(16) uint8_t ls[LS_SIZE];
     V gpr[128];
@@ -99,7 +107,12 @@ struct SpuThread {
     uint32_t ls32(uint32_t a) const {
         uint32_t v; memcpy(&v, ls + (a & (LS_SIZE - 4)), 4); return __builtin_bswap32(v);
     }
-    void set_ls32(uint32_t a, uint32_t v) { v = __builtin_bswap32(v); memcpy(ls + (a & (LS_SIZE - 4)), &v, 4); }
+    void set_ls32(uint32_t a, uint32_t v) {
+        a &= LS_SIZE - 4;
+        if (code_line[a >> 7]) ls_written(a, 4);
+        v = __builtin_bswap32(v);
+        memcpy(ls + a, &v, 4);
+    }
     // A quadword in LS is 16 big-endian bytes; V keeps big-endian word order with each
     // word in host order, so converting is one byte swap per word.
     static __m128i bswap32_mask() { return _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12); }
@@ -110,8 +123,34 @@ struct SpuThread {
         return r;
     }
     void stq(uint32_t a, const V &v) {
-        _mm_store_si128((__m128i *)(ls + (a & (LS_SIZE - 16))),
-                        _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)v.w), bswap32_mask()));
+        a &= LS_SIZE - 16;
+        if (code_line[a >> 7]) ls_written(a, 16);
+        _mm_store_si128((__m128i *)(ls + a), _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)v.w), bswap32_mask()));
+    }
+
+    // Recompiled code mapped into LS. native[pc / 4] is the function entering
+    // at pc; code_line marks 128-byte lines holding mapped code, and any write
+    // there unmaps that module (code_epoch++ makes running native code return).
+    NativeFn *native = nullptr;
+    uint8_t code_line[LS_SIZE / 128] = {};
+    uint32_t code_epoch = 0;
+    bool interp_once = false;              // native code handed one instruction to the interpreter
+    uint32_t native_polls = 0;
+    struct Mapped { const NativeModule *m; };
+    Mapped mapped[8] = {};
+    // An image was copied to LS [lsa, lsa+size) from guest address ea: map recompiled code for it.
+    void code_loaded(uint32_t lsa, uint32_t ea, uint32_t size);
+    // LS [lsa, lsa+size) is about to be written by anything other than a code load.
+    void ls_written(uint32_t lsa, uint32_t size) {
+        for (uint32_t l = lsa >> 7, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 7; l <= e && size; l++)
+            if (code_line[l]) { unmap_range(lsa, size); return; }
+    }
+    void unmap_range(uint32_t lsa, uint32_t size);
+    // Called by native code at branches while interrupts are enabled: take a pending event.
+    bool poll_interrupt(uint32_t &next) {
+        if (++native_polls & 15 || !pending_events()) return false;
+        srr0 = next, next = 0, interrupts = false;
+        return true;
     }
 
     void reset();

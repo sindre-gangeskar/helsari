@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from . import analyze, codegen, elf, nid
+from . import analyze, codegen, elf, nid, spu
 from .overrides import OVERRIDES
 
 KNOWN_TITLES = {'BCES00081': 'Killzone 2 (EU)', 'BCUS98116': 'Killzone 2 (US)',
@@ -159,6 +159,10 @@ def generate(e, out, rpcs3):
         c.write(f'#define GAME_MALLOC_PAGESIZE 0x{pp["malloc_pagesize"]:x}u\n#define GAME_SDK_VERSION 0x{pp["sdk_version"]:x}u\n')
     with open(os.path.join(out, 'sources.txt'), 'w') as s:
         for p in files + [os.path.join(out, 'ppu_table.c'), os.path.join(out, 'imports.c')]:
+            s.write(p.replace('\\', '/') + '\n')
+    spu_files = spu.generate(e, out, log)
+    with open(os.path.join(out, 'spu_sources.txt'), 'w') as s:
+        for p in spu_files:
             s.write(p.replace('\\', '/') + '\n')
     log(f'done in {time.time() - t0:.1f}s')
 

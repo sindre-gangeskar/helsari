@@ -59,6 +59,7 @@ Workload *find(uint32_t wid) {
 
 void init_context(Workload &w, spu::SpuThread &s) {
     // SpursKernelContext fields the policy module reads.
+    s.ls_written(CTX_ADDR, 0x100);
     memset(s.ls + CTX_ADDR, 0, 0x100);
     s.set_ls32(CTX_ADDR + 0xc0, 0), s.set_ls32(CTX_ADDR + 0xc4, w.spurs);    // 0x1C0: spurs (u64)
     s.set_ls32(CTX_ADDR + 0xc8, 0);                                           // 0x1C8: spuNum
@@ -77,6 +78,7 @@ void workload_thread(Workload *w) {
     name_host_thread(s.name);
     if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;   // exclude from tracing
+    s.ls_written(PM_ADDR, w->size);
     memcpy(s.ls + PM_ADDR, mem::ptr(w->pm), w->size);
     s.set_trap(SELECT_WORKLOAD_ADDR);
     s.set_trap(EXIT_ADDR);

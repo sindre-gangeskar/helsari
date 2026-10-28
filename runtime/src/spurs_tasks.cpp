@@ -74,8 +74,10 @@ uint32_t load_elf(spu::SpuThread &s, uint32_t elf) {
             LOG("spurs", "task ELF 0x%x: segment 0x%x+0x%x outside task area", elf, vaddr, memsz);
             return 0;
         }
+        s.ls_written(vaddr, memsz);
         memset(s.ls + vaddr, 0, memsz);
         memcpy(s.ls + vaddr, mem::ptr(elf + off), filesz);
+        s.code_loaded(vaddr, elf + off, filesz);           // recompiled code for this segment, if any
     }
     return entry;
 }

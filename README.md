@@ -15,7 +15,7 @@ generated on your machine, from your own dump, into `build/` (git-ignored).
 | Boot | crt0, TLS, libc init, ~15 engine threads (FIOS, audio, pad, SPURS handlers) |
 | Kernel | mutex/cond/lwmutex/lwcond/semaphore/event flag/event queue/rwlock, threads |
 | Files | `/dev_bdvd` mapped onto the dump, split `.666xx` archives joined transparently |
-| SPU | **not emulated.** The Edge Zlib inflate task is replaced with native code, so asset streaming works |
+| SPU | Interpreter plus a static recompiler: SPURS task ELFs and job binaries in the EBOOT are compiled to C++ (`tools/recomp/spu.py`) and mapped when loaded into local store; Edge Zlib runs natively |
 | GPU (RSX) | Direct3D 11 backend: vertex/fragment programs translated to HLSL, render-target cache, textures (swizzled, DXT, cube), blend/depth/stencil. Culling and shader branches not yet |
 | Input | XInput controller mapped to DualShock 3 |
 | Audio | Ports and timing events work; no sound output yet |
