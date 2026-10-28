@@ -13,6 +13,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <unordered_map>
@@ -22,6 +23,15 @@ uint32_t regs[0x10000 / 4];
 uint32_t vp_ucode[512 * 4];
 float vp_consts[512 * 4];
 bool vp_consts_dirty = true;
+// Backend costs on the FIFO thread, reported with the fps (rsx::stats_line).
+uint64_t g_wb_us, g_wb_calls, g_draw_us, g_draw_calls, g_present_us;
+uint64_t g_wbs_us, g_wbs_n, g_tex_us, g_tex_n, g_compile_us, g_compile_n;   // inside the above
+uint64_t g_fetch_us, g_fetch_verts, g_fetch_used, g_dcall_us, g_map_us;      // vertex fetch (of which Map+copy)
+struct ScopedUs {
+    uint64_t &acc;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~ScopedUs() { acc += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(); }
+};
 
 uint64_t fnv(const void *p, size_t n, uint64_t h) {
     const uint8_t *b = (const uint8_t *)p;
@@ -72,6 +82,8 @@ std::unordered_map<uint64_t, PsEntry> g_ps;
 
 ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
     ID3DBlob *code = nullptr, *err = nullptr;
+    ScopedUs timer{g_compile_us};
+    g_compile_n++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "main", target,
                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
     if (FAILED(hr)) {
@@ -99,7 +111,6 @@ struct DynBuf {
     ID3D11ShaderResourceView *srv = nullptr;
     UINT size = 0;
 };
-DynBuf g_vbuf, g_ibuf;
 ID3D11Buffer *g_cb_vc, *g_cb_vx, *g_cb_px;
 
 void *map_buf(DynBuf &b, UINT size, UINT bind, bool structured) {
@@ -125,6 +136,38 @@ void *map_buf(DynBuf &b, UINT size, UINT bind, bool structured) {
     D3D11_MAPPED_SUBRESOURCE m;
     g_ctx->Map(b.buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
     return m.pData;
+}
+
+// Per-draw vertex and index data are appended to one large dynamic buffer
+// with MAP_WRITE_NO_OVERWRITE and only discarded when it wraps; draws locate
+// their data with BaseVertexLocation / StartIndexLocation. Discarding a buffer
+// on every draw makes the driver run out of renames and wait for the GPU.
+struct Ring : DynBuf { UINT pos = 0; };
+Ring g_vring, g_iring;
+bool g_ring_ok;   // MAP_WRITE_NO_OVERWRITE is allowed on the vertex SRV buffer
+
+// Space for `bytes` (a multiple of `unit`): returns the mapped pointer and its offset in units.
+void *ring_map(Ring &r, UINT bytes, UINT unit, UINT bind, bool structured, UINT *offset_units) {
+    if (!g_ring_ok) { *offset_units = 0; return map_buf(r, bytes, bind, structured); }
+    constexpr UINT RING_SIZE = 64 << 20;
+    D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
+    if (bytes > r.size || r.size < RING_SIZE) {               // (re)create, large enough
+        UINT want = std::max(RING_SIZE, bytes * 2);
+        void *p = map_buf(r, want, bind, structured);            // creates and maps with DISCARD
+        g_ctx->Unmap(r.buf, 0);
+        (void)p;
+        r.pos = 0;
+        mode = D3D11_MAP_WRITE_DISCARD;
+    } else if (r.pos + bytes > r.size) {
+        r.pos = 0;
+        mode = D3D11_MAP_WRITE_DISCARD;
+    }
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(g_ctx->Map(r.buf, 0, mode, 0, &m))) { *offset_units = 0; return nullptr; }
+    *offset_units = r.pos / unit;
+    void *p = (uint8_t *)m.pData + r.pos;
+    r.pos = (r.pos + bytes + unit - 1) / unit * unit;
+    return p;
 }
 
 ID3D11Buffer *make_cb(UINT size) {
@@ -398,6 +441,8 @@ uint32_t image_size(uint32_t fmt, uint32_t w, uint32_t h, uint32_t pitch) {
 void write_back_surface(uint32_t ea, Surface &s) {
     if (!s.dirty || !s.pitch) return;
     s.dirty = false;
+    ScopedUs timer{g_wbs_us};
+    g_wbs_n++;
     uint32_t bpp = s.depth ? (s.fmt == 1 ? 2 : 4)
                            : s.fmt == 0xb ? 8 : s.fmt == 0xc ? 16 : s.fmt == 0x9 ? 1 : s.fmt == 0xa ? 2 : 4;
     uint32_t w = std::min(s.w, s.pitch / bpp), h = s.h;
@@ -590,6 +635,8 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     release(t.srv);
     release(t.tex);
     t.content = hv;
+    ScopedUs timer{g_tex_us};
+    g_tex_n++;
 
     int faces = cube ? 6 : 1;
     uint32_t face_stride = 0;
@@ -970,9 +1017,22 @@ void draw() {
     }
     if (vmin > vmax || vmax - vmin > 4 * 1024 * 1024) return;
     uint32_t nv = vmax - vmin + 1;
-    float *vd = (float *)map_buf(g_vbuf, nv * 256, D3D11_BIND_SHADER_RESOURCE, true);
-    for (uint32_t i = 0; i < nv; i++) fetch_vertex(vd + i * 64, vmin + i);
-    g_ctx->Unmap(g_vbuf.buf, 0);
+    UINT base_vertex = 0, start_index = 0;   // where this draw's data sits in the rings
+    {
+        ScopedUs timer{g_fetch_us};
+        g_fetch_verts += nv;
+        g_fetch_used += src_idx.size();
+        // Decode into ordinary memory, then copy once: the mapped buffer is
+        // write-combined, where scattered partial writes are very slow.
+        static std::vector<float> scratch;
+        if (scratch.size() < (size_t)nv * 64) scratch.resize((size_t)nv * 64);
+        for (uint32_t i = 0; i < nv; i++) fetch_vertex(scratch.data() + (size_t)i * 64, vmin + i);
+        ScopedUs map_timer{g_map_us};
+        void *vd = ring_map(g_vring, nv * 256, 256, D3D11_BIND_SHADER_RESOURCE, true, &base_vertex);
+        if (!vd) return;
+        memcpy(vd, scratch.data(), (size_t)nv * 256);
+        g_ctx->Unmap(g_vring.buf, 0);
+    }
 
     std::vector<uint32_t> list;
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -992,9 +1052,10 @@ void draw() {
         flush_run();
     }
     if (list.empty()) return;
-    uint32_t *id = (uint32_t *)map_buf(g_ibuf, (UINT)list.size() * 4, D3D11_BIND_INDEX_BUFFER, false);
+    uint32_t *id = (uint32_t *)ring_map(g_iring, (UINT)list.size() * 4, 4, D3D11_BIND_INDEX_BUFFER, false, &start_index);
+    if (!id) return;
     memcpy(id, list.data(), list.size() * 4);
-    g_ctx->Unmap(g_ibuf.buf, 0);
+    g_ctx->Unmap(g_iring.buf, 0);
 
     // shaders
     ID3D11VertexShader *vs = vertex_shader();
@@ -1018,8 +1079,9 @@ void draw() {
 
     // constants
     if (vp_consts_dirty) { upload_cb(g_cb_vc, vp_consts, sizeof vp_consts); vp_consts_dirty = false; }
-    float vx[12] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
+    float vx[16] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
                     regf(0x0a28), regf(0x0a2c), (float)b.w, (float)b.h, 0, 0};
+    memcpy(&vx[12], &base_vertex, 4);   // vbase.x: first vertex of this draw in the ring (uint)
     bool origin_bottom = (reg(0x1d88) >> 12) & 0xf;
     // Window-origin "bottom" (0x1d88 bit 12) maps to D3D top-down here; verified against
     // the font atlas, which must come out upright for text lookups to work.
@@ -1095,7 +1157,7 @@ void draw() {
     ID3D11Buffer *vcb[2] = {g_cb_vc, g_cb_vx};
     g_ctx->VSSetConstantBuffers(0, 2, vcb);
     g_ctx->PSSetConstantBuffers(0, 1, &g_cb_px);
-    g_ctx->VSSetShaderResources(0, 1, &g_vbuf.srv);
+    g_ctx->VSSetShaderResources(0, 1, &g_vring.srv);
     // sampling a surface that is also being rendered to: use a snapshot
     for (auto &s : srv) {
         for (auto *c : b.color) if (s && c && s == c->srv) s = snapshot(*c);
@@ -1103,9 +1165,9 @@ void draw() {
     }
     g_ctx->PSSetShaderResources(0, 16, srv);
     g_ctx->PSSetSamplers(0, 16, smp);
-    g_ctx->IASetIndexBuffer(g_ibuf.buf, DXGI_FORMAT_R32_UINT, 0);
+    g_ctx->IASetIndexBuffer(g_iring.buf, DXGI_FORMAT_R32_UINT, 0);
     g_ctx->IASetPrimitiveTopology(topo);
-    g_ctx->DrawIndexed((UINT)list.size(), 0, 0);
+    g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
     // Only what the RSX would write is dirty: a zeta buffer stays bound while depth
     // and stencil are off, and depth-only passes mask colour writes.
     if (reg(0x0324)) for (auto *c : b.color) if (c) c->dirty = true;
@@ -1151,6 +1213,10 @@ bool create_device() {
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, &fl, 1,
                                                D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, nullptr, &g_ctx);
     if (FAILED(hr)) { LOG("rsx", "D3D11 device creation failed (0x%08lx)", hr); return false; }
+    D3D11_FEATURE_DATA_D3D11_OPTIONS opts{};
+    g_ring_ok = SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opts, sizeof opts)) &&
+                opts.MapNoOverwriteOnDynamicBufferSRV;
+    if (!g_ring_ok) LOG("rsx", "driver lacks MapNoOverwriteOnDynamicBufferSRV: per-draw buffers are discarded (slow)");
     ID3D11Texture2D *bb = nullptr;
     g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
     g_dev->CreateRenderTargetView(bb, nullptr, &g_backbuffer);
@@ -1239,7 +1305,10 @@ void begin_end(uint32_t prim) {
         g_ranges.clear();
         g_indexed = false;
     } else {
+        auto t0 = std::chrono::steady_clock::now();
         draw();
+        g_draw_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        g_draw_calls++;
         g_ranges.clear();
     }
 }
@@ -1263,8 +1332,27 @@ void request_capture() { g_capture_req = true; }
 // semaphores, user commands, flips): from then on the PPU and SPUs may read
 // what it rendered - Killzone 2 post-processes downsampled frames on the SPUs.
 void write_back() {
+    auto t0 = std::chrono::steady_clock::now();
     for (auto &[ea, s] : g_surfaces) write_back_surface(ea, s);
     for (auto &[ea, s] : g_depth_surfaces) write_back_surface(ea, s);
+    g_wb_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    g_wb_calls++;
+}
+std::string stats_line(uint32_t frames) {
+    char b[320];
+    double f = frames;
+    snprintf(b, sizeof b,
+             "RSX per frame: draws %.0f ms (%.0f), write-back %.0f ms (%.0f); surface readbacks %.0f ms (%.0f), "
+             "texture uploads %.0f ms (%.0f), shader compiles %.0f ms (%.0f), vertex fetch %.0f ms (%.1fM vertices "
+             "for %.1fM indices; Map+copy %.0f ms), draw calls %.0f ms; present %.0f ms",
+             g_draw_us / 1e3 / f, g_draw_calls / f, g_wb_us / 1e3 / f, g_wb_calls / f, g_wbs_us / 1e3 / f, g_wbs_n / f,
+             g_tex_us / 1e3 / f, g_tex_n / f, g_compile_us / 1e3 / f, g_compile_n / f, g_fetch_us / 1e3 / f,
+             g_fetch_verts / 1e6 / f, g_fetch_used / 1e6 / f, g_map_us / 1e3 / f, g_dcall_us / 1e3 / f,
+             g_present_us / 1e3 / f);
+    g_wb_us = g_wb_calls = g_draw_us = g_draw_calls = g_present_us = 0;
+    g_wbs_us = g_wbs_n = g_tex_us = g_tex_n = g_compile_us = g_compile_n = 0;
+    g_fetch_us = g_fetch_verts = g_fetch_used = g_dcall_us = g_map_us = 0;
+    return b;
 }
 
 // Debug: KZ2_SCREENSHOT=<sec> writes the presented frame, half size, to
@@ -1423,7 +1511,9 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_ctx->Draw(3, 0);
     maybe_screenshot();
+    auto t0 = std::chrono::steady_clock::now();
     g_swap->Present(0, 0);
+    g_present_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
 void write_back();

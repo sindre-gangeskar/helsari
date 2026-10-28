@@ -27,6 +27,12 @@ constexpr uint32_t OFFSET_TABLES = mem::RSX_IO + 0x400000; // io->ea and ea->io 
 constexpr uint32_t FRAGMENT = 32 * 1024;
 constexpr uint32_t GCM_FLIP_METHOD = 0xfeac;
 
+// Time the FIFO spent waiting in SEMAPHORE_ACQUIRE (reported with the fps).
+std::atomic<uint64_t> g_acquire_us{0};
+std::atomic<uint64_t> g_fifo_idle_us{0};   // FIFO empty: waiting for the game to submit
+uint64_t g_acquire_max_us;
+uint32_t g_acquire_max_label;
+
 struct Display { uint32_t offset, pitch, width, height; };
 Display g_disp[8];
 uint32_t g_io_base, g_io_size;
@@ -97,7 +103,11 @@ void flip(uint32_t id) {
     if (++n - last_n >= 60 || secs >= 5) {
         uint32_t frames = n - last_n;
         last = now, last_n = n;
-        LOG("gcm", "flip #%u (buffer %u), %.1f fps; %s", n, id, frames / secs, spu::stats_line(secs, frames).c_str());
+        LOG("gcm", "flip #%u (buffer %u), %.1f fps; %s; RSX FIFO idle %.0f ms/frame, semaphore waits %.0f ms/frame (longest %.0f ms, label 0x%x); %s",
+            n, id, frames / secs, spu::stats_line(secs, frames).c_str(), g_fifo_idle_us.exchange(0) / 1000.0 / frames,
+            g_acquire_us.exchange(0) / 1000.0 / frames, g_acquire_max_us / 1000.0, g_acquire_max_label,
+            rsx::stats_line(frames).c_str());
+        g_acquire_max_us = 0;
     }
     g_last_flip = id;
     if (id < 8) rsx::flip(g_disp[id].offset, g_disp[id].width, g_disp[id].height, g_disp[id].pitch);
@@ -137,7 +147,13 @@ void method(uint32_t m, uint32_t arg) {
     case 0x0068: {                                                      // NV406E_SEMAPHORE_ACQUIRE
         uint32_t a = LABEL_ADDR + g_rsx.semaphore_offset;
         int spin = 0;
+        auto t0 = std::chrono::steady_clock::now();
         for (; ld32(a) != arg && spin < 2000; spin++) Sleep(1);
+        if (spin) {
+            uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            g_acquire_us += us;
+            if (us > g_acquire_max_us) g_acquire_max_us = us, g_acquire_max_label = g_rsx.semaphore_offset;
+        }
         if (spin == 2000)
             LOG("rsx", "semaphore acquire timed out: label 0x%x = 0x%x, want 0x%x (fifo get 0x%x)",
                 g_rsx.semaphore_offset, ld32(a), arg, ld32(CTRL_ADDR + 4));
@@ -171,7 +187,12 @@ void fifo_thread() {
     uint32_t last_put = 0;
     for (;;) {
         uint32_t get = ld32(CTRL_ADDR + 4), put = ld32(CTRL_ADDR);
-        if (get == put) { Sleep(0); continue; }
+        if (get == put) {
+            auto t0 = std::chrono::steady_clock::now();
+            Sleep(0);
+            g_fifo_idle_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            continue;
+        }
         if (trace && put != last_put) { LOG("rsx", "put=0x%x get=0x%x", put, get); last_put = put; }
         uint32_t ea = io_ea(get);
         if (!ea) { LOG("rsx", "FIFO get 0x%x is not io-mapped (put 0x%x); stalling", get, put); Sleep(1000); continue; }

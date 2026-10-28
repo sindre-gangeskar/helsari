@@ -164,14 +164,14 @@ VpInfo translate_vp(uint32_t start) {
     }
     std::string h = w +
         "cbuffer VC : register(b0) { float4 c[512]; };\n"
-        "cbuffer VX : register(b1) { float4 vscale; float4 voffset; float4 surf; };\n"
+        "cbuffer VX : register(b1) { float4 vscale; float4 voffset; float4 surf; uint4 vbase; };\n"
         "StructuredBuffer<float4> vtx : register(t0);\n"
         "struct VOut { float4 pos : SV_Position;\n";
     for (int k = 1; k < 16; k++) h += "  float4 o" + std::to_string(k) + " : TEXCOORD" + std::to_string(k) + ";\n";
     h += "};\n"
          "VOut main(uint vid : SV_VertexID) {\n"
          "  float4 v[16];\n"
-         "  [unroll] for (int k = 0; k < 16; k++) v[k] = vtx[vid * 16 + k];\n"
+         "  [unroll] for (int k = 0; k < 16; k++) v[k] = vtx[(vid + vbase.x) * 16 + k];\n"
          "  float4 r[32]; [unroll] for (int k = 0; k < 32; k++) r[k] = 0;\n"
          "  float4 o[16]; [unroll] for (int k = 0; k < 16; k++) o[k] = float4(0, 0, 0, 1);\n"
          "  float4 cc0 = 0, cc1 = 0; int4 a0 = 0, a1 = 0;\n" +
