@@ -33,6 +33,8 @@ constexpr uint32_t LOCAL_BASE = 0xc0000000, LOCAL_SIZE = 0x0f900000; /* RSX loca
 constexpr uint32_t STACK_BASE = 0xd0000000, STACK_END = 0xe0000000;
 
 void init();
+uint64_t committed();                                 /* bytes of guest memory backed by host memory */
+std::string host_regions();                           /* committed private host memory outside it, by block size */
 uint32_t alloc(uint32_t size, uint32_t align = 16);  /* user region */
 void free(uint32_t addr);
 void ensure(uint32_t ea, uint32_t size);  /* commit before host (kernel) I/O touches it */

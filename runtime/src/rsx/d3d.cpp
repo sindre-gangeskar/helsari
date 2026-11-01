@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <atomic>
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d11_1.h>
+#include <dxgi1_6.h>
+#include <psapi.h>
 #include <d3dcompiler.h>
 
 #include <chrono>
@@ -187,6 +189,28 @@ void upload_cb(ID3D11Buffer *b, const void *data, size_t n) {
     g_ctx->Unmap(b, 0);
 }
 
+// Per-draw constants are appended to one large constant buffer and bound by
+// offset (D3D11.1 VSSetConstantBuffers1). Discarding a constant buffer on
+// every draw (~1700 per frame, 8 KB each) made the driver allocate fresh
+// memory each time, which it kept: the process grew ~30 MB per frame.
+struct CbSlice { UINT first = 0, num = 0, gen = ~0u; };
+ID3D11DeviceContext1 *g_ctx1;
+ID3D11Buffer *g_cbring;
+UINT g_cbring_pos, g_cbring_gen;
+constexpr UINT CBRING_SIZE = 16 << 20;
+CbSlice cb_push(const void *data, size_t n) {
+    UINT bytes = (UINT)((n + 255) & ~size_t(255));                    // offsets and sizes: multiples of 16 constants
+    D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
+    if (g_cbring_pos + bytes > CBRING_SIZE) g_cbring_pos = 0, g_cbring_gen++, mode = D3D11_MAP_WRITE_DISCARD;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(g_ctx->Map(g_cbring, 0, mode, 0, &m))) return {};
+    memcpy((uint8_t *)m.pData + g_cbring_pos, data, n);
+    g_ctx->Unmap(g_cbring, 0);
+    CbSlice s{g_cbring_pos / 16, bytes / 16, g_cbring_gen};
+    g_cbring_pos += bytes;
+    return s;
+}
+
 /* ---------------- render target cache ---------------- */
 struct Surface {
     uint32_t ea = 0, fmt = 0, w = 0, h = 0;
@@ -342,8 +366,21 @@ struct Tex {
     ID3D11ShaderResourceView *srv = nullptr;
     uint64_t content = 0;
     uint32_t checked_frame = ~0u;
+    double last_used = 0;          // g_flip_time when last bound
 };
 std::unordered_map<uint64_t, Tex> g_textures;
+double g_flip_time = 0;            // seconds since start, updated at each flip
+IDXGIAdapter3 *g_adapter3;         // for video memory use in the fps log
+
+// Leak hunting (KZ2_LEAK_BISECT=1): every 8 s the renderer drops one piece of
+// its work, and the flip logs memory, so the growth rate per mode shows which
+// part makes the driver allocate. 0 normal, 1 no DrawIndexed, 2 no vertex/index
+// ring uploads, 3 no constant uploads, 4 no texture creation/updates, 5 no
+// per-draw work at all, 6 also no readbacks.
+int leak_mode() {
+    static const bool on = getenv("KZ2_LEAK_BISECT") != nullptr;
+    return on ? (int)(g_flip_time / 8) % 7 : 0;
+}
 
 uint32_t swizzled_offset(uint32_t x, uint32_t y, uint32_t lw, uint32_t lh) {
     // Morton order up to the smaller dimension, then linear in the larger one.
@@ -623,6 +660,8 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
 
     uint64_t key = fnv(&ea, 4, fnv(&fmtreg, 4, fnv(&rect, 4, fnv(&pitch, 4))));
     Tex &t = g_textures[key];
+    t.last_used = g_flip_time;
+    if (leak_mode() == 4) return t.srv;   // leak hunting: no texture creation or updates
     uint32_t size = image_size(fmt, w, h, pitch);
     if (t.srv && t.checked_frame == g_frame) return t.srv;
     // Detect CPU-side changes: hash up to 64 KiB spread over the image.
@@ -632,8 +671,6 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     else for (uint32_t k = 0; k < 1024; k++) hv = fnv(p + (uint64_t)size * k / 1024, 64, hv);
     t.checked_frame = g_frame;
     if (t.srv && t.content == hv) return t.srv;
-    release(t.srv);
-    release(t.tex);
     t.content = hv;
     ScopedUs timer{g_tex_us};
     g_tex_n++;
@@ -667,9 +704,26 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     D3D11_TEXTURE2D_DESC d{};
     d.Width = w, d.Height = h, d.MipLevels = 1, d.ArraySize = faces, d.Format = df;
     d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_IMMUTABLE;
+    d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     d.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+    // Content changed but the shape did not: overwrite the texture in place.
+    // Recreating it every time (a texture the game rewrites each frame) left the
+    // driver's ~15 MB upload copies behind - the process grew ~30 MB per frame.
+    if (t.tex) {
+        D3D11_TEXTURE2D_DESC old;
+        t.tex->GetDesc(&old);
+        if (old.Width == d.Width && old.Height == d.Height && old.Format == d.Format && old.ArraySize == d.ArraySize &&
+            old.MiscFlags == d.MiscFlags) {
+            for (int f = 0; f < faces; f++) g_ctx->UpdateSubresource(t.tex, f, nullptr, sd[f].pSysMem, sd[f].SysMemPitch, 0);
+            return t.srv;
+        }
+        release(t.srv);
+        release(t.tex);
+    }
+    static int big_logs;
+    if ((uint64_t)w * h >= (2u << 20) && big_logs++ < 20)
+        LOG("rsx", "large texture created: ea 0x%x fmt 0x%x %ux%u", ea, fmt, w, h);
     if (FAILED(g_dev->CreateTexture2D(&d, sd, &t.tex))) {
         LOG("rsx", "texture create failed fmt 0x%x %ux%u", fmt, w, h);
         return nullptr;
@@ -983,6 +1037,7 @@ void dump_surface(Surface &s, const char *name) {
 void draw() {
     if (!g_ok || g_ranges.empty()) return;
     g_draws_this_frame++;
+    if (leak_mode() >= 5) return;
     // debug: KZ2_SKIP_DRAWS=a,b,c skips those draw indices in every frame
     static std::vector<int> skip = [] {
         std::vector<int> v;
@@ -1018,7 +1073,7 @@ void draw() {
     if (vmin > vmax || vmax - vmin > 4 * 1024 * 1024) return;
     uint32_t nv = vmax - vmin + 1;
     UINT base_vertex = 0, start_index = 0;   // where this draw's data sits in the rings
-    {
+    if (leak_mode() != 2) {
         ScopedUs timer{g_fetch_us};
         g_fetch_verts += nv;
         g_fetch_used += src_idx.size();
@@ -1052,10 +1107,12 @@ void draw() {
         flush_run();
     }
     if (list.empty()) return;
-    uint32_t *id = (uint32_t *)ring_map(g_iring, (UINT)list.size() * 4, 4, D3D11_BIND_INDEX_BUFFER, false, &start_index);
-    if (!id) return;
-    memcpy(id, list.data(), list.size() * 4);
-    g_ctx->Unmap(g_iring.buf, 0);
+    if (leak_mode() != 2) {
+        uint32_t *id = (uint32_t *)ring_map(g_iring, (UINT)list.size() * 4, 4, D3D11_BIND_INDEX_BUFFER, false, &start_index);
+        if (!id) return;
+        memcpy(id, list.data(), list.size() * 4);
+        g_ctx->Unmap(g_iring.buf, 0);
+    }
 
     // shaders
     ID3D11VertexShader *vs = vertex_shader();
@@ -1078,7 +1135,15 @@ void draw() {
     if (!vs || !ps->ps) return;
 
     // constants
-    if (vp_consts_dirty) { upload_cb(g_cb_vc, vp_consts, sizeof vp_consts); vp_consts_dirty = false; }
+    static CbSlice s_vc, s_vx, s_px;   // static: a skipped upload (leak_mode 3) keeps the last binding
+    const bool cb_on = leak_mode() != 3;
+    if (!cb_on) {
+    } else if (g_cbring) {
+        if (vp_consts_dirty || s_vc.gen != g_cbring_gen) s_vc = cb_push(vp_consts, sizeof vp_consts);
+    } else if (vp_consts_dirty) {
+        upload_cb(g_cb_vc, vp_consts, sizeof vp_consts);
+    }
+    vp_consts_dirty = false;
     float vx[16] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
                     regf(0x0a28), regf(0x0a2c), (float)b.w, (float)b.h, 0, 0};
     memcpy(&vx[12], &base_vertex, 4);   // vbase.x: first vertex of this draw in the ring (uint)
@@ -1088,7 +1153,9 @@ void draw() {
     origin_bottom = !origin_bottom;
     if (getenv("KZ2_FLIP_Y")) origin_bottom = !origin_bottom;
     vx[10] = origin_bottom ? 1.f : 0.f;
-    upload_cb(g_cb_vx, vx, sizeof vx);
+    if (!cb_on) {
+    } else if (g_cbring) s_vx = cb_push(vx, sizeof vx);
+    else upload_cb(g_cb_vx, vx, sizeof vx);
     struct { float alpha_ref[4]; float wpos[4]; float texscale[16][4]; uint32_t fc[128 * 4]; } px{};
     for (int t = 0; t < 16; t++) {
         uint32_t rect = reg(0x1a18 + t * 32);
@@ -1104,7 +1171,10 @@ void draw() {
     px.wpos[2] = (float)g_aa_sx, px.wpos[3] = (float)g_aa_sy;
     for (size_t k = 0; k < ps->consts.size(); k++)
         for (int c = 0; c < 4; c++) px.fc[k * 4 + c] = fp_const_word(fp_ea + ps->consts[k] + 4 * c);
-    upload_cb(g_cb_px, &px, 32 + 256 + ps->consts.size() * 16);
+    if (!cb_on) {
+    } else if (g_cbring) s_px = cb_push(&px, 32 + 256 + ps->consts.size() * 16);
+    else upload_cb(g_cb_px, &px, 32 + 256 + ps->consts.size() * 16);
+    if (cb_on && g_cbring && s_vx.gen != s_vc.gen) s_vc = cb_push(vp_consts, sizeof vp_consts);   // ring wrapped in between
     if ((int)g_frame == g_log_frame) {
         float f[8];
         memcpy(f, px.fc, 32);
@@ -1155,8 +1225,15 @@ void draw() {
     g_ctx->VSSetShader(vs, nullptr, 0);
     g_ctx->PSSetShader(ps->ps, nullptr, 0);
     ID3D11Buffer *vcb[2] = {g_cb_vc, g_cb_vx};
-    g_ctx->VSSetConstantBuffers(0, 2, vcb);
-    g_ctx->PSSetConstantBuffers(0, 1, &g_cb_px);
+    if (g_cbring) {
+        ID3D11Buffer *rings[2] = {g_cbring, g_cbring};
+        UINT first[2] = {s_vc.first, s_vx.first}, num[2] = {s_vc.num, s_vx.num};
+        g_ctx1->VSSetConstantBuffers1(0, 2, rings, first, num);
+        g_ctx1->PSSetConstantBuffers1(0, 1, &g_cbring, &s_px.first, &s_px.num);
+    } else {
+        g_ctx->VSSetConstantBuffers(0, 2, vcb);
+        g_ctx->PSSetConstantBuffers(0, 1, &g_cb_px);
+    }
     g_ctx->VSSetShaderResources(0, 1, &g_vring.srv);
     // sampling a surface that is also being rendered to: use a snapshot
     for (auto &s : srv) {
@@ -1167,7 +1244,7 @@ void draw() {
     g_ctx->PSSetSamplers(0, 16, smp);
     g_ctx->IASetIndexBuffer(g_iring.buf, DXGI_FORMAT_R32_UINT, 0);
     g_ctx->IASetPrimitiveTopology(topo);
-    g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
+    if (leak_mode() != 1) g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
     // Only what the RSX would write is dirty: a zeta buffer stays bound while depth
     // and stencil are off, and depth-only passes mask colour writes.
     if (reg(0x0324)) for (auto *c : b.color) if (c) c->dirty = true;
@@ -1265,6 +1342,13 @@ bool create_device() {
     smp.MaxLOD = D3D11_FLOAT32_MAX;
     g_dev->CreateSamplerState(&smp, &g_present_smp);
     g_cb_vc = make_cb(sizeof vp_consts);
+    // Constant ring (see cb_push), when the driver supports offsets and NO_OVERWRITE on constant buffers.
+    if (opts.ConstantBufferOffsetting && opts.MapNoOverwriteOnDynamicConstantBuffer &&
+        SUCCEEDED(g_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&g_ctx1))) {
+        g_cbring = make_cb(CBRING_SIZE);
+        if (!g_cbring) release(g_ctx1);
+    }
+    if (!g_cbring) LOG("rsx", "driver lacks constant buffer offsets: constants are re-uploaded per draw");
     g_cb_vx = make_cb(64);
     g_cb_px = make_cb(32 + 256 + 128 * 16);
     g_cb_present = make_cb(16);
@@ -1444,6 +1528,33 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     }
     if (getenv("KZ2_TRACE_DRAWS") && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
     g_draws_this_frame = 0;
+    // Streamed textures come and go at new addresses: once a second, release
+    // those unused for 10 s (time, not frames: at low frame rates 600 frames is minutes).
+    static const auto t_start = std::chrono::steady_clock::now();
+    g_flip_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    if (getenv("KZ2_LEAK_BISECT")) {
+        static double last_log = 0;
+        if (g_flip_time - last_log >= 1) {
+            last_log = g_flip_time;
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof pmc);
+            LOG("leak", "t=%.0f s mode %d: %llu MB private", g_flip_time, leak_mode(),
+                (unsigned long long)(pmc.PrivateUsage >> 20));
+        }
+    }
+    static double last_sweep = 0;
+    if (g_flip_time - last_sweep >= 1) {
+        last_sweep = g_flip_time;
+        for (auto it = g_textures.begin(); it != g_textures.end();) {
+            if (g_flip_time - it->second.last_used > 10) {
+                release(it->second.srv);
+                release(it->second.tex);
+                it = g_textures.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     uint32_t ea = local_ea(offset);
     ID3D11ShaderResourceView *src = nullptr;
     float uv[4] = {1, 1, 0, 0};

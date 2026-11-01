@@ -6,6 +6,7 @@
 // pre-commit the RSX/mmapper ranges.
 #include "runtime.h"
 
+#include <unordered_map>
 #include <windows.h>
 
 #include <map>
@@ -239,6 +240,41 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 } // namespace
+
+uint64_t committed() {
+    uint64_t n = 0;
+    MEMORY_BASIC_INFORMATION mi;
+    for (uint8_t *p = g_mem; p < g_mem + RESERVE && VirtualQuery(p, &mi, sizeof mi); p = (uint8_t *)mi.BaseAddress + mi.RegionSize)
+        if (mi.State == MEM_COMMIT) n += mi.RegionSize;
+    return n;
+}
+
+// Leak hunting: private committed memory outside the guest reservation,
+// grouped by allocation (region) size. Driver buffers are few large blocks;
+// heap growth is many small ones.
+std::string host_regions() {
+    static const uint64_t edges[] = {1 << 20, 16 << 20, 64 << 20};
+    uint64_t bytes[4] = {}, count[4] = {};
+    std::unordered_map<void *, uint64_t> alloc;     // allocation base -> committed bytes
+    MEMORY_BASIC_INFORMATION mi;
+    for (uint8_t *p = nullptr; VirtualQuery(p, &mi, sizeof mi); p = (uint8_t *)mi.BaseAddress + mi.RegionSize) {
+        uint8_t *b = (uint8_t *)mi.BaseAddress;
+        if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && !(b >= g_mem && b < g_mem + RESERVE))
+            alloc[mi.AllocationBase] += mi.RegionSize;
+        if ((uint8_t *)mi.BaseAddress + mi.RegionSize < p) break;
+    }
+    for (auto &[base, n] : alloc) {
+        int k = 0;
+        while (k < 3 && n >= edges[k]) k++;
+        bytes[k] += n, count[k]++;
+    }
+    char s[200];
+    snprintf(s, sizeof s, "host blocks <1MB %llu (%llu MB), 1-16MB %llu (%llu MB), 16-64MB %llu (%llu MB), >=64MB %llu (%llu MB)",
+             (unsigned long long)count[0], (unsigned long long)(bytes[0] >> 20), (unsigned long long)count[1],
+             (unsigned long long)(bytes[1] >> 20), (unsigned long long)count[2], (unsigned long long)(bytes[2] >> 20),
+             (unsigned long long)count[3], (unsigned long long)(bytes[3] >> 20));
+    return s;
+}
 
 void init() {
     g_mem = (uint8_t *)VirtualAlloc(nullptr, RESERVE, MEM_RESERVE, PAGE_READWRITE);

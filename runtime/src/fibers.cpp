@@ -17,6 +17,8 @@
 
 #include <windows.h>
 
+#include <atomic>
+#include <string>
 #include <map>
 #include <mutex>
 
@@ -41,6 +43,7 @@ struct Fiber {
 
 std::mutex g_lock;
 std::map<uint32_t, Fiber *> g_suspended;      // buffer -> fiber that yielded into it
+std::atomic<int64_t> g_live{0};               // fibers created and not yet deleted (flip log)
 
 thread_local Fiber *t_cur;                    // fiber running on this thread
 thread_local Fiber *t_dead;                   // abandoned fiber, deleted by the next one to run
@@ -52,6 +55,7 @@ void reap() {
         if (d->primary) return;               // stays converted; never resumed again
         DeleteFiber(d->handle);
         delete d;
+        g_live--;
     }
 }
 
@@ -101,6 +105,7 @@ void switch_to(PPUContext *ctx, uint32_t next, uint32_t suspend_in) {
         target->buf = next;
         target->handle = CreateFiberEx(64 << 10, FIBER_STACK, FIBER_FLAG_FLOAT_SWITCH, fresh_entry, target);
         if (!target->handle) fatal("CreateFiberEx failed (%lu)", GetLastError());
+        g_live++;
     }
     if (!suspend_in) t_dead = me;
     t_ctx = ctx;
@@ -130,4 +135,10 @@ extern "C" void f_00071f24(PPU_CTX) {
     // restore(buf = r3) reached directly (microthread exit): switch for good.
     switch_to(ctx, (uint32_t)ctx->r[3], 0);
     fatal("abandoned microthread was resumed");
+}
+
+// Microthread fibers alive, and those parked in a context buffer (flip log).
+std::string fiber_stats() {
+    std::lock_guard<std::mutex> lk(g_lock);
+    return std::to_string(g_live.load()) + " fibers (" + std::to_string(g_suspended.size()) + " suspended)";
 }

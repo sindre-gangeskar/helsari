@@ -4,8 +4,11 @@
 
 #include <windows.h>
 #include <mmsystem.h>
+#include <psapi.h>
 
+#include <atomic>
 #include <filesystem>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -81,6 +84,9 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+void start_alloc_tracing();
+extern "C" const char kz2_build_stamp[];   // build/kz2_build_stamp.cpp
+
 int main(int argc, char **argv) {
     // One instance at a time: two would share the save data and fight over input.
     CreateMutexA(nullptr, FALSE, "Local\\kz2-recomp-instance");
@@ -107,6 +113,8 @@ int main(int argc, char **argv) {
         fatal("Killzone 2 dump not found at '%s' (pass --dump <folder containing PS3_GAME>)", cfg::dump_dir.c_str());
     for (const char *d : {"/dev_hdd0/game", "/dev_hdd0/home/00000001/savedata", "/dev_hdd1"})
         std::filesystem::create_directories(cfg::data_dir + d);
+    LOG("main", "build: %s %s, stamp %s", __DATE__, __TIME__, kz2_build_stamp);   // which build wrote this log
+    start_alloc_tracing();
     LOG("main", "dump: %s", cfg::dump_dir.c_str());
     LOG("main", "data: %s", cfg::data_dir.c_str());
 
@@ -140,3 +148,105 @@ int main(int argc, char **argv) {
     LOG("main", "main thread returned");
     return 0;
 }
+
+// Leak hunting: every allocation of 8 MB or more - C++ new, and VirtualAlloc /
+// HeapAlloc calls made by any loaded DLL (the graphics driver) - is logged with
+// its host call stack ("module+offset", symbolize kz2.exe offsets with llvm-nm), up to 60.
+namespace {
+std::atomic<int> g_big_allocs{0};
+void log_big_alloc(const char *what, size_t n) {
+    if (n < (8u << 20) || g_big_allocs++ >= 60) return;
+    void *frames[12];
+    USHORT k = RtlCaptureStackBackTrace(2, 12, frames, nullptr);
+    char out[768];
+    int len = snprintf(out, sizeof out, "%s of %zu MB from", what, n >> 20);
+    for (USHORT i = 0; i < k && len < (int)sizeof out - 48; i++) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)frames[i], &mod))
+            GetModuleFileNameA(mod, name, sizeof name);
+        const char *base = strrchr(name, '\\');
+        len += snprintf(out + len, sizeof out - len, " %s+0x%llx", base ? base + 1 : name,
+                        (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)mod));
+    }
+    LOG("mem", "%s", out);
+}
+
+using VirtualAllocFn = LPVOID(WINAPI *)(LPVOID, SIZE_T, DWORD, DWORD);
+using HeapAllocFn = LPVOID(WINAPI *)(HANDLE, DWORD, SIZE_T);
+VirtualAllocFn g_real_virtual_alloc;
+HeapAllocFn g_real_heap_alloc;
+LPVOID WINAPI logged_virtual_alloc(LPVOID a, SIZE_T n, DWORD type, DWORD prot) {
+    if (type & MEM_COMMIT) log_big_alloc("VirtualAlloc", n);
+    return g_real_virtual_alloc(a, n, type, prot);
+}
+LPVOID WINAPI logged_heap_alloc(HANDLE h, DWORD flags, SIZE_T n) {
+    log_big_alloc("HeapAlloc", n);
+    return g_real_heap_alloc(h, flags, n);
+}
+// The native call under VirtualAlloc; some drivers call it directly.
+using NtAllocFn = LONG(NTAPI *)(HANDLE, PVOID *, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+NtAllocFn g_real_nt_alloc;
+LONG NTAPI logged_nt_alloc(HANDLE proc, PVOID *base, ULONG_PTR zero, PSIZE_T size, ULONG type, ULONG prot) {
+    if ((type & MEM_COMMIT) && size) log_big_alloc("NtAllocateVirtualMemory", *size);
+    return g_real_nt_alloc(proc, base, zero, size, type, prot);
+}
+
+// Point every loaded module's import of `real` (any of its addresses) at `hook`.
+int patch_imports(void *const *reals, int nreal, void *hook) {
+    HMODULE mods[1024];
+    DWORD bytes = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &bytes)) return 0;
+    int patched = 0;
+    for (DWORD i = 0; i < bytes / sizeof(HMODULE); i++) {
+        auto *base = (uint8_t *)mods[i];
+        auto *dos = (IMAGE_DOS_HEADER *)base;
+        auto *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+        auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dir.VirtualAddress) continue;
+        for (auto *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; d++)
+            for (auto *t = (IMAGE_THUNK_DATA *)(base + d->FirstThunk); t->u1.Function; t++)
+                for (int r = 0; r < nreal; r++)
+                    if ((void *)t->u1.Function == reals[r]) {
+                        DWORD old;
+                        VirtualProtect(&t->u1.Function, sizeof(void *), PAGE_READWRITE, &old);
+                        t->u1.Function = (ULONG_PTR)hook;
+                        VirtualProtect(&t->u1.Function, sizeof(void *), old, &old);
+                        patched++;
+                    }
+    }
+    return patched;
+}
+
+// KZ2_TRACE_BIG_ALLOCS=1: hook the allocators once the graphics driver is loaded.
+void hook_allocators() {
+    HMODULE k32 = GetModuleHandleA("kernel32.dll"), kb = GetModuleHandleA("kernelbase.dll");
+    void *va[2] = {(void *)GetProcAddress(k32, "VirtualAlloc"), (void *)GetProcAddress(kb, "VirtualAlloc")};
+    void *ha[3] = {(void *)GetProcAddress(k32, "HeapAlloc"), (void *)GetProcAddress(kb, "HeapAlloc"),
+                   (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlAllocateHeap")};
+    void *nt[1] = {(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtAllocateVirtualMemory")};
+    g_real_virtual_alloc = (VirtualAllocFn)va[1];
+    g_real_heap_alloc = (HeapAllocFn)ha[2];
+    g_real_nt_alloc = (NtAllocFn)nt[0];
+    int n = patch_imports(va, 2, (void *)logged_virtual_alloc) + patch_imports(ha, 3, (void *)logged_heap_alloc) +
+            patch_imports(nt, 1, (void *)logged_nt_alloc);
+    LOG("mem", "allocation tracing: patched %d imports", n);
+}
+} // namespace
+
+void start_alloc_tracing() {
+    if (!getenv("KZ2_TRACE_BIG_ALLOCS")) return;
+    std::thread([] { Sleep(15000); hook_allocators(); }).detach();
+}
+
+void *operator new(size_t n) {
+    log_big_alloc("new", n);
+    if (void *p = malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void *operator new[](size_t n) { return operator new(n); }
+void operator delete(void *p) noexcept { free(p); }
+void operator delete[](void *p) noexcept { free(p); }
+void operator delete(void *p, size_t) noexcept { free(p); }
+void operator delete[](void *p, size_t) noexcept { free(p); }

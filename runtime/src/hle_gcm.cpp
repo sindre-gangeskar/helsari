@@ -4,6 +4,7 @@
 #include "rsx/rsx.h"
 
 #include <windows.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +19,7 @@
 #define REG(n) hle_register(#n, hle_##n)
 
 namespace spu { std::string stats_line(double secs, uint32_t frames); }
+std::string fiber_stats();   // fibers.cpp
 
 namespace {
 constexpr uint32_t CTX_ADDR = mem::RSX_IO + 0x0000;       // CellGcmContextData
@@ -106,8 +108,23 @@ void flip(uint32_t id) {
         LOG("gcm", "flip #%u (buffer %u), %.1f fps; %s; RSX FIFO idle %.0f ms/frame, semaphore waits %.0f ms/frame (longest %.0f ms, label 0x%x); %s",
             n, id, frames / secs, spu::stats_line(secs, frames).c_str(), g_fifo_idle_us.exchange(0) / 1000.0 / frames,
             g_acquire_us.exchange(0) / 1000.0 / frames, g_acquire_max_us / 1000.0, g_acquire_max_label,
-            rsx::stats_line(frames).c_str());
+            (rsx::stats_line(frames) + ", " + fiber_stats() + "; " + mem::host_regions()).c_str());
         g_acquire_max_us = 0;
+    }
+    // Window title: fps and frame time, averaged over at least a second, and the
+    // process's memory (private bytes: what it has committed, as Task Manager shows).
+    static auto title_last = now;
+    static uint32_t title_n = 0;
+    double title_secs = std::chrono::duration<double>(now - title_last).count();
+    if (title_secs >= 1 && g_hwnd) {
+        uint32_t frames = n - title_n;
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof pmc);
+        wchar_t title[128];
+        swprintf(title, 128, L"Killzone 2 (recomp) - %.1f fps (%.0f ms) - RAM %.1f GB", frames / title_secs,
+                 title_secs * 1000 / frames, pmc.PrivateUsage / 1073741824.0);
+        SetWindowTextW(g_hwnd, title);
+        title_last = now, title_n = n;
     }
     g_last_flip = id;
     if (id < 8) rsx::flip(g_disp[id].offset, g_disp[id].width, g_disp[id].height, g_disp[id].pitch);
