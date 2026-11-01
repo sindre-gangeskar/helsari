@@ -78,8 +78,8 @@ void workload_thread(Workload *w) {
     name_host_thread(s.name);
     if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;   // exclude from tracing
-    s.ls_written(PM_ADDR, w->size);
     memcpy(s.ls + PM_ADDR, mem::ptr(w->pm), w->size);
+    s.code_loaded(PM_ADDR, w->pm, w->size);         // native code for the policy module, if compiled
     s.set_trap(SELECT_WORKLOAD_ADDR);
     s.set_trap(EXIT_ADDR);
     s.on_trap = [w](spu::SpuThread &t) {

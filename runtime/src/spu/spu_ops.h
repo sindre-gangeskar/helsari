@@ -297,6 +297,15 @@ inline V insert_mask(uint32_t t, int size) {
     return r;
 }
 
+// 2^n as a double (n well inside the exponent range): scaling by it is exact,
+// like ldexp, without a library call.
+inline double pow2(int n) {
+    uint64_t b = (uint64_t)(1023 + n) << 52;
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+
 inline int32_t sat_s32(double v) { return v >= 2147483647.0 ? 0x7fffffff : v <= -2147483648.0 ? (int32_t)0x80000000 : std::isnan(v) ? 0 : (int32_t)v; }
 inline uint32_t sat_u32(double v) { return v >= 4294967295.0 ? 0xffffffffu : v <= 0 || std::isnan(v) ? 0 : (uint32_t)v; }
 
@@ -535,10 +544,10 @@ template <Op OP> SPU_INLINE uint32_t step(SpuThread &t, uint32_t x, uint32_t pc)
     case FCMEQ: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) == std::fabs(ftz(vb.f(i))) ? ~0u : 0; t.gpr[rt] = r; break;
     case FCGT: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) > ftz(vb.f(i)) ? ~0u : 0; t.gpr[rt] = r; break;
     case FCMGT: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) > std::fabs(ftz(vb.f(i))) ? ~0u : 0; t.gpr[rt] = r; break;
-    case CSFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)std::ldexp((double)(int32_t)va.w[i], -sc)); t.gpr[rt] = r; break; }
-    case CUFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)std::ldexp((double)va.w[i], -sc)); t.gpr[rt] = r; break; }
-    case CFLTS: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)sat_s32(std::ldexp((double)va.f(i), sc)); t.gpr[rt] = r; break; }
-    case CFLTU: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = sat_u32(std::ldexp((double)va.f(i), sc)); t.gpr[rt] = r; break; }
+    case CSFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)(int32_t)va.w[i] * pow2(-sc))); t.gpr[rt] = r; break; }
+    case CUFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)va.w[i] * pow2(-sc))); t.gpr[rt] = r; break; }
+    case CFLTS: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)sat_s32((double)va.f(i) * pow2(sc)); t.gpr[rt] = r; break; }
+    case CFLTU: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = sat_u32((double)va.f(i) * pow2(sc)); t.gpr[rt] = r; break; }
     case FSCRRD: t.gpr[rt] = V{}; break;
     case FSCRWR: break;
 

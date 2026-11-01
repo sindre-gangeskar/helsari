@@ -9,7 +9,9 @@
 #include <atomic>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace spu {
 
@@ -57,8 +59,18 @@ constexpr uint32_t EVENT_SN = 0x002;   // DMA list stall-and-notify
 struct SpuThread;
 using NativeFn = uint32_t (*)(SpuThread &, uint32_t pc);
 struct NativeEntry { uint32_t pc; NativeFn fn; };
-// One compiled image: `size` bytes at guest address src_ea, executed at LS ls_base.
-struct NativeModule { const char *name; uint32_t src_ea, ls_base, size; const NativeEntry *entries; uint32_t count; };
+// One compiled image, executed at LS ls_base: `size` bytes found at guest address
+// src_ea (EBOOT modules), or captured at runtime and embedded as `image`
+// (spu_cache modules, see spu_capture.cpp). protect marks the 128-byte lines
+// holding code (null: all); a runtime module only compiles and matches those.
+struct NativeModule {
+    const char *name;
+    uint32_t src_ea, ls_base, size;
+    const NativeEntry *entries;
+    uint32_t count;
+    const uint8_t *image;
+    const uint8_t *protect;
+};
 
 struct SpuThread {
     alignas(16) uint8_t ls[LS_SIZE];
@@ -109,7 +121,7 @@ struct SpuThread {
     }
     void set_ls32(uint32_t a, uint32_t v) {
         a &= LS_SIZE - 4;
-        if (code_line[a >> 7]) ls_written(a, 4);
+        if (code_q[a >> 4] == CODE) ls_written(a, 4);
         v = __builtin_bswap32(v);
         memcpy(ls + a, &v, 4);
     }
@@ -124,15 +136,18 @@ struct SpuThread {
     }
     void stq(uint32_t a, const V &v) {
         a &= LS_SIZE - 16;
-        if (code_line[a >> 7]) ls_written(a, 16);
+        if (code_q[a >> 4] == CODE) ls_written(a, 16);
         _mm_store_si128((__m128i *)(ls + a), _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)v.w), bswap32_mask()));
     }
 
     // Recompiled code mapped into LS. native[pc / 4] is the function entering
-    // at pc; code_line marks 128-byte lines holding mapped code, and any write
-    // there unmaps that module (code_epoch++ makes running native code return).
-    NativeFn *native = nullptr;
-    uint8_t code_line[LS_SIZE / 128] = {};
+    // at pc; code_q marks the quadwords of mapped modules: a write to a CODE
+    // quadword unmaps its module (code_epoch++ makes running native code
+    // return); DATA (the rest of the image) may change freely - nothing was
+    // compiled from it. Quadwords, not lines: code and data share 128-byte lines.
+    enum : uint8_t { CODE = 1, DATA = 2 };
+    std::unique_ptr<NativeFn[]> native;   // owned: a SpuThread per SPURS task start (~200/s) leaked 512 KB each
+    uint8_t code_q[LS_SIZE / 16] = {};
     uint32_t code_epoch = 0;
     bool interp_once = false;              // native code handed one instruction to the interpreter
     uint32_t native_polls = 0;
@@ -140,11 +155,48 @@ struct SpuThread {
     Mapped mapped[8] = {};
     // An image was copied to LS [lsa, lsa+size) from guest address ea: map recompiled code for it.
     void code_loaded(uint32_t lsa, uint32_t ea, uint32_t size);
+    bool map_module(const NativeModule *m);
+    bool code_dirty = true;                // LS written since map_at last looked
+    bool map_at(uint32_t pc);              // map a module whose image LS holds at pc
+    // Modules mapped most recently, tried first by map_at: job managers reload the
+    // same few job binaries over and over, so the match is nearly always here.
+    const NativeModule *recent[8] = {};
     // LS [lsa, lsa+size) is about to be written by anything other than a code load.
     void ls_written(uint32_t lsa, uint32_t size) {
-        for (uint32_t l = lsa >> 7, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 7; l <= e && size; l++)
-            if (code_line[l]) { unmap_range(lsa, size); return; }
+        code_dirty = true;
+        if (cap_any && size) capture_overwritten(lsa, size);
+        for (uint32_t q = lsa >> 4, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 4; q <= e && size; q++)
+            if (code_q[q] == CODE) { unmap_range(lsa, size); return; }
     }
+
+    // Runtime capture of interpreted code (spu_capture.cpp): src_delta[line] is
+    // ea - lsa of the DMA load that filled the line (0: not loaded), so lines
+    // loaded together form one image; exec_q marks quadwords the interpreter ran.
+    // Each image is saved to spu_cache/ for the recompiler when it is replaced.
+    uint32_t src_delta[LS_SIZE / 128] = {};
+    uint8_t exec_q[LS_SIZE / 16] = {};
+    struct Capture { uint32_t lo, hi; bool valid; std::vector<uint8_t> image; uint64_t last_use; };
+    Capture caps[4] = {};
+    bool cap_any = false;
+    uint64_t cap_clock = 0;
+    void loaded_from(uint32_t lsa, uint32_t ea, uint32_t size) {
+        for (uint32_t l = lsa >> 7, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 7; l <= e && size; l++) src_delta[l] = ea - lsa;
+    }
+    // Interpreter hook: pc is about to run without native code.
+    void note_interpreted(uint32_t pc) {
+        exec_q[pc >> 4] = 1;
+        for (auto &c : caps)
+            if (pc >= c.lo && pc < c.hi) {
+                if (!(++cap_clock & 0x3fffff)) checkpoint_captures();
+                c.last_use = cap_clock;
+                return;
+            }
+        begin_capture(pc);
+    }
+    void begin_capture(uint32_t pc);
+    void capture_overwritten(uint32_t lsa, uint32_t size);
+    void flush_capture(Capture &c);
+    void checkpoint_captures();
     void unmap_range(uint32_t lsa, uint32_t size);
     // Called by native code at branches while interrupts are enabled: take a pending event.
     bool poll_interrupt(uint32_t &next) {

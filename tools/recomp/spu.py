@@ -15,13 +15,15 @@ what it knows (indirect branch to an unknown target, another chunk, an
 instruction the interpreter must run). The runtime maps a module when its
 image is loaded into LS and unmaps it when that LS range is written.
 """
+import contextlib
+import io
 import os
 import re
 import struct
 
 OPS_HEADER = os.path.join(os.path.dirname(__file__), '..', '..', 'runtime', 'src', 'spu', 'spu_ops.h')
 LS_MASK = 0x3fffc
-CHUNK_INSNS = 3000            # instructions per generated function
+CHUNK_INSNS = 500             # instructions per generated function (larger: slow, memory-hungry compiles)
 JOB_LS_BASE = 0x4000          # job managers DMA job binaries here (observed for jm_post)
 MAX_JOB_SIZE = 0x8000         # larger "jobs" between the ELFs are data
 
@@ -68,8 +70,15 @@ def branch_target(op, x, pc):
 
 
 class Module:
-    def __init__(self, name, src_ea, ls_base, code):
+    """An SPU image executed at LS ls_base. protect: per quadword, whether it
+    holds code (None: all); only those quadwords are compiled. embed: the runtime
+    compares LS with the image bytes compiled in, not with the EBOOT."""
+    def __init__(self, name, src_ea, ls_base, code, protect=None, embed=False):
         self.name, self.src_ea, self.ls_base, self.code = name, src_ea, ls_base, code
+        self.protect, self.embed = protect, embed
+
+    def is_code(self, pc):
+        return self.protect is None or self.protect[(pc - self.ls_base) >> 4]
 
     @property
     def end(self):
@@ -91,10 +100,22 @@ def find_modules(e):
     for ea in elves:
         hdr = e.read(ea, 52)
         phoff, phnum = struct.unpack('>I', hdr[28:32])[0], struct.unpack('>H', hdr[44:46])[0]
+        shoff, shnum = struct.unpack('>I', hdr[32:36])[0], struct.unpack('>H', hdr[48:50])[0]
+        # executable sections (SHF_EXECINSTR): the rest of a segment is data the program writes
+        text = []
+        for k in range(shnum if shoff else 0):
+            _, _, sflags, addr, _, size = struct.unpack('>6I', e.read(ea + shoff + 40 * k, 24))
+            if sflags & 4 and size:
+                text.append((addr, addr + size))
         for k in range(phnum):
             p_type, off, vaddr, _, filesz, _, flags, _ = struct.unpack('>8I', e.read(ea + phoff + 32 * k, 32))
             if p_type == 1 and flags & 1 and filesz:
-                mods.append(Module(f'elf_{ea:x}', ea + off, vaddr, e.read(ea + off, filesz & ~3)))
+                size = filesz & ~3
+                protect = None
+                if text:
+                    protect = [any(a < vaddr + 16 * (q + 1) and vaddr + 16 * q < b for a, b in text)
+                               for q in range((size + 15) // 16)]
+                mods.append(Module(f'elf_{ea:x}', ea + off, vaddr, e.read(ea + off, size), protect))
     # Job binaries sit between the ELFs: each ends with a 16-byte marker line
     # (ffffffff, then ffffffff in word 2 or 3), is zero-padded, and the next one
     # starts at the following 0x80-aligned non-zero line.
@@ -136,14 +157,17 @@ def find_modules(e):
     return mods
 
 
-def gen_module(dec, m, mi):
-    """C++ for one module; returns (source text, [(pc, function name)], [function names])."""
+def gen_module(dec, m, prefix):
+    """C++ for one module; returns (source text, [(pc, function name)], [function names]).
+    Functions are named <prefix>_c<chunk>."""
     n = len(m.code) // 4
     words = struct.unpack(f'>{n}I', m.code[:4 * n])
     pcs = [m.ls_base + 4 * k for k in range(n)]
     ops = [dec.op(x) for x in words]
     starts = {m.ls_base}
     for k, (x, op, pc) in enumerate(zip(words, ops, pcs)):
+        if not m.is_code(pc):
+            continue
         if op in DIRECT or op in COND:
             t = branch_target(op, x, pc)
             if m.ls_base <= t < m.end:
@@ -151,6 +175,11 @@ def gen_module(dec, m, mi):
         if op in DIRECT or op in COND or op in INDIRECT or op in TO_INTERP or op in CHANNEL:
             if pc + 4 < m.end:
                 starts.add(pc + 4)
+    # Code entered from data (fall-through) starts a block too.
+    for pc in range(m.ls_base, m.end, 16):
+        if m.is_code(pc) and pc > m.ls_base and not m.is_code(pc - 16):
+            starts.add(pc)
+    starts = {s for s in starts if m.is_code(s)}
 
     # chunks: runs of whole blocks, about CHUNK_INSNS instructions each
     chunks, cur = [], m.ls_base
@@ -163,13 +192,13 @@ def gen_module(dec, m, mi):
 
     out, entries, fns = [], [], []
     for ci, (lo, hi) in enumerate(chunks):
-        fn = f'spu_m{mi}_c{ci}'
+        fn = f'{prefix}_c{ci}'
         fns.append(fn)
         labels = sorted(s for s in starts if lo <= s < hi)
         entries += [(s, fn) for s in labels]
 
         def jump(t, pc):
-            if lo <= t < hi and t in starts:
+            if lo <= t < hi and t in starts and m.is_code(t):
                 if t <= pc:   # backward: let pending interrupts in, as the interpreter would
                     return f'if (t.interrupts) {{ next = 0x{t:x}; goto redispatch; }} goto L_{t:x};'
                 return f'goto L_{t:x};'
@@ -188,6 +217,8 @@ def gen_module(dec, m, mi):
         for k in range((lo - m.ls_base) // 4, (hi - m.ls_base) // 4):
             x, op, pc = words[k], ops[k], pcs[k]
             nxt = (pc + 4) & LS_MASK
+            if not m.is_code(pc):
+                continue
             if pc in starts:
                 o.append(f'L_{pc:x}:')
             s = f'step<{op}>(t, 0x{x:08x}u, 0x{pc:x}u)'
@@ -208,10 +239,71 @@ def gen_module(dec, m, mi):
                 o.append(f'    {s}; if (!t.running) return 0x{nxt:x};')
             else:
                 o.append(f'    {s};')
+            if m.ls_base <= nxt < m.end and not m.is_code(nxt):
+                o.append(f'    return 0x{nxt:x};')   # falls into data: not compiled
         o.append(f'    return 0x{hi & LS_MASK:x};')
         o.append('}')
         out.append('\n'.join(o))
     return '\n\n'.join(out) + '\n', entries, fns
+
+
+
+
+def write_if_changed(path, text):
+    """Rewrite path only if its content changes, so the build recompiles only what changed."""
+    if os.path.isfile(path) and open(path, encoding='utf-8').read() == text:
+        return
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+@contextlib.contextmanager
+def out_file(path):
+    """`with out_file(p) as f:` - like open(p, 'w'), but only rewrites p if its content changes."""
+    buf = io.StringIO()
+    yield buf
+    write_if_changed(path, buf.getvalue())
+
+
+def remove_stale(directory, keep):
+    """Delete files in directory that this generation did not produce."""
+    keep = {os.path.normcase(os.path.abspath(p)) for p in keep}
+    for f in os.listdir(directory):
+        p = os.path.join(directory, f)
+        if os.path.normcase(os.path.abspath(p)) not in keep:
+            os.remove(p)
+
+
+def byte_array(data):
+    return ',\n'.join(','.join(f'0x{b:02x}' for b in data[i:i + 32]) for i in range(0, len(data), 32))
+
+
+def module_table(table, symbol):
+    """C++ lines for a NativeModule table; table = [(module, tag, entries, function names)].
+    Returns (lines, row count); the caller appends the count definition."""
+    out = ['#include "spu/spu.h"', '', 'namespace spu {', '']
+    rows = []
+    for m, tag, entries, fns in table:
+        out += [f'uint32_t {fn}(SpuThread &, uint32_t);' for fn in fns]
+        out.append(f'static const NativeEntry {tag}_entries[] = {{')
+        out += [f'    {{0x{pc:x}, {fn}}},' for pc, fn in entries]
+        out.append('};')
+        image = protect = 'nullptr'
+        if m.embed:
+            out.append(f'static const uint8_t {tag}_image[] = {{\n{byte_array(m.code)}}};')
+            image = f'{tag}_image'
+        if m.protect is not None:
+            out.append(f'static const uint8_t {tag}_protect[] = {{{",".join("1" if b else "0" for b in m.protect)}}};')
+            protect = f'{tag}_protect'
+        rows.append(f'    {{"{m.name}", 0x{m.src_ea:x}, 0x{m.ls_base:x}, 0x{len(m.code):x}, {tag}_entries, '
+                    f'{len(entries)}, {image}, {protect}}},')
+    out.append(f'extern const NativeModule {symbol}[] = {{')
+    out += rows or ['    {},']
+    out.append('};')
+    return out, len(rows)
+
+
+PRELUDE = '#include "spu/spu_ops.h"\n\nnamespace spu {\n\n'
 
 
 def generate(e, out, log):
@@ -220,34 +312,104 @@ def generate(e, out, log):
     mods = find_modules(e)
     spu_dir = os.path.join(out, 'spu')
     os.makedirs(spu_dir, exist_ok=True)
-    for f in os.listdir(spu_dir):
-        os.remove(os.path.join(spu_dir, f))
     files, table = [], []
-    prelude = '#include "spu/spu_ops.h"\n\nnamespace spu {\n\n'
     for mi, m in enumerate(mods):
-        src, entries, fns = gen_module(dec, m, mi)
+        src, entries, fns = gen_module(dec, m, f'spu_m{mi}')
+        if not entries:
+            continue
         p = os.path.join(spu_dir, f'spu_m{mi:02d}.cpp')
-        with open(p, 'w') as c:
+        with out_file(p) as c:
             c.write(f'// {m.name}: {len(m.code)} bytes from 0x{m.src_ea:x}, LS 0x{m.ls_base:x}\n')
-            c.write(prelude + src + '\n} // namespace spu\n')
+            c.write(PRELUDE + src + '\n} // namespace spu\n')
         files.append(p)
-        table.append((m, mi, entries, fns))
+        table.append((m, f'm{mi}', entries, fns))
     p = os.path.join(spu_dir, 'spu_modules.cpp')
-    with open(p, 'w') as c:
-        c.write('#include "spu/spu.h"\n\nnamespace spu {\n\n')
-        for m, mi, entries, fns in table:
-            for fn in fns:
-                c.write(f'uint32_t {fn}(SpuThread &, uint32_t);\n')
-            c.write(f'static const NativeEntry m{mi}_entries[] = {{\n')
-            c.write(''.join(f'    {{0x{pc:x}, {fn}}},\n' for pc, fn in entries))
-            c.write('};\n')
-        c.write('extern const NativeModule g_native_modules[] = {\n')
-        for m, mi, entries, fns in table:
-            c.write(f'    {{"{m.name}", 0x{m.src_ea:x}, 0x{m.ls_base:x}, 0x{len(m.code):x}, m{mi}_entries, {len(entries)}}},\n')
-        c.write('};\n')
-        c.write(f'extern const int g_native_module_count = {len(table)};\n\n}} // namespace spu\n')
+    lines, n = module_table(table, 'g_native_modules')
+    lines += [f'extern const int g_native_module_count = {n};', '', '} // namespace spu', '']
+    with out_file(p) as c:
+        c.write('\n'.join(lines))
     files.append(p)
+    remove_stale(spu_dir, files)
     ninsn = sum(len(m.code) // 4 for m in mods)
     log(f'SPU: {len(mods)} modules ({sum(1 for m in mods if m.name.startswith("elf"))} ELF segments), '
         f'{ninsn} instructions')
+    return files
+
+
+RT_BUCKETS = 16                       # fixed file count, so the build's source list never changes
+
+
+def rt_sources(out):
+    rt_dir = os.path.join(out, 'spu_rt')
+    return [os.path.join(rt_dir, f'spu_rt_{i:02d}.cpp') for i in range(RT_BUCKETS)] + \
+        [os.path.join(rt_dir, 'spu_rt_modules.cpp')]
+
+
+def read_cache_files(cache_dir):
+    """spu_cache/*.bin written by the runtime (spu_capture.cpp), file format:
+    "SPC2", ls_base, size, mask (one byte per quadword: executed), image.
+    "SPC1" files have one mask byte per 128-byte line. Yields (path, ls_base,
+    per-quadword mask, image); incomplete files are skipped."""
+    if not os.path.isdir(cache_dir):
+        return
+    for f in sorted(os.listdir(cache_dir)):
+        if not re.fullmatch(r'[0-9a-f]+_[0-9a-f]{16}\.bin', f):
+            continue
+        path = os.path.join(cache_dir, f)
+        d = open(path, 'rb').read()
+        if len(d) < 12:
+            continue
+        magic, ls_base, size = struct.unpack('<4sII', d[:12])
+        grain = {b'SPC1': 128, b'SPC2': 16}.get(magic)        # bytes per mask entry
+        nmask = (size + grain - 1) // grain if grain else 0
+        if not grain or len(d) < 12 + nmask + size:
+            continue
+        mask = [d[12 + q * 16 // grain] != 0 for q in range((size + 15) // 16)]
+        yield path, ls_base, mask, d[12 + nmask:12 + nmask + size]
+
+
+def capture_hash(ls_base, image):
+    """The runtime's file name hash (spu_capture.cpp image_hash): FNV-1a seeded with ls_base."""
+    h = 1469598103934665603 ^ ls_base
+    for b in image:
+        h = ((h ^ b) * 1099511628211) & 0xffffffffffffffff
+    return h
+
+
+def write_capture(cache_dir, ls_base, mask, image):
+    path = os.path.join(cache_dir, f'{ls_base:05x}_{capture_hash(ls_base, image):016x}.bin')
+    with open(path, 'wb') as f:
+        f.write(struct.pack('<4sII', b'SPC2', ls_base, len(image)) + bytes(1 if b else 0 for b in mask) + image)
+
+
+def read_cache(cache_dir):
+    """Captured images -> [Module], named after their file's hash."""
+    mods = []
+    for path, ls_base, mask, image in read_cache_files(cache_dir):
+        h = os.path.basename(path)[-20:-4]
+        mods.append(Module(f'rt_{ls_base:x}_{h}', 0, ls_base, image[:len(image) & ~3], mask, embed=True))
+    return mods
+
+
+def generate_cache(cache_dir, out, log):
+    """Runtime-captured SPU code -> build/generated/spu_rt/ (spu_rt_00..15.cpp, spu_rt_modules.cpp)."""
+    dec = Decoder()
+    os.makedirs(os.path.join(out, 'spu_rt'), exist_ok=True)
+    buckets = [[] for _ in range(RT_BUCKETS)]
+    table = []
+    for m in read_cache(cache_dir):
+        h = m.name.rsplit('_', 1)[1]
+        src, entries, fns = gen_module(dec, m, f'spu_rt_{h}')
+        if not entries:
+            continue
+        buckets[int(h, 16) % RT_BUCKETS].append(f'// {m.name}: {len(m.code)} bytes at LS 0x{m.ls_base:x}\n' + src)
+        table.append((m, f'rt_{h}', entries, fns))
+    files = rt_sources(out)
+    for i, b in enumerate(buckets):
+        write_if_changed(files[i], PRELUDE + '\n'.join(b) + '\n} // namespace spu\n')
+    lines, n = module_table(table, 'g_rt_modules')
+    lines += [f'extern const int g_rt_module_count = {n};', '', '} // namespace spu', '']
+    write_if_changed(files[-1], '\n'.join(lines))
+    compiled = sum(sum(m.protect) for m, _, _, _ in table) * 4
+    log(f'SPU cache: {n} captured images, {compiled} instructions compiled')
     return files

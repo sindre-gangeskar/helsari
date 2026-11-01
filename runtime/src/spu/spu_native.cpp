@@ -1,19 +1,26 @@
 // Mapping recompiled SPU modules (build/generated/spu) into a thread's LS.
-// A module maps when its exact image is copied to its LS base - a task ELF
-// segment loaded by the runtime, or a job binary DMA'd from the EBOOT - and
-// unmaps when anything writes into its range. KZ2_SPU_NATIVE=0 disables it.
+// A module maps when its image is in LS at its base - copied there in one
+// piece (code_loaded), or found when execution reaches it (map_at) - and
+// unmaps when anything writes to one of its code quadwords. Native code exists
+// only for code quadwords, so writes to the rest of the image (data) are harmless.
+// EBOOT modules (task ELFs, job binaries) are compared with the EBOOT; runtime
+// modules (captured by spu_capture.cpp) with their embedded image, on their
+// code quadwords. KZ2_SPU_NATIVE=0 disables it.
 #include "spu.h"
 
 #include "runtime.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <unordered_map>
 
 namespace spu {
 
-extern const NativeModule g_native_modules[];
+extern const NativeModule g_native_modules[];      // from the EBOOT (spu_modules.cpp)
 extern const int g_native_module_count;
+extern const NativeModule g_rt_modules[];          // from spu_cache/ (spu_rt_modules.cpp)
+extern const int g_rt_module_count;
 
 namespace {
 const bool g_enabled = [] {
@@ -31,34 +38,96 @@ const std::unordered_multimap<uint32_t, const NativeModule *> &by_source() {
     return m;
 }
 
-std::atomic<uint64_t> g_maps{0}, g_unmaps{0};
+// KZ2_SPU_RT=0: ignore modules compiled from spu_cache/ (EBOOT modules still map).
+const bool g_rt_enabled = [] {
+    const char *e = getenv("KZ2_SPU_RT");
+    return !e || atoi(e) != 0;
+}();
 } // namespace
+std::atomic<uint64_t> g_maps{0}, g_unmaps{0}, g_match_tries{0};   // reported in the flip log (spu_interp.cpp)
+namespace {
+
+bool is_code(const NativeModule *m, uint32_t q) {   // q: quadword index from ls_base
+    return !m->protect || m->protect[q];
+}
+
+// Does LS hold m's image? Runtime modules are compared on their code quadwords only:
+// those are all that was compiled, and the rest is data the program may have changed.
+bool image_matches(const uint8_t *ls, const NativeModule *m) {
+    if (!m->image) return !memcmp(ls + m->ls_base, mem::ptr(m->src_ea), m->size);
+    for (uint32_t off = 0; off < m->size; off += 16)
+        if (is_code(m, off >> 4) && memcmp(ls + m->ls_base + off, m->image + off, std::min(16u, m->size - off)))
+            return false;
+    return true;
+}
+} // namespace
+
+bool SpuThread::map_module(const NativeModule *m) {
+    int slot = -1;
+    for (int i = 0; i < 8; i++) if (!mapped[i].m) { slot = i; break; }
+    if (slot < 0) return false;
+    if (!native) native = std::make_unique<NativeFn[]>(LS_SIZE / 4);
+    for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = m->entries[i].fn;
+    for (uint32_t q = m->ls_base >> 4; q <= (m->ls_base + m->size - 1) >> 4; q++)
+        code_q[q] = is_code(m, q - (m->ls_base >> 4)) ? CODE : DATA;
+    mapped[slot].m = m;
+    if (g_maps++ < 20) LOG("spu", "%s: native code for %s mapped at 0x%x", name.c_str(), m->name, m->ls_base);
+    return true;
+}
 
 void SpuThread::code_loaded(uint32_t lsa, uint32_t ea, uint32_t size) {
     ls_written(lsa, size);
+    loaded_from(lsa, ea, size);
     if (!g_enabled) return;
     auto range = by_source().equal_range(ea);
     for (auto it = range.first; it != range.second; ++it) {
         const NativeModule *m = it->second;
-        if (m->ls_base != lsa || m->size > size || memcmp(ls + lsa, mem::ptr(ea), m->size)) continue;
-        int slot = -1;
-        for (int i = 0; i < 8; i++) if (!mapped[i].m) { slot = i; break; }
-        if (slot < 0) return;
-        if (!native) native = new NativeFn[LS_SIZE / 4]();
-        for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = m->entries[i].fn;
-        for (uint32_t l = m->ls_base >> 7; l <= (m->ls_base + m->size - 1) >> 7; l++) code_line[l] = 1;
-        mapped[slot].m = m;
-        if (g_maps++ < 20) LOG("spu", "%s: native code for %s mapped at 0x%x", name.c_str(), m->name, lsa);
+        if (m->ls_base != lsa || m->size > size || !image_matches(ls, m)) continue;
+        map_module(m);
         return;
     }
+}
+
+// Images that arrive in pieces (DMA lists, several GETs - one DMA moves at most
+// 16 KB) never match code_loaded. When execution reaches a pc without native
+// code after LS was written, compare LS with every module covering pc.
+bool SpuThread::map_at(uint32_t pc) {
+    code_dirty = false;
+    if (!g_enabled) return false;
+    auto try_map = [&](const NativeModule *m) {
+        if (pc < m->ls_base || pc >= m->ls_base + m->size || !is_code(m, (pc - m->ls_base) >> 4)) return false;
+        for (auto &mp : mapped)
+            if (mp.m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size) return false;
+        g_match_tries++;
+        if (!image_matches(ls, m) || !map_module(m)) return false;
+        // move to the front of the recently used list
+        int k = 0;
+        while (k < 7 && recent[k] != m) k++;
+        for (; k > 0; k--) recent[k] = recent[k - 1];
+        recent[0] = m;
+        return true;
+    };
+    for (const NativeModule *m : recent)
+        if (m && try_map(m)) return native[pc >> 2];
+    for (const NativeModule *table : {g_native_modules, g_rt_modules}) {
+        int n = table == g_native_modules ? g_native_module_count : g_rt_enabled ? g_rt_module_count : 0;
+        for (int i = 0; i < n; i++) {
+            if (try_map(&table[i])) return native[pc >> 2];
+        }
+    }
+    return false;
 }
 
 void SpuThread::unmap_range(uint32_t lsa, uint32_t size) {
     for (auto &mp : mapped) {
         const NativeModule *m = mp.m;
         if (!m || lsa >= m->ls_base + m->size || m->ls_base >= lsa + size) continue;
+        bool code = false;
+        for (uint32_t a = std::max(lsa, m->ls_base) & ~15u; a < std::min(lsa + size, m->ls_base + m->size) && !code; a += 16)
+            code = is_code(m, (a - m->ls_base) >> 4);
+        if (!code) continue;
         for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = nullptr;
-        for (uint32_t l = m->ls_base >> 7; l <= (m->ls_base + m->size - 1) >> 7; l++) code_line[l] = 0;
+        for (uint32_t q = m->ls_base >> 4; q <= (m->ls_base + m->size - 1) >> 4; q++) code_q[q] = 0;
         mp.m = nullptr;
         code_epoch++;
         if (g_unmaps++ < 20) LOG("spu", "%s: native code for %s unmapped (write to 0x%x+0x%x)", name.c_str(), m->name, lsa, size);

@@ -84,11 +84,12 @@ def generate(e, out, rpcs3):
     gen = codegen.Gen(prog, funcs)
     ppu_dir = os.path.join(out, 'ppu')
     os.makedirs(ppu_dir, exist_ok=True)
-    for f in os.listdir(ppu_dir):
-        os.remove(os.path.join(ppu_dir, f))
+    # Outputs are rewritten only when their content changes (spu.out_file), so
+    # regenerating after an unrelated recompiler change recompiles nothing.
+    out_file = spu.out_file
 
     order = sorted(funcs)
-    with open(os.path.join(out, 'ppu_funcs.h'), 'w') as h:
+    with out_file(os.path.join(out, 'ppu_funcs.h')) as h:
         h.write('#pragma once\n#include "ppu.h"\n')
         for a in order:
             h.write(f'void f_{a:08x}(PPU_CTX);\n')
@@ -106,7 +107,7 @@ def generate(e, out, rpcs3):
         if not chunk:
             return
         p = os.path.join(ppu_dir, f'ppu_{idx:04d}.c')
-        with open(p, 'w') as c:
+        with out_file(p) as c:
             c.write('#include "ppu_funcs.h"\n\n')
             for a in chunk:
                 c.write(gen.function(funcs[a], f'f_{a:08x}_guest' if a in OVERRIDES else None))
@@ -120,11 +121,12 @@ def generate(e, out, rpcs3):
         if size >= CHUNK_INSNS:
             flush()
     flush()
+    spu.remove_stale(ppu_dir, files)
     log(f'wrote {len(files)} C files ({time.time() - t0:.1f}s)')
     if gen.missing:
         log('untranslated instructions (emitted as ppu_unimpl):', dict(gen.missing))
 
-    with open(os.path.join(out, 'ppu_table.c'), 'w') as c:
+    with out_file(os.path.join(out, 'ppu_table.c')) as c:
         c.write('#include "ppu_funcs.h"\n#include "runtime.h"\n\n')
         c.write(f'const uint32_t g_func_count = {len(order)};\n')
         c.write('const FuncEntry g_funcs[] = {\n')
@@ -138,7 +140,7 @@ def generate(e, out, rpcs3):
     if rpcs3 and os.path.isfile(rpcs3):
         cands |= nid.names_from_binary(rpcs3)
     names = nid.resolve([i.nid for i in stubs], cands)
-    with open(os.path.join(out, 'imports.c'), 'w') as c:
+    with out_file(os.path.join(out, 'imports.c')) as c:
         c.write('#include "runtime.h"\n\n')
         c.write(f'const uint32_t g_import_count = {len(stubs)};\n')
         c.write('const ImportEntry g_imports[] = {\n')
@@ -151,17 +153,17 @@ def generate(e, out, rpcs3):
     tls = e.tls()
     opd_entry = e.entry
     func, toc = struct.unpack('>II', e.read(opd_entry, 8))
-    with open(os.path.join(out, 'game_config.h'), 'w') as c:
+    with out_file(os.path.join(out, 'game_config.h')) as c:
         c.write('#pragma once\n')
         c.write(f'#define GAME_ENTRY_OPD 0x{opd_entry:x}u\n#define GAME_ENTRY 0x{func:x}u\n#define GAME_TOC 0x{toc:x}u\n')
         c.write(f'#define GAME_TLS_ADDR 0x{tls[0]:x}u\n#define GAME_TLS_FILESZ 0x{tls[1]:x}u\n#define GAME_TLS_MEMSZ 0x{tls[2]:x}u\n')
         c.write(f'#define GAME_PRIMARY_PRIO {pp["primary_prio"]}\n#define GAME_PRIMARY_STACK 0x{pp["primary_stacksize"]:x}u\n')
         c.write(f'#define GAME_MALLOC_PAGESIZE 0x{pp["malloc_pagesize"]:x}u\n#define GAME_SDK_VERSION 0x{pp["sdk_version"]:x}u\n')
-    with open(os.path.join(out, 'sources.txt'), 'w') as s:
+    with out_file(os.path.join(out, 'sources.txt')) as s:
         for p in files + [os.path.join(out, 'ppu_table.c'), os.path.join(out, 'imports.c')]:
             s.write(p.replace('\\', '/') + '\n')
     spu_files = spu.generate(e, out, log)
-    with open(os.path.join(out, 'spu_sources.txt'), 'w') as s:
+    with out_file(os.path.join(out, 'spu_sources.txt')) as s:
         for p in spu_files:
             s.write(p.replace('\\', '/') + '\n')
     log(f'done in {time.time() - t0:.1f}s')

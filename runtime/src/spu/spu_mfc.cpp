@@ -165,9 +165,12 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
     bool get = cmd & 0x40;
     for (uint32_t i = first; i < count; i++) {
         uint32_t ts = ls32(list + 8 * i), eal = ls32(list + 8 * i + 4), sz = ts & 0x7fff;
-        if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, lsa, sz);
-        if (get) ls_written(lsa, sz), memcpy(ls + lsa, ea_ptr(eal), sz);
-        else memcpy(ea_ptr(eal), ls + lsa, sz);
+        // DMA keeps the offset within a quadword: an element's LS address takes the
+        // low 4 bits of its EA, and the next element starts at the following quadword.
+        uint32_t la = (lsa & (LS_SIZE - 16)) | (eal & 15);
+        if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, la, sz);
+        if (get) ls_written(la, sz), memcpy(ls + la, ea_ptr(eal), sz), loaded_from(la, eal, sz);
+        else memcpy(ea_ptr(eal), ls + la, sz);
         lsa = (lsa + sz + 15) & (LS_SIZE - 16);
         if (ts & 0x80000000u) {
             stalled[tag] = {true, cmd, lsa, list, i + 1, count};

@@ -142,6 +142,8 @@ void hot_dump() {
 }
 } // namespace
 
+extern std::atomic<uint64_t> g_maps, g_unmaps, g_match_tries;
+
 std::string stats_line(double secs, uint32_t frames) {
     static int calls;
     if (g_hot_on && ++calls % 6 == 0) hot_dump();
@@ -149,11 +151,18 @@ std::string stats_line(double secs, uint32_t frames) {
     uint64_t i = g_insns.load(), r = g_run_ns.load(), w = g_wait_ns.load();
     uint64_t di = i - last_i, dr = r - last_r, dw = w - last_w;
     last_i = i, last_r = r, last_w = w;
-    char b[200];
+    static uint64_t last_maps, last_unmaps, last_tries;
+    uint64_t maps = g_maps.load(), unmaps = g_unmaps.load(), tries = g_match_tries.load();
+    double f = frames ? frames : 1;
+    char b[320];
     // busy = time in run() not blocked on events, summed over SPU threads (in cores)
     double busy = (double)(dr - std::min(dr, dw)) / 1e9;
-    snprintf(b, sizeof b, "SPU %.1fM insns/frame, %.0fM insns/s, %.2f cores busy (%.0fM insns/s per busy core)",
-             frames ? di / 1e6 / frames : 0.0, di / 1e6 / secs, busy / secs, busy > 0 ? di / 1e6 / busy : 0.0);
+    snprintf(b, sizeof b,
+             "SPU %.1fM insns/frame, %.0fM insns/s, %.2f cores busy (%.0fM insns/s per busy core), "
+             "native maps %.0f unmaps %.0f match tries %.0f per frame",
+             di / 1e6 / f, di / 1e6 / secs, busy / secs, busy > 0 ? di / 1e6 / busy : 0.0, (maps - last_maps) / f,
+             (unmaps - last_unmaps) / f, (tries - last_tries) / f);
+    last_maps = maps, last_unmaps = unmaps, last_tries = tries;
     return b;
 }
 
@@ -186,12 +195,16 @@ void SpuThread::run() {
             if (!on_trap(*this)) { running = false; break; }
             continue;
         }
-        if (native && !interp_once)
-            if (NativeFn f = native[pc >> 2]) {
-                pc = f(*this, pc);
-                continue;
-            }
+        if (!interp_once) {
+            if (native)
+                if (NativeFn f = native[pc >> 2]) {
+                    pc = f(*this, pc);
+                    continue;
+                }
+            if (code_dirty && map_at(pc)) continue;
+        }
         interp_once = false;
+        note_interpreted(pc);
         uint32_t x = ls32(pc);
         history[history_pos++ & 63] = pc;
         if (traced < trace_limit && traced++ >= 0) LOG("spu", "%s %05x: %08x  %s", name.c_str(), pc, x, disasm(pc, x).c_str());
