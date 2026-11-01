@@ -118,8 +118,23 @@ void SpuThread::mfc_command(uint32_t cmd) {
             const uint64_t *want = (const uint64_t *)rdata, *src = (const uint64_t *)(ls + (lsa & ~127u));
             line_lock(line);
             for (int i = 0; ok && i < 16; i++) ok = __atomic_load_n(&mem64[i], __ATOMIC_SEQ_CST) == want[i];
-            for (int i = 0; ok && i < 16; i++)
-                if (want[i] != src[i]) __atomic_store_n(&mem64[i], src[i], __ATOMIC_SEQ_CST);
+            // Plain stores (PPU sth/stw, DMA puts) do not take the line lock: a release
+            // landing between the compare and the store would be overwritten. Swap each
+            // changed word only if it still holds the reserved value; on a miss, undo the
+            // words already swapped and fail, so the SPU retries as after a lost reservation.
+            int done = 0;
+            for (; ok && done < 16; done++) {
+                if (want[done] == src[done]) continue;
+                uint64_t expect = want[done];
+                ok = __atomic_compare_exchange_n(&mem64[done], &expect, src[done], false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                if (!ok) break;
+            }
+            if (!ok)
+                for (int i = 0; i < done; i++)
+                    if (want[i] != src[i]) {
+                        uint64_t expect = src[i];
+                        __atomic_compare_exchange_n(&mem64[i], &expect, want[i], false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                    }
             if (ok) line_commit(line);
             line_unlock(line);
         }
