@@ -1121,8 +1121,12 @@ void draw() {
     uint8_t texdim[16] = {};
     ID3D11ShaderResourceView *srv[16] = {};
     ID3D11SamplerState *smp[16] = {};
+    // Games leave textures enabled that the program never samples (Killzone 2 keeps
+    // its G-buffer bound while rendering into it); binding one costs a decode, a
+    // readback or a snapshot copy of a render target, so bind only sampled units.
+    uint16_t sampled = scan_fp(fp_ea).tex_mask;
     for (int t = 0; t < 16; t++) {
-        if (!(reg(0x1a0c + t * 32) & 0x80000000)) continue;
+        if (!(reg(0x1a0c + t * 32) & 0x80000000) || !(sampled & (1 << t))) continue;
         TexDim d;
         srv[t] = get_texture(t, d);
         texdim[t] = d;
@@ -1190,6 +1194,48 @@ void draw() {
         LOG("draw", "   surface fmt=%08x %ux%u target=%x color=%x/%x/%x/%x depth=%x pitch=%x", reg(0x0208), b.w, b.h,
             reg(0x0220), b.color[0] ? b.color[0]->ea : 0, b.color[1] ? b.color[1]->ea : 0, b.color[2] ? b.color[2]->ea : 0,
             b.color[3] ? b.color[3]->ea : 0, b.depth ? b.depth->ea : 0, reg(0x020c));
+        {   // geometry: primitive, index buffer, vertex range, and each enabled attribute as fmt@offset
+            std::string attrs;
+            for (int a = 0; a < 16; a++)
+                if (reg(0x1ff0) & (1 << a)) {
+                    char s[40];
+                    snprintf(s, sizeof s, " a%d=%08x@%08x", a, reg(0x1740 + a * 4), reg(0x1680 + a * 4));
+                    attrs += s;
+                }
+            LOG("draw", "   geom vs=%016llx prim=%u indexed=%d index=%08x@%08x verts %u..%u base=%x/%x freq=%x:%s",
+                (unsigned long long)g_vs_hash, g_prim, g_indexed, reg(0x1820), reg(0x181c), vmin, vmax, reg(0x1738),
+                reg(0x173c), reg(0x1fc0), attrs.c_str());
+            // Spike check on the decoded attribute-0 positions: share of triangles with an
+            // edge over 8x the draw's median edge length.
+            if (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST && list.size() >= 3) {
+                std::vector<float> pos((size_t)nv * 3), edge;
+                float vv[64];
+                for (uint32_t i = 0; i < nv; i++) fetch_vertex(vv, vmin + i), memcpy(&pos[i * 3], vv, 12);
+                auto len = [&](uint32_t a, uint32_t b) {
+                    float d[3] = {pos[a * 3] - pos[b * 3], pos[a * 3 + 1] - pos[b * 3 + 1], pos[a * 3 + 2] - pos[b * 3 + 2]};
+                    return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                };
+                for (size_t i = 0; i + 2 < list.size(); i += 3)
+                    edge.push_back(std::max({len(list[i], list[i + 1]), len(list[i + 1], list[i + 2]), len(list[i + 2], list[i])}));
+                std::vector<float> sorted = edge;
+                std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+                float median = sorted[sorted.size() / 2];
+                size_t spikes = 0;
+                for (float e : edge) spikes += e > 8 * median;
+                if (spikes * 50 > edge.size()) {
+                    LOG("draw", "   SPIKES: %zu of %zu triangles have an edge > 8x the median (%g)", spikes, edge.size(), median);
+                    for (size_t i = 0, shown = 0; i < edge.size() && shown < 3; i++) {
+                        if (edge[i] <= 8 * median) continue;
+                        shown++;
+                        for (int k = 0; k < 3; k++) {
+                            uint32_t v = list[i * 3 + k];
+                            LOG("draw", "     tri %zu v%d: index %u (+%u) pos %g %g %g", i, k, v, vmin, pos[v * 3], pos[v * 3 + 1],
+                                pos[v * 3 + 2]);
+                        }
+                    }
+                }
+            }
+        }
         for (int t = 0; t < 16; t++)
             if (reg(0x1a0c + t * 32) & 0x80000000) {
                 uint32_t tea = ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32));
@@ -1252,8 +1298,12 @@ void draw() {
     if (b.depth && zwrite) b.depth->dirty = true;
     // Capture: after each small draw (post-processing quads), save its target.
     // (Square targets are shadow maps: skipped.)
-    if ((int)g_frame == g_log_frame && list.size() <= 96 && b.color[0] && b.color[0]->w != b.color[0]->h &&
-        g_step_dumps < 80) {
+    // KZ2_STEP_EVERY=n with KZ2_STEP_RT=<ea>: also snapshot that target after every nth draw into it.
+    static const int step_every = getenv("KZ2_STEP_EVERY") ? atoi(getenv("KZ2_STEP_EVERY")) : 0;
+    static const uint32_t step_rt = getenv("KZ2_STEP_RT") ? (uint32_t)strtoul(getenv("KZ2_STEP_RT"), nullptr, 16) : 0;
+    bool step = step_every > 0 && b.color[0] && b.color[0]->ea == step_rt && g_draws_this_frame % step_every == 0;
+    if ((int)g_frame == g_log_frame && b.color[0] && g_step_dumps < 80 &&
+        (step_every ? step : list.size() <= 96 && b.color[0]->w != b.color[0]->h)) {
         g_step_dumps++;
         char name[64];
         snprintf(name, sizeof name, "step_%04d_%08x", g_draws_this_frame, b.color[0]->ea);
@@ -1275,6 +1325,17 @@ const char *PRESENT_HLSL =
     "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
 ID3D11Buffer *g_cb_present;
 
+} // namespace
+} // namespace rsx
+// Hybrid-graphics drivers (NVIDIA Optimus, AMD PowerXpress) run executables exporting
+// these on the discrete GPU.
+extern "C" {
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+namespace rsx {
+namespace {
+
 bool create_device() {
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 1;
@@ -1287,8 +1348,29 @@ bool create_device() {
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;  // blt model: stretches to the window, capturable
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     UINT flags = getenv("KZ2_D3D_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0;
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, &fl, 1,
-                                               D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, nullptr, &g_ctx);
+    // The default adapter is whatever Windows considers primary - often the integrated
+    // GPU of an APU. Ask DXGI for the high-performance one (the discrete GPU).
+    IDXGIAdapter1 *adapter = nullptr;
+    IDXGIFactory6 *factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory6), (void **)&factory))) {
+        factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, __uuidof(IDXGIAdapter1),
+                                            (void **)&adapter);
+        factory->Release();
+    }
+    if (adapter) {
+        DXGI_ADAPTER_DESC1 ad;
+        adapter->GetDesc1(&ad);
+        char name[128];
+        WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof name, nullptr, nullptr);
+        LOG("rsx", "GPU: %s (%llu MB video memory)", name, (unsigned long long)(ad.DedicatedVideoMemory >> 20));
+    }
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+                                               nullptr, flags, &fl, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, nullptr,
+                                               &g_ctx);
+    if (adapter) {
+        adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&g_adapter3);
+        adapter->Release();
+    }
     if (FAILED(hr)) { LOG("rsx", "D3D11 device creation failed (0x%08lx)", hr); return false; }
     D3D11_FEATURE_DATA_D3D11_OPTIONS opts{};
     g_ring_ok = SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opts, sizeof opts)) &&
@@ -1415,24 +1497,43 @@ void request_capture() { g_capture_req = true; }
 // memory in RSX layout. Called when the RSX signals progress (labels,
 // semaphores, user commands, flips): from then on the PPU and SPUs may read
 // what it rendered - Killzone 2 post-processes downsampled frames on the SPUs.
-void write_back() {
+// Only surfaces in main memory are copied here: those are what the PPU and SPUs
+// read. Surfaces in RSX local memory stay on the GPU until a texture or NV0039
+// copy needs their bytes (write_back_surface on demand); each copy stalls on
+// the GPU. KZ2_WB_LOCAL=1 also copies local surfaces at every sync point.
+void write_back(bool all) {
+    if (leak_mode() == 6) return;
+    static const bool wb_local = getenv("KZ2_WB_LOCAL") && atoi(getenv("KZ2_WB_LOCAL"));
+    all |= wb_local;
     auto t0 = std::chrono::steady_clock::now();
-    for (auto &[ea, s] : g_surfaces) write_back_surface(ea, s);
-    for (auto &[ea, s] : g_depth_surfaces) write_back_surface(ea, s);
+    for (auto &[ea, s] : g_surfaces) if (all || ea < mem::LOCAL_BASE) write_back_surface(ea, s);
+    for (auto &[ea, s] : g_depth_surfaces) if (all || ea < mem::LOCAL_BASE) write_back_surface(ea, s);
     g_wb_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     g_wb_calls++;
 }
 std::string stats_line(uint32_t frames) {
-    char b[320];
+    char b[600];
     double f = frames;
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof pmc);
+    DXGI_QUERY_VIDEO_MEMORY_INFO vram{}, sysram{};
+    if (g_adapter3) {
+        g_adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vram);
+        g_adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &sysram);
+    }
     snprintf(b, sizeof b,
              "RSX per frame: draws %.0f ms (%.0f), write-back %.0f ms (%.0f); surface readbacks %.0f ms (%.0f), "
              "texture uploads %.0f ms (%.0f), shader compiles %.0f ms (%.0f), vertex fetch %.0f ms (%.1fM vertices "
-             "for %.1fM indices; Map+copy %.0f ms), draw calls %.0f ms; present %.0f ms",
+             "for %.1fM indices; Map+copy %.0f ms), draw calls %.0f ms; present %.0f ms; "
+             "memory: %zu textures, %zu surfaces, process %llu MB in use (%llu MB private, %llu MB of it guest memory), "
+             "GPU %llu MB in video memory + %llu MB in system memory",
              g_draw_us / 1e3 / f, g_draw_calls / f, g_wb_us / 1e3 / f, g_wb_calls / f, g_wbs_us / 1e3 / f, g_wbs_n / f,
              g_tex_us / 1e3 / f, g_tex_n / f, g_compile_us / 1e3 / f, g_compile_n / f, g_fetch_us / 1e3 / f,
              g_fetch_verts / 1e6 / f, g_fetch_used / 1e6 / f, g_map_us / 1e3 / f, g_dcall_us / 1e3 / f,
-             g_present_us / 1e3 / f);
+             g_present_us / 1e3 / f, g_textures.size(), g_surfaces.size() + g_depth_surfaces.size(),
+             (unsigned long long)(pmc.WorkingSetSize >> 20), (unsigned long long)(pmc.PrivateUsage >> 20),
+             (unsigned long long)(mem::committed() >> 20),
+             (unsigned long long)(vram.CurrentUsage >> 20), (unsigned long long)(sysram.CurrentUsage >> 20));
     g_wb_us = g_wb_calls = g_draw_us = g_draw_calls = g_present_us = 0;
     g_wbs_us = g_wbs_n = g_tex_us = g_tex_n = g_compile_us = g_compile_n = 0;
     g_fetch_us = g_fetch_verts = g_fetch_used = g_dcall_us = g_map_us = 0;
@@ -1627,11 +1728,11 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     g_present_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void write_back();
+void write_back(bool all);
 void copy_m2mf() {
     // NV0039: line-by-line copy between local and main memory. The source may
     // be a surface rendered earlier in the stream: write it back first.
-    write_back();
+    write_back(true);
     uint32_t in = ea_for(dma_location(reg(0x2184)), reg(0x230c));
     uint32_t out = ea_for(dma_location(reg(0x2188)), reg(0x2310));
     int32_t pin = (int32_t)reg(0x2314), pout = (int32_t)reg(0x2318);
@@ -1646,7 +1747,7 @@ void copy_m2mf() {
 void method(uint32_t m, uint32_t arg) {
     regs[m >> 2] = arg;
     // Sync points: whoever waits on these may read what was rendered.
-    if (m == 0x006c || m == 0x1d70 || m == 0x1d74 || m == 0xeb00 || m == 0xfeac) write_back();
+    if (m == 0x006c || m == 0x1d70 || m == 0x1d74 || m == 0xeb00 || m == 0xfeac) write_back(false);
     if (m >= 0x0b80 && m < 0x0c00) { vp_ucode[g_vp_load++ & 2047] = arg; return; }
     if (m >= 0x1f00 && m < 0x1f80) { memcpy(&vp_consts[g_vc_load++ & 2047], &arg, 4); vp_consts_dirty = true; return; }
     if (m >= 0x1c00 && m < 0x1d00) { uint32_t i = (m - 0x1c00) >> 2; memcpy(&g_vattr[i / 4][i % 4], &arg, 4); return; }

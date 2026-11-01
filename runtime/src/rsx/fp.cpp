@@ -68,12 +68,14 @@ std::string cmp_cc(bool lt, bool eq, bool gt, const std::string &v) {
 FpScan scan_fp(uint32_t addr) {
     // Instruction words only (inline constants excluded) identify the shader;
     // constant values are uploaded per draw.
-    FpScan r{1469598103934665603ull, {}};
+    FpScan r{1469598103934665603ull, {}, 0};
     uint32_t a = addr;
     for (int n = 0; n < 1024; n++) {
         uint32_t w[4] = {fpword(a), fpword(a + 4), fpword(a + 8), fpword(a + 12)};
         r.hash = fnv(w, 16, r.hash);
         a += 16;
+        uint32_t op = bits(w[0], 24, 6) | (bits(w[2], 31, 1) << 6);   // TEX TXP TXD TXL TXB
+        if (op == 0x17 || op == 0x18 || op == 0x19 || op == 0x2f || op == 0x31) r.tex_mask |= 1u << bits(w[0], 17, 4);
         if (bits(w[1], 0, 2) == 2 || bits(w[2], 0, 2) == 2 || bits(w[3], 0, 2) == 2) {
             if (r.consts.size() < 128) r.consts.push_back(a - addr);
             a += 16;
