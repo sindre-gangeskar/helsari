@@ -254,7 +254,7 @@ HLE(cellSpursWorkloadAttributeSetName) {
 void ready_monitor() {
     name_host_thread("spurs ready monitor");
     for (;;) {
-        host_sleep_us(1000);
+        host_sleep_us(fast_wake() ? 100 : 1000);
         std::lock_guard<std::mutex> lk(g_lock);
         for (auto &[id, w] : g_workloads)
             if (w->ready() > w->running) w->cv.notify_all();

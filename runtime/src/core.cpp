@@ -46,10 +46,18 @@ void host_sleep_us(uint32_t us) {
     WaitForSingleObject(timer, INFINITE);
 }
 
+// KZ2_FAST_WAKE=1 (experiment): no sleeps longer than 50 us in wait loops, and the
+// SPURS ready monitor polls every 100 us - tests whether frames are bound by how
+// quickly waiting threads notice work, rather than by the work itself.
+bool fast_wake() {
+    static const bool on = getenv("KZ2_FAST_WAKE") && atoi(getenv("KZ2_FAST_WAKE"));
+    return on;
+}
+
 void host_backoff(uint32_t n) {
     if (n < 64) YieldProcessor();          // a few hundred ns: the other side is about to answer
     else if (n < 256) SwitchToThread();    // give the core to a ready thread, if any
-    else host_sleep_us(n < 1024 ? 50 : n < 2048 ? 200 : 1000);   // long idle (~0.25 s): fewer wake-ups
+    else host_sleep_us(n < 1024 || fast_wake() ? 50 : n < 2048 ? 200 : 1000);   // long idle (~0.25 s): fewer wake-ups
 }
 
 void fatal(const char *fmt, ...) {

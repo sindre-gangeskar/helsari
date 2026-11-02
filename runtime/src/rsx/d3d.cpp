@@ -1386,7 +1386,55 @@ void draw() {
     if (vmin > vmax || vmax - vmin > 4 * 1024 * 1024) { g_skip[2]++; return; }
     uint32_t nv = vmax - vmin + 1;
     UINT base_vertex = 0, start_index = 0;   // where this draw's data sits in the rings
-    if (leak_mode() != 2) {
+    // Vertex attributes for the shader (VX cbuffer): byte offset of vertex vmin in the
+    // vertex ring, stride, type | size << 4, enabled; constant values when disabled.
+    uint32_t vattr[16][4] = {};
+    // GPU vertex fetch: copy the raw guest bytes of each attribute's vertex range
+    // (overlapping ranges - interleaved attributes - merged into one copy); the vertex
+    // shader decodes them (vp.cpp fetch). KZ2_CPU_VERTEX=1: decode on the CPU instead.
+    static const bool cpu_vertex = getenv("KZ2_CPU_VERTEX") && atoi(getenv("KZ2_CPU_VERTEX"));
+    if (leak_mode() != 2 && !cpu_vertex) {
+        ScopedUs timer{g_fetch_us};
+        g_fetch_verts += nv;
+        g_fetch_used += src_idx.size();
+        uint32_t mask = reg(0x1ff0), base_off = reg(0x1738), base_idx = reg(0x173c);
+        struct Span { uint64_t lo, hi; int attr; };
+        Span spans[16];
+        int ns = 0;
+        static const uint8_t comp_bytes[8] = {0, 2, 4, 2, 1, 2, 4, 1};
+        for (int a = 0; a < 16; a++) {
+            uint32_t fmt = reg(0x1740 + a * 4), type = fmt & 0xf, size = (fmt >> 4) & 0xf, stride = (fmt >> 8) & 0xff;
+            if (!(mask & (1 << a)) || !size || type < 1 || type > 7) continue;
+            uint32_t off = reg(0x1680 + a * 4);
+            uint32_t ea = ea_for(off >> 31, (off & 0x7fffffff) + base_off);
+            uint32_t elem = type == 6 ? 4 : comp_bytes[type] * size;
+            uint64_t lo = (uint64_t)ea + (uint64_t)(base_idx + vmin) * stride;
+            uint64_t hi = (uint64_t)ea + (uint64_t)(base_idx + vmax) * stride + elem;
+            spans[ns++] = {lo, hi, a};
+            vattr[a][1] = stride, vattr[a][2] = type | size << 4, vattr[a][3] = 1;
+        }
+        std::sort(spans, spans + ns, [](const Span &x, const Span &y) { return x.lo < y.lo; });
+        // Merge overlapping spans; each merged span starts 16-byte aligned in the ring.
+        struct Run { uint64_t lo, hi; uint32_t dst; };
+        Run runs[16];
+        int nr = 0;
+        uint32_t total = 0;
+        int run_of[16];
+        for (int i = 0; i < ns; i++) {
+            if (nr && spans[i].lo < runs[nr - 1].hi) runs[nr - 1].hi = std::max(runs[nr - 1].hi, spans[i].hi);
+            else runs[nr++] = {spans[i].lo, spans[i].hi, 0};
+            run_of[i] = nr - 1;
+        }
+        for (int r = 0; r < nr; r++) runs[r].dst = total, total += (uint32_t)((runs[r].hi - runs[r].lo + 15) & ~15ull);
+        ScopedUs map_timer{g_map_us};
+        uint8_t *vd = total ? (uint8_t *)ring_map(g_vring, total, 16, D3D11_BIND_SHADER_RESOURCE, true, &base_vertex) : nullptr;
+        if (total && !vd) { g_skip[3]++; return; }
+        for (int r = 0; r < nr; r++) memcpy(vd + runs[r].dst, mem::ptr((uint32_t)runs[r].lo), runs[r].hi - runs[r].lo);
+        if (total) g_ctx->Unmap(g_vring.buf, 0);
+        for (int i = 0; i < ns; i++)
+            vattr[spans[i].attr][0] = base_vertex * 16 + runs[run_of[i]].dst + (uint32_t)(spans[i].lo - runs[run_of[i]].lo);
+        base_vertex = 0;
+    } else if (leak_mode() != 2) {
         ScopedUs timer{g_fetch_us};
         g_fetch_verts += nv;
         g_fetch_used += src_idx.size();
@@ -1400,6 +1448,9 @@ void draw() {
         if (!vd) { g_skip[3]++; return; }
         memcpy(vd, scratch.data(), (size_t)nv * 256);
         g_ctx->Unmap(g_vring.buf, 0);
+        // The shader reads host float4s: vertex i's attribute k at (base + i) * 256 + k * 16.
+        for (int a = 0; a < 16; a++) vattr[a][0] = base_vertex * 256 + a * 16, vattr[a][1] = 256, vattr[a][2] = 8, vattr[a][3] = 1;
+        base_vertex = 0;
     }
 
     std::vector<uint32_t> list;
@@ -1504,7 +1555,7 @@ void draw() {
         upload_cb(g_cb_vc, vp_consts, sizeof vp_consts);
     }
     vp_consts_dirty = false;
-    float vx[24] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
+    float vx[24 + 128] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
                     regf(0x0a28), regf(0x0a2c), (float)b.w, (float)b.h, 0, 0};
     // SET_USER_CLIP_PLANE_CONTROL (0x1478): 4 bits per plane, 1 = clip where d >= 0
     // (keep d < 0), 2 = clip where d < 0. Killzone 2 cuts mirrored geometry at the
@@ -1521,6 +1572,8 @@ void draw() {
     origin_bottom = !origin_bottom;
     if (getenv("KZ2_FLIP_Y")) origin_bottom = !origin_bottom;
     vx[10] = origin_bottom ? 1.f : 0.f;
+    memcpy(&vx[24], vattr, sizeof vattr);
+    memcpy(&vx[24 + 64], g_vattr, sizeof g_vattr);
     if (!cb_on) {
     } else if (g_cbring) s_vx = cb_push(vx, sizeof vx);
     else upload_cb(g_cb_vx, vx, sizeof vx);
@@ -1906,7 +1959,7 @@ bool create_device() {
         if (!g_cbring) release(g_ctx1);
     }
     if (!g_cbring) LOG("rsx", "driver lacks constant buffer offsets: constants are re-uploaded per draw");
-    g_cb_vx = make_cb(96);
+    g_cb_vx = make_cb(sizeof(float) * (24 + 128));
     g_cb_px = make_cb(32 + 256 + 128 * 16);
     g_cb_present = make_cb(16);
     g_cb_unit_uv = make_cb(16);

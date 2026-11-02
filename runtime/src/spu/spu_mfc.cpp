@@ -122,6 +122,7 @@ void SpuThread::mfc_command(uint32_t cmd) {
     }
     switch (cmd) {
     case 0x40: case 0x41: case 0x42:                // GET, GETB, GETF
+        if (same_code_reload(lsa, ea_ptr(ea), size)) { loaded_from(lsa, ea, size); break; }
         memcpy(ls + lsa, ea_ptr(ea), size);
         code_loaded(lsa, ea, size);                 // unmaps what it overwrote; maps a known image
         break;
@@ -204,7 +205,8 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
         // low 4 bits of its EA, and the next element starts at the following quadword.
         uint32_t la = (lsa & (LS_SIZE - 16)) | (eal & 15);
         if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, la, sz);
-        if (get) ls_written(la, sz), memcpy(ls + la, ea_ptr(eal), sz), loaded_from(la, eal, sz);
+        if (get && same_code_reload(la, ea_ptr(eal), sz)) loaded_from(la, eal, sz);
+        else if (get) ls_written(la, sz), memcpy(ls + la, ea_ptr(eal), sz), loaded_from(la, eal, sz);
         else memcpy(ea_ptr(eal), ls + la, sz);
         lsa = (lsa + sz + 15) & (LS_SIZE - 16);
         if (ts & 0x80000000u) {

@@ -6,6 +6,7 @@
 #include "idle_backoff.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <atomic>
@@ -163,6 +164,16 @@ struct SpuThread {
     // Modules mapped most recently, tried first by map_at: job managers reload the
     // same few job binaries over and over, so the match is nearly always here.
     const NativeModule *recent[8] = {};
+    // A DMA bringing bytes LS already holds over mapped code (job managers re-send the
+    // same job binary before every run): nothing changes, so the mapping stays.
+    // Saves an unmap, an image match and a remap per job. KZ2_SPU_RELOAD_CHECK=0: off.
+    bool same_code_reload(uint32_t lsa, const void *src, uint32_t size) {
+        static const bool on = [] { const char *e = getenv("KZ2_SPU_RELOAD_CHECK"); return !e || atoi(e) != 0; }();
+        if (!on || !size || lsa + size > LS_SIZE) return false;
+        bool code = false;
+        for (uint32_t q = lsa >> 4, e = (lsa + size - 1) >> 4; q <= e && !code; q++) code = code_q[q] == CODE;
+        return code && !memcmp(ls + lsa, src, size);
+    }
     // LS [lsa, lsa+size) is about to be written by anything other than a code load.
     void ls_written(uint32_t lsa, uint32_t size) {
         code_dirty = true;

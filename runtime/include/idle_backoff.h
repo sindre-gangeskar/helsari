@@ -8,6 +8,8 @@
 /* One step of a wait loop: spin briefly (n = iterations so far), then sleep
    in short steps, so quick handoffs stay fast and long waits cost no CPU. */
 void host_backoff(uint32_t n);
+/* KZ2_FAST_WAKE=1 experiment: short sleeps only (core.cpp). */
+bool fast_wake();
 /* Monotonic time in nanoseconds (core.cpp). */
 uint64_t host_now_ns();
 

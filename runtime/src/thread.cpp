@@ -1,10 +1,14 @@
 // PPU threads: each guest thread is a host thread with its own PPUContext,
 // guest stack and TLS block.
 #include "runtime.h"
+#include "idle_backoff.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <vector>
 #include <condition_variable>
 #include <map>
 #include <mutex>
@@ -23,6 +27,13 @@ struct Thread {
     std::atomic<const char *> last_call{"(start)"};
     std::atomic<uint64_t> last_lr{0}, last_arg0{0};
     std::atomic<bool> in_call{false};
+    // Time spent in OS calls (syscalls and HLE imports), outermost call only: which
+    // waits pace a thread (call_report, in the flip log).
+    int call_depth = 0;
+    const char *call_name = nullptr;
+    uint64_t call_t0 = 0;
+    std::mutex stats_lock;
+    std::map<const char *, uint64_t> call_ns;
 };
 
 struct ThreadExit { uint64_t status; };
@@ -83,11 +94,59 @@ Thread *make(uint32_t entry_opd, uint64_t arg, uint32_t stack, const char *name,
 void note_call(const char *name, PPUContext *ctx, bool entering) {
     if (!t_cur) return;
     if (entering) {
+        // usleep is how the game polls: account it per call site (lr), to find the loop.
+        if (t_cur->call_depth == 0 && !strcmp(name, "syscall_141")) {
+            static std::mutex m;
+            static std::map<uint64_t, const char *> names;
+            std::lock_guard<std::mutex> lk(m);
+            const char *&n = names[ctx->lr];
+            if (!n) { char *b = new char[40]; snprintf(b, 40, "usleep@%llx", (unsigned long long)ctx->lr); n = b; }
+            name = n;
+        }
+        if (t_cur->call_depth++ == 0) t_cur->call_name = name, t_cur->call_t0 = host_now_ns();
+    } else if (t_cur->call_depth > 0 && --t_cur->call_depth == 0) {
+        if (!strncmp(t_cur->call_name, "usleep@", 7) && t_cur->name == "main")
+            gcm_tl("main %s %.3f ms", t_cur->call_name, (host_now_ns() - t_cur->call_t0) / 1e6);
+        std::lock_guard<std::mutex> lk(t_cur->stats_lock);
+        t_cur->call_ns[t_cur->call_name] += host_now_ns() - t_cur->call_t0;
+    }
+    if (entering) {
         t_cur->last_call = name;
         t_cur->last_lr = ctx->lr;
         t_cur->last_arg0 = ctx->r[3];
     }
     t_cur->in_call = entering;
+}
+
+// Time a thread spent waiting outside an OS call (e.g. the native microthread pick).
+void add_wait(const char *name, uint64_t ns) {
+    if (!t_cur) return;
+    std::lock_guard<std::mutex> lk(t_cur->stats_lock);
+    t_cur->call_ns[name] += ns;
+}
+
+// "name: call ms, call ms, ..." for guest threads whose name contains `filter`:
+// the calls they spent most time in since the last report, per frame. Resets.
+std::string call_report(const char *filter, double frames) {
+    std::string out;
+    std::lock_guard<std::mutex> lk(g_lock);
+    for (auto &[id, t] : g_threads) {
+        if (t->done || t->name.find(filter) == std::string::npos) continue;
+        std::vector<std::pair<uint64_t, const char *>> v;
+        {
+            std::lock_guard<std::mutex> sl(t->stats_lock);
+            for (auto &[n, ns] : t->call_ns) v.push_back({ns, n});
+            t->call_ns.clear();
+        }
+        std::sort(v.rbegin(), v.rend());
+        char buf[128];
+        out += (out.empty() ? "" : "; ") + t->name + ":";
+        for (size_t i = 0; i < v.size() && i < 6; i++) {
+            snprintf(buf, sizeof buf, " %s %.1f", v[i].second, v[i].first / 1e6 / frames);
+            out += buf;
+        }
+    }
+    return out;
 }
 
 void dump_all() {

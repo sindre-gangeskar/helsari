@@ -15,6 +15,25 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <cstdarg>
+#include "idle_backoff.h"
+#include "rsx/rsx.h"
+
+// Frame timeline (around an F12 capture): timestamped events of the RSX, the user
+// handler and the waiting PPU, to see which step holds up the frame.
+void gcm_tl(const char *fmt, ...) {
+    if (!rsx::capturing()) return;
+    static uint64_t t0;
+    uint64_t now = host_now_ns();
+    if (!t0 || now - t0 > 2000000000ull) t0 = now;
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    LOG("tl", "%9.3f ms  %s", (now - t0) / 1e6, buf);
+}
+#define tl gcm_tl
 
 #define REG(n) hle_register(#n, hle_##n)
 
@@ -32,6 +51,7 @@ constexpr uint32_t GCM_FLIP_METHOD = 0xfeac;
 // Time the FIFO spent waiting in SEMAPHORE_ACQUIRE (reported with the fps).
 std::atomic<uint64_t> g_acquire_us{0};
 std::atomic<uint64_t> g_fifo_idle_us{0};   // FIFO empty: waiting for the game to submit
+std::atomic<uint64_t> g_fifo_parked_us{0}; // of that: parked on a jump to itself (released by the user handler)
 uint64_t g_acquire_max_us;
 uint32_t g_acquire_max_label;
 
@@ -106,11 +126,12 @@ void flip(uint32_t id) {
     if (++n - last_n >= 60 || secs >= 5) {
         uint32_t frames = n - last_n;
         last = now, last_n = n;
-        LOG("gcm", "flip #%u (buffer %u), %.1f fps; %s; RSX FIFO idle %.0f ms/frame, semaphore waits %.0f ms/frame (longest %.0f ms, label 0x%x); %s",
-            n, id, frames / secs, spu::stats_line(secs, frames).c_str(), g_fifo_idle_us.exchange(0) / 1000.0 / frames,
+        LOG("gcm", "flip #%u (buffer %u), %.1f fps; %s; RSX FIFO idle %.0f ms/frame (parked %.0f), semaphore waits %.0f ms/frame (longest %.0f ms, label 0x%x); %s",
+            n, id, frames / secs, spu::stats_line(secs, frames).c_str(), g_fifo_idle_us.exchange(0) / 1000.0 / frames, g_fifo_parked_us.exchange(0) / 1000.0 / frames,
             g_acquire_us.exchange(0) / 1000.0 / frames, g_acquire_max_us / 1000.0, g_acquire_max_label,
             (rsx::stats_line(frames) + ", " + fiber_stats() + "; " + mem::host_regions()).c_str());
         g_acquire_max_us = 0;
+        LOG("gcm", "   PPU time in OS calls (ms/frame): %s", thread::call_report("", frames).c_str());
     }
     // Window title: fps and frame time, averaged over at least a second, and the
     // process's memory (private bytes: what it has committed, as Task Manager shows).
@@ -182,13 +203,15 @@ void method(uint32_t m, uint32_t arg) {
     case 0x006c:                                                        // NV406E_SEMAPHORE_RELEASE
         if (rsx::capturing()) LOG("sync", "RSX release label 0x%x = 0x%x", g_rsx.semaphore_offset, arg);
         st32(LABEL_ADDR + g_rsx.semaphore_offset, arg);
+        tl("rsx label 0x%x = 0x%x", g_rsx.semaphore_offset, arg);
         break;
     case 0x1d6c: g_rsx.be_semaphore_offset = arg; break;
     case 0x1d70:                                                        // BACK_END_WRITE_SEMAPHORE_RELEASE
         st32(LABEL_ADDR + g_rsx.be_semaphore_offset, (arg & 0xff00ff00) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff));
+        tl("rsx label 0x%x = 0x%x (back end)", g_rsx.be_semaphore_offset, arg);
         break;
-    case 0x1d74: st32(LABEL_ADDR + g_rsx.be_semaphore_offset, arg); break; // TEXTURE_READ_SEMAPHORE_RELEASE
-    case GCM_FLIP_METHOD: flip(arg); break;
+    case 0x1d74: st32(LABEL_ADDR + g_rsx.be_semaphore_offset, arg); tl("rsx label 0x%x = 0x%x (tex)", g_rsx.be_semaphore_offset, arg); break;
+    case GCM_FLIP_METHOD: tl("rsx flip 0x%x", arg); flip(arg); break;
     case 0xeb00: {                                                      // GCM_SET_USER_COMMAND
         static std::atomic<int> logs{0};
         if (logs++ < 5) LOG("rsx", "user command 0x%x (handler 0x%x)", arg, g_user_handler);
@@ -197,6 +220,7 @@ void method(uint32_t m, uint32_t arg) {
             g_user_commands.push_back(arg);
         }
         g_intr_cv.notify_one();
+        tl("rsx user command 0x%x", arg);
         break;
     }
     }
@@ -215,9 +239,12 @@ void fifo_thread() {
         uint32_t ea0 = get != put ? io_ea(get) : 0;
         bool parked = ea0 && ld32(ea0) == (0x20000000 | get) || ea0 && ld32(ea0) == (get | 1);
         if (get == put || parked) {
+            if (!idle) tl("rsx %s at 0x%x", parked ? "parked" : "empty", get);
             auto t0 = std::chrono::steady_clock::now();
             host_backoff(idle++);
-            g_fifo_idle_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            g_fifo_idle_us += us;
+            if (parked) g_fifo_parked_us += us;
             continue;
         }
         // Experiment (KZ2_RSX_RESUME_DELAY_MS): after idling, give in-flight SPU writes
@@ -229,6 +256,7 @@ void fifo_thread() {
             idle = 0;
             continue;   // re-read put/get: more may have been released meanwhile
         }
+        if (idle) tl("rsx resumes at 0x%x (put 0x%x)", get, put);
         idle = 0;
         if (trace && put != last_put) { LOG("rsx", "put=0x%x get=0x%x", put, get); last_put = put; }
         uint32_t ea = io_ea(get);
@@ -275,7 +303,12 @@ void vblank_loop(PPUContext *ctx) {
                 cmds.swap(g_user_commands);
             }
             for (uint32_t c : cmds)
-                if (g_user_handler) { ctx->r[3] = c; ppu_invoke(ctx, g_user_handler); }
+                if (g_user_handler) {
+                    tl("handler(0x%x) starts", c);
+                    ctx->r[3] = c;
+                    ppu_invoke(ctx, g_user_handler);
+                    tl("handler(0x%x) done", c);
+                }
         }
         if (g_vblank_handler) { ctx->r[3] = 1; ppu_invoke(ctx, g_vblank_handler); }
         if (g_pending_flip_handler.exchange(0) && g_flip_handler) { ctx->r[3] = 1; ppu_invoke(ctx, g_flip_handler); }

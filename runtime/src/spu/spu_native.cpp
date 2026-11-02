@@ -55,9 +55,15 @@ bool is_code(const NativeModule *m, uint32_t q) {   // q: quadword index from ls
 // those are all that was compiled, and the rest is data the program may have changed.
 bool image_matches(const uint8_t *ls, const NativeModule *m) {
     if (!m->image) return !memcmp(ls + m->ls_base, mem::ptr(m->src_ea), m->size);
-    for (uint32_t off = 0; off < m->size; off += 16)
-        if (is_code(m, off >> 4) && memcmp(ls + m->ls_base + off, m->image + off, std::min(16u, m->size - off)))
-            return false;
+    // Compare each run of consecutive code quadwords with one memcmp.
+    for (uint32_t off = 0; off < m->size;) {
+        if (!is_code(m, off >> 4)) { off += 16; continue; }
+        uint32_t end = off;
+        while (end < m->size && is_code(m, end >> 4)) end += 16;
+        end = std::min(end, m->size);
+        if (memcmp(ls + m->ls_base + off, m->image + off, end - off)) return false;
+        off = end;
+    }
     return true;
 }
 } // namespace

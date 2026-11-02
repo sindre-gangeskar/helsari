@@ -14,10 +14,12 @@
 // the current fiber, and restore resumes the fiber suspended in that buffer
 // or starts a new one at the buffer's entry point.
 #include "runtime.h"
+#include "idle_backoff.h"
 
 #include <windows.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <string>
 #include <map>
 #include <mutex>
@@ -129,6 +131,50 @@ extern "C" void f_0007203c(PPU_CTX) {
     if (next != cur) switch_to(ctx, next, cur);
     ctx->r[3] = cur;
     f_00071f24_guest(ctx);                    // our registers; lr = our caller
+}
+
+// pick(scheduler = r3) -> context buffer. Same logic as the guest code (0x72680):
+// five slots, tried round-robin after the current one (scheduler +12); a slot is
+// in use when its word at +3884 (slots are 4 bytes apart from scheduler[+8]) is
+// non-zero, and runnable when its wait pointer (+3864) is null or points to a
+// non-zero word. No slot in use: current = -1, return the idle context (+0xc80).
+// The guest loops without pause while slots exist but none is runnable - a
+// busy-wait for an SPU job or another thread to set a word, which kept a host
+// core spinning in the main thread. Here each fruitless pass backs off (pause,
+// yield, then 50 us sleeps). KZ2_PICK_SPIN=1: the original guest code.
+extern "C" void f_00072680_guest(PPU_CTX);
+extern "C" void f_00072680(PPU_CTX) {
+    static const bool spin = getenv("KZ2_PICK_SPIN") && atoi(getenv("KZ2_PICK_SPIN"));
+    if (spin) { f_00072680_guest(ctx); return; }
+    const uint32_t s = (uint32_t)ctx->r[3];
+    uint64_t t_wait = 0;   // set at the first fruitless pass: time waited goes to the flip log
+    struct Account { uint64_t &t; ~Account() { if (t) thread::add_wait("microthread wait", host_now_ns() - t); } } acc{t_wait};
+    for (uint32_t pass = 0;; pass++) {
+        bool any = false;
+        for (int32_t k = 0; k < 5; k++) {
+            int32_t i = ((int32_t)ld32(s + 12) + k + 1) % 5;
+            uint32_t slot = ld32(s + 8) + (uint32_t)i * 4;
+            if (!ld32(slot + 3884)) continue;
+            any = true;
+            uint32_t w = ld32(slot + 3864);
+            if (w) {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                uint32_t v = ld32(w);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (!v) continue;
+            }
+            st32(s + 12, (uint32_t)i);
+            ctx->r[3] = (uint32_t)(ld32(s + 8) + (uint32_t)i * 640);
+            return;
+        }
+        if (!any) {
+            st32(s + 12, 0xffffffffu);
+            ctx->r[3] = (uint32_t)(ld32(s + 8) + 0xc80);
+            return;
+        }
+        if (!t_wait) t_wait = host_now_ns();
+        host_backoff(pass < 1000 ? pass : 1000);
+    }
 }
 
 extern "C" void f_00071f24(PPU_CTX) {

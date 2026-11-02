@@ -94,6 +94,7 @@ uint32_t hle_make_opd(hle_fn fn);  /* OPD for a runtime function, callable by gu
 void ppu_invoke(PPUContext *ctx, uint32_t opd);
 
 /* ---- threads ---- */
+void gcm_tl(const char *fmt, ...);   /* frame timeline log around an F12 capture (hle_gcm.cpp) */
 namespace thread {
 PPUContext *create_context();
 uint32_t current_id();
@@ -105,6 +106,8 @@ uint32_t alloc_tls();
 void set_tls_params(uint32_t img, uint32_t filesz, uint32_t memsz);
 void run_main(uint32_t argv, uint32_t envp);
 void note_call(const char *name, PPUContext *ctx, bool entering);  /* watchdog bookkeeping */
+std::string call_report(const char *filter, double frames);         /* ms/frame per OS call (flip log) */
+void add_wait(const char *name, uint64_t ns);                       /* waits outside OS calls, for call_report */
 void dump_all();
 }
 
