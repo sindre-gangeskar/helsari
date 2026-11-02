@@ -969,6 +969,13 @@ ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     d.MaxLOD = mipmapped ? ((ctl0 >> 7) & 0xfff) / 256.f : 0.f;
     if (d.MaxLOD < d.MinLOD) d.MaxLOD = d.MinLOD;
     d.MipLODBias = (float)((int32_t)(filt << 19) >> 19) / 256.f;
+    // Anisotropic filtering: TEXTURE_CONTROL0 bits 4-6 = 1x 2x 4x 6x 8x 10x 12x 16x
+    // (mipmapped linear minification only). KZ2_NO_ANISO=1 disables.
+    static const uint8_t aniso_of[8] = {1, 2, 4, 6, 8, 10, 12, 16};
+    static const bool no_aniso = getenv("KZ2_NO_ANISO") && atoi(getenv("KZ2_NO_ANISO"));
+    uint32_t aniso = aniso_of[(ctl0 >> 4) & 7];
+    if (!no_aniso && !shadow && aniso > 1 && mipmapped && min_lin)
+        d.Filter = D3D11_FILTER_ANISOTROPIC, d.MaxAnisotropy = aniso;
     d.AddressU = wrap(addr & 0xf);
     d.AddressV = wrap((addr >> 8) & 0xf);
     d.AddressW = wrap((addr >> 16) & 0xf);
@@ -1444,6 +1451,23 @@ void draw() {
         if (!(reg(0x1a0c + t * 32) & 0x80000000) || !(sampled & (1 << t))) continue;
         TexDim d;
         srv[t] = get_texture(t, d);
+        // Capture: raw bytes (level 0) of each compressed 2D texture, to check the block
+        // layout offline (tex_<ea>_<fmt>_<w>x<h>.bin).
+        if ((int)g_frame == g_log_frame && d != TEX_CUBE) {
+            uint32_t fr = reg(0x1a04 + t * 32), base = (fr >> 8) & 0x9f, rect = reg(0x1a18 + t * 32);
+            uint32_t tea = ea_for((fr & 3) == 2, reg(0x1a00 + t * 32));
+            static std::set<uint32_t> raw_done;
+            static uint32_t raw_frame;
+            if (raw_frame != g_frame) raw_done.clear(), raw_frame = g_frame;
+            if (base >= 0x86 && base <= 0x88 && raw_done.insert(tea).second) {
+                char path[80];
+                snprintf(path, sizeof path, "tex_%08x_%02x_%ux%u.bin", tea, base, rect >> 16, rect & 0xffff);
+                if (FILE *fp = fopen(path, "wb")) {
+                    fwrite(mem::ptr(tea), 1, image_size(base, rect >> 16, rect & 0xffff, 0), fp);
+                    fclose(fp);
+                }
+            }
+        }
         if (d == TEX_CUBE) {
             if ((int)g_frame == g_log_frame && srv[t]) dump_cube(srv[t], ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32)));
             if (g_no_cube) srv[t] = black_cube();
@@ -1604,9 +1628,9 @@ void draw() {
             if (reg(0x1a0c + t * 32) & 0x80000000) {
                 uint32_t tea = ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32));
                 auto rt = g_surfaces.find(tea);
-                LOG("draw", "   tex%d ea=%x fmt=%08x rect=%08x pitch=%x filter=%08x addr=%08x remap=%04x %s", t, tea,
+                LOG("draw", "   tex%d ea=%x fmt=%08x rect=%08x pitch=%x filter=%08x addr=%08x remap=%04x ctl0=%08x %s", t, tea,
                     reg(0x1a04 + t * 32), reg(0x1a18 + t * 32), reg(0x1840 + t * 4) & 0xfffff, reg(0x1a14 + t * 32),
-                    reg(0x1a08 + t * 32), reg(0x1a10 + t * 32) & 0xffff,
+                    reg(0x1a08 + t * 32), reg(0x1a10 + t * 32) & 0xffff, reg(0x1a0c + t * 32),
                     rt != g_surfaces.end() ? ("(render target fmt " + std::to_string(rt->second.fmt) + " " +
                                               std::to_string(rt->second.w) + "x" + std::to_string(rt->second.h) + ")").c_str()
                                            : "");
@@ -2107,7 +2131,8 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         // writes hundreds of MB) and translated shaders, so only this frame's remain.
         std::error_code ec;
         for (auto &e : std::filesystem::directory_iterator(".", ec))
-            if (e.path().extension() == ".bmp") std::filesystem::remove(e.path(), ec);
+            if (e.path().extension() == ".bmp" || (e.path().extension() == ".bin" && e.path().filename().string().rfind("tex_", 0) == 0))
+                std::filesystem::remove(e.path(), ec);
         for (auto &e : std::filesystem::directory_iterator("shaders", ec))
             if (e.path().filename().string().rfind("cap_", 0) == 0) std::filesystem::remove(e.path(), ec);
         for (auto &[k, v] : g_ps) v.dumped = false;
