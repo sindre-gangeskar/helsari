@@ -7,6 +7,7 @@
 #include "runtime.h"
 
 #include <cfloat>
+#include <smmintrin.h>
 #include <cmath>
 #include <cstdlib>
 
@@ -260,6 +261,34 @@ inline float ftz(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::cop
 inline float spf(float f) { return std::isfinite(f) ? ftz(f) : std::copysign(FLT_MAX, f); }
 inline float spr(float f) { return std::isfinite(f) ? ftz(f) : std::isnan(f) ? 0.0f : std::copysign(FLT_MAX, f); }
 
+// The same rules on four lanes at once, branch-free (SSE4.1): bit-identical to spf/spr
+// applied per element - the arithmetic between them is the same IEEE single precision.
+inline __m128 vf(const V &v) { return _mm_loadu_ps((const float *)v.w); }
+inline V fv(__m128 x) { V r; _mm_storeu_ps((float *)r.w, x); return r; }
+inline __m128 v_ftz(__m128 x) {
+    __m128i b = _mm_castps_si128(x), e = _mm_and_si128(b, _mm_set1_epi32(0x7f800000));
+    __m128i den = _mm_cmpeq_epi32(e, _mm_setzero_si128());
+    return _mm_castsi128_ps(_mm_blendv_epi8(b, _mm_and_si128(b, _mm_set1_epi32((int)0x80000000)), den));
+}
+inline __m128 v_spf(__m128 x) {
+    __m128i b = _mm_castps_si128(x), e = _mm_and_si128(b, _mm_set1_epi32(0x7f800000));
+    __m128i sign = _mm_and_si128(b, _mm_set1_epi32((int)0x80000000));
+    __m128i den = _mm_cmpeq_epi32(e, _mm_setzero_si128()), big = _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7f800000));
+    b = _mm_blendv_epi8(b, sign, den);
+    b = _mm_blendv_epi8(b, _mm_or_si128(sign, _mm_set1_epi32(0x7f7fffff)), big);
+    return _mm_castsi128_ps(b);
+}
+inline __m128 v_spr(__m128 x) {
+    __m128i b = _mm_castps_si128(x), e = _mm_and_si128(b, _mm_set1_epi32(0x7f800000));
+    __m128i sign = _mm_and_si128(b, _mm_set1_epi32((int)0x80000000));
+    __m128i den = _mm_cmpeq_epi32(e, _mm_setzero_si128()), big = _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7f800000));
+    __m128i nan = _mm_andnot_si128(_mm_cmpeq_epi32(_mm_and_si128(b, _mm_set1_epi32(0x007fffff)), _mm_setzero_si128()), big);
+    b = _mm_blendv_epi8(b, sign, den);
+    b = _mm_blendv_epi8(b, _mm_or_si128(sign, _mm_set1_epi32(0x7f7fffff)), big);
+    b = _mm_andnot_si128(nan, b);   // NaN -> +0
+    return _mm_castsi128_ps(b);
+}
+
 inline V splat(uint32_t v) { return V{{v, v, v, v}}; }
 
 // 128-bit helpers on the big-endian register image.
@@ -290,9 +319,33 @@ inline V rot_bits(const V &a, int s) {   // s in 0..7
     for (int i = 0; i < 4; i++) r.w[i] = (a.w[i] << s) | (a.w[(i + 1) & 3] >> (32 - s));
     return r;
 }
-inline V rot_bytes(const V &a, int n) { uint8_t s[16], d[16]; to_bytes(a, s); for (int i = 0; i < 16; i++) d[i] = s[(i + n) & 15]; return from_bytes(d); }
-inline V shl_bytes(const V &a, int n) { uint8_t s[16], d[16]; to_bytes(a, s); for (int i = 0; i < 16; i++) d[i] = i + n < 16 ? s[i + n] : 0; return from_bytes(d); }
-inline V shr_bytes(const V &a, int n) { uint8_t s[16], d[16]; to_bytes(a, s); for (int i = 0; i < 16; i++) d[i] = i - n >= 0 ? s[i - n] : 0; return from_bytes(d); }
+// Big-endian byte images of registers in SSE registers (byte i = register byte i),
+// for whole-register byte permutes with pshufb.
+inline __m128i be_bytes(const V &v) {
+    return _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)v.w), _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+}
+inline V from_be(__m128i b) {
+    V r;
+    _mm_storeu_si128((__m128i *)r.w, _mm_shuffle_epi8(b, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)));
+    return r;
+}
+inline __m128i iota8() { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
+// d[i] = s[(i + n) & 15]
+inline V rot_bytes(const V &a, int n) {
+    return from_be(_mm_shuffle_epi8(be_bytes(a), _mm_and_si128(_mm_add_epi8(iota8(), _mm_set1_epi8((char)n)), _mm_set1_epi8(15))));
+}
+// d[i] = i + n < 16 ? s[i + n] : 0   (n in 0..31; pshufb zeroes lanes whose index has bit 7 set)
+inline V shl_bytes(const V &a, int n) {
+    __m128i idx = _mm_add_epi8(iota8(), _mm_set1_epi8((char)n));
+    idx = _mm_or_si128(idx, _mm_cmpgt_epi8(idx, _mm_set1_epi8(15)));
+    return from_be(_mm_shuffle_epi8(be_bytes(a), idx));
+}
+// d[i] = i - n >= 0 ? s[i - n] : 0   (n in 0..31)
+inline V shr_bytes(const V &a, int n) {
+    __m128i idx = _mm_sub_epi8(iota8(), _mm_set1_epi8((char)n));
+    idx = _mm_or_si128(idx, _mm_cmplt_epi8(idx, _mm_setzero_si128()));
+    return from_be(_mm_shuffle_epi8(be_bytes(a), idx));
+}
 
 // cbd/chd/cwd/cdd: a shufb control that inserts a preferred-slot element of
 // `size` bytes at offset t (byte: 03, half: 02 03, word: 00..03, dword: 00..07)
@@ -447,11 +500,17 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
         break;
     }
     case SHUFB: {
-        uint8_t ab[32], c[16], o[16];
-        to_bytes(va, ab), to_bytes(vb, ab + 16), to_bytes(gpr[rt], c);
-        for (int i = 0; i < 16; i++)
-            o[i] = c[i] >= 0xe0 ? 0x80 : c[i] >= 0xc0 ? 0xff : c[i] >= 0x80 ? 0x00 : ab[c[i] & 0x1f];
-        gpr[(x >> 21) & 0x7f] = from_bytes(o);
+        // Selector byte c: 0x00-0x1f picks byte c of a:b, 10xxxxxx gives 0x00, 110xxxxx 0xff,
+        // 111xxxxx 0x80. Two pshufb lookups (a, b) blended on bit 4, then the constants.
+        __m128i A = be_bytes(va), B = be_bytes(vb), C = be_bytes(gpr[rt]);
+        __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0f));
+        __m128i bit4 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
+        __m128i sel = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), bit4);
+        __m128i hi = _mm_cmplt_epi8(C, _mm_setzero_si128());   // c >= 0x80
+        __m128i c0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xc0)), _mm_set1_epi8((char)0xc0));
+        __m128i e0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xe0)), _mm_set1_epi8((char)0xe0));
+        __m128i k = _mm_blendv_epi8(_mm_and_si128(c0, _mm_set1_epi8((char)0xff)), _mm_set1_epi8((char)0x80), e0);
+        gpr[(x >> 21) & 0x7f] = from_be(_mm_blendv_epi8(sel, k, hi));
         break;
     }
 
@@ -541,23 +600,53 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
     case HBR: case HBRA: case HBRR: case NOP: case LNOP: case SYNC: case DSYNC: break;
 
     /* ---------- single precision ---------- */
-    case FA: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) + spf(vb.f(i)))); gpr[rt] = r; break;
-    case FS: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) - spf(vb.f(i)))); gpr[rt] = r; break;
-    case FM: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) * spf(vb.f(i)))); gpr[rt] = r; break;
-    case FMA: { const V &C = gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) + spf(C.f(i)))); gpr[(x >> 21) & 0x7f] = r; break; }
-    case FMS: { const V &C = gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) - spf(C.f(i)))); gpr[(x >> 21) & 0x7f] = r; break; }
-    case FNMS: { const V &C = gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(C.f(i)) - spr(spf(va.f(i)) * spf(vb.f(i))))); gpr[(x >> 21) & 0x7f] = r; break; }
+    case FA: gpr[rt] = fv(v_spr(_mm_add_ps(v_spf(vf(va)), v_spf(vf(vb))))); break;
+    case FS: gpr[rt] = fv(v_spr(_mm_sub_ps(v_spf(vf(va)), v_spf(vf(vb))))); break;
+    case FM: gpr[rt] = fv(v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb))))); break;
+    case FMA: gpr[(x >> 21) & 0x7f] = fv(v_spr(_mm_add_ps(v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb)))), v_spf(vf(gpr[rt]))))); break;
+    case FMS: gpr[(x >> 21) & 0x7f] = fv(v_spr(_mm_sub_ps(v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb)))), v_spf(vf(gpr[rt]))))); break;
+    case FNMS: gpr[(x >> 21) & 0x7f] = fv(v_spr(_mm_sub_ps(v_spf(vf(gpr[rt])), v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb))))))); break;
     // frest/frsqest return the exact value; fi then passes it through.
-    case FREST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / spf(va.f(i)))); gpr[rt] = r; break;
-    case FRSQEST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / std::sqrt(std::fabs(spf(va.f(i)))))); gpr[rt] = r; break;
+    case FREST: gpr[rt] = fv(v_spr(_mm_div_ps(_mm_set1_ps(1.0f), v_spf(vf(va))))); break;
+    case FRSQEST: gpr[rt] = fv(v_spr(_mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(_mm_andnot_ps(_mm_set1_ps(-0.0f), v_spf(vf(va))))))); break;
     case FI: gpr[rt] = vb; break;
-    case FCEQ: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) == ftz(vb.f(i)) ? ~0u : 0; gpr[rt] = r; break;
+    case FCEQ: gpr[rt] = fv(_mm_cmpeq_ps(v_ftz(vf(va)), v_ftz(vf(vb)))); break;
     case FCMEQ: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) == std::fabs(ftz(vb.f(i))) ? ~0u : 0; gpr[rt] = r; break;
-    case FCGT: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) > ftz(vb.f(i)) ? ~0u : 0; gpr[rt] = r; break;
+    case FCGT: gpr[rt] = fv(_mm_cmpgt_ps(v_ftz(vf(va)), v_ftz(vf(vb)))); break;
     case FCMGT: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) > std::fabs(ftz(vb.f(i))) ? ~0u : 0; gpr[rt] = r; break;
-    case CSFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)(int32_t)va.w[i] * pow2(-sc))); gpr[rt] = r; break; }
+    case CSFLT: {
+        int sc = 155 - (int)((x >> 14) & 0xff);
+        // int -> float rounds once; scaling by 2^-sc is then exact unless the result leaves
+        // the normal range (|sc| small enough here) - the same single rounding as via double.
+        if (sc >= 0 && sc <= 96) {
+            gpr[rt] = fv(_mm_mul_ps(_mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)va.w)), _mm_set1_ps((float)pow2(-sc))));
+            break;
+        }
+        for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)(int32_t)va.w[i] * pow2(-sc)));
+        gpr[rt] = r;
+        break;
+    }
     case CUFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)va.w[i] * pow2(-sc))); gpr[rt] = r; break; }
-    case CFLTS: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)sat_s32((double)va.f(i) * pow2(sc)); gpr[rt] = r; break; }
+    case CFLTS: {
+        int sc = 173 - (int)((x >> 14) & 0xff);
+        // f * 2^sc in float is exact unless it overflows (saturates anyway) or underflows
+        // (truncates to 0 anyway); then truncate with saturation: NaN -> 0, out of range -> min/max.
+        if (sc >= 0 && sc <= 64) {
+            __m128 f = _mm_mul_ps(vf(va), _mm_set1_ps((float)pow2(sc)));
+            __m128i t = _mm_cvttps_epi32(f);   // 0x80000000 when out of range or NaN
+            __m128i pos = _mm_castps_si128(_mm_cmpge_ps(f, _mm_set1_ps(2147483648.0f)));
+            __m128i nan = _mm_castps_si128(_mm_cmpunord_ps(f, f));
+            t = _mm_blendv_epi8(t, _mm_set1_epi32(0x7fffffff), pos);
+            t = _mm_andnot_si128(nan, t);
+            V o;
+            _mm_storeu_si128((__m128i *)o.w, t);
+            gpr[rt] = o;
+            break;
+        }
+        for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)sat_s32((double)va.f(i) * pow2(sc));
+        gpr[rt] = r;
+        break;
+    }
     case CFLTU: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = sat_u32((double)va.f(i) * pow2(sc)); gpr[rt] = r; break; }
     case FSCRRD: gpr[rt] = V{}; break;
     case FSCRWR: break;
