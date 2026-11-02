@@ -55,5 +55,6 @@ void flip(uint32_t display_offset, uint32_t width, uint32_t height, uint32_t pit
 void copy_m2mf();   // NV0039 memory-to-memory copy
 void method(uint32_t m, uint32_t arg);  // state tracking for everything
 std::string stats_line(uint32_t frames);   // backend costs since the last call, for the fps log
+bool capturing();        // an F12 capture is pending or in progress (for other logs to follow it)
 void request_capture();  // F12: log the next frame's draws and dump its render targets
 } // namespace rsx

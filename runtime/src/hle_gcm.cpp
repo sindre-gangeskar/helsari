@@ -174,9 +174,14 @@ void method(uint32_t m, uint32_t arg) {
         if (spin == 2000)
             LOG("rsx", "semaphore acquire timed out: label 0x%x = 0x%x, want 0x%x (fifo get 0x%x)",
                 g_rsx.semaphore_offset, ld32(a), arg, ld32(CTRL_ADDR + 4));
+        if (rsx::capturing())
+            LOG("sync", "RSX acquire label 0x%x == 0x%x: waited %d ms", g_rsx.semaphore_offset, arg, spin);
         break;
     }
-    case 0x006c: st32(LABEL_ADDR + g_rsx.semaphore_offset, arg); break; // NV406E_SEMAPHORE_RELEASE
+    case 0x006c:                                                        // NV406E_SEMAPHORE_RELEASE
+        if (rsx::capturing()) LOG("sync", "RSX release label 0x%x = 0x%x", g_rsx.semaphore_offset, arg);
+        st32(LABEL_ADDR + g_rsx.semaphore_offset, arg);
+        break;
     case 0x1d6c: g_rsx.be_semaphore_offset = arg; break;
     case 0x1d70:                                                        // BACK_END_WRITE_SEMAPHORE_RELEASE
         st32(LABEL_ADDR + g_rsx.be_semaphore_offset, (arg & 0xff00ff00) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff));
@@ -393,7 +398,12 @@ HLE(cellGcmGetOffsetTable) {
     RET(0);
 }
 HLE(cellGcmGetControlRegister) { RET(CTRL_ADDR); }
-HLE(cellGcmGetLabelAddress) { RET(LABEL_ADDR + 16 * ARG32(0)); }
+HLE(cellGcmGetLabelAddress) {
+    static std::atomic<int> logs{0};
+    if (logs++ < 64) LOG("gcm", "cellGcmGetLabelAddress(%u) -> 0x%x, caller lr 0x%llx", ARG32(0), LABEL_ADDR + 16 * ARG32(0),
+                         (unsigned long long)ld64(ctx->r[1] + 32));   // the import stub saved its caller's lr
+    RET(LABEL_ADDR + 16 * ARG32(0));
+}
 HLE(cellGcmSetDisplayBuffer) {
     uint32_t id = ARG32(0);
     if (id < 8) g_disp[id] = {ARG32(1), ARG32(2), ARG32(3), ARG32(4)};

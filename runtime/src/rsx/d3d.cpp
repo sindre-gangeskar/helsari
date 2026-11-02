@@ -63,6 +63,10 @@ std::vector<Range> g_ranges;
 bool g_indexed;
 uint32_t g_frame;
 int g_draws_this_frame;
+// Scene draws per frame (draws into 4 colour targets at once: the G-buffer pass),
+// min / sum / max over the fps log interval: the visible set should be stable.
+int g_scene_draws, g_scene_min = 1 << 30, g_scene_max, g_scene_frames;
+uint64_t g_scene_sum;
 // Multisampled surfaces: the RSX stores the samples of a pixel side by side
 // (2x: 2 across; 4x: 2x2), so a 1280x720 2x target occupies 2560x720 and
 // later passes read it that way. We render such surfaces supersampled at
@@ -1052,6 +1056,7 @@ void draw() {
     for (int k : skip) if (k == g_draws_this_frame) return;
     Bound b = bind_surfaces();
     if (!b.w) { g_skip[1]++; return; }
+    if (b.color[0] && b.color[1] && b.color[2] && b.color[3]) g_scene_draws++;
 
     // vertices + indices
     std::vector<uint32_t> src_idx;
@@ -1250,6 +1255,19 @@ void draw() {
                     rt != g_surfaces.end() ? ("(render target fmt " + std::to_string(rt->second.fmt) + " " +
                                               std::to_string(rt->second.w) + "x" + std::to_string(rt->second.h) + ")").c_str()
                                            : "");
+                // Tiny textures (per-object data the SPUs write each frame, e.g. lighting
+                // probes): log their raw words, and whether they are all zero.
+                uint32_t tw = reg(0x1a18 + t * 32) >> 16, th = reg(0x1a18 + t * 32) & 0xffff;
+                if (tw * th <= 256 && tw && th) {
+                    std::string words;
+                    bool zero = true;
+                    for (uint32_t k = 0; k < tw * th; k++) {
+                        uint32_t v = ld32(tea + 4 * k);
+                        zero &= v == 0;
+                        if (k < 16) { char s[12]; snprintf(s, sizeof s, " %08x", v); words += s; }
+                    }
+                    LOG("draw", "     tex%d data (%ux%u, %s):%s", t, tw, th, zero ? "ALL ZERO" : "non-zero", words.c_str());
+                }
             }
         // Vertex shader and the first vertices' attributes: every full-screen pass, or KZ2_LOG_ATTRS=<draw>.
         static int attr_draw = getenv("KZ2_LOG_ATTRS") ? atoi(getenv("KZ2_LOG_ATTRS")) : -1;
@@ -1496,6 +1514,9 @@ void dump_surfaces() {
 }
 
 void request_capture() { g_capture_req = true; }
+bool capturing() {
+    return g_capture_req || (g_log_frame >= 0 && (int)g_frame >= g_log_frame && (int)g_frame <= g_dump_frame);
+}
 
 // Copy colour surfaces rendered since the last sync point back to guest
 // memory in RSX layout. Called when the RSX signals progress (labels,
@@ -1547,7 +1568,12 @@ std::string stats_line(uint32_t frames) {
              "%.0f, no shader %.0f",
              g_skip[0] / f, g_skip[1] / f, g_skip[2] / f, g_skip[3] / f, g_skip[4] / f, g_skip[5] / f);
     memset(g_skip, 0, sizeof g_skip);
-    return std::string(b) + sk;
+    char sc[120] = "";
+    if (g_scene_frames)
+        snprintf(sc, sizeof sc, "; scene draws per frame min %d avg %.0f max %d", g_scene_min,
+                 (double)g_scene_sum / g_scene_frames, g_scene_max);
+    g_scene_min = 1 << 30, g_scene_max = 0, g_scene_sum = 0, g_scene_frames = 0;
+    return std::string(b) + sk + sc;
 }
 
 // Debug: KZ2_SCREENSHOT=<sec> writes the presented frame, half size, to
@@ -1639,6 +1665,11 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     }
     if (getenv("KZ2_TRACE_DRAWS") && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
     g_draws_this_frame = 0;
+    if (g_scene_draws) {
+        g_scene_min = std::min(g_scene_min, g_scene_draws), g_scene_max = std::max(g_scene_max, g_scene_draws);
+        g_scene_sum += g_scene_draws, g_scene_frames++;
+    }
+    g_scene_draws = 0;
     // Streamed textures come and go at new addresses: once a second, release
     // those unused for 10 s (time, not frames: at low frame rates 600 frames is minutes).
     static const auto t_start = std::chrono::steady_clock::now();

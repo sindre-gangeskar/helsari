@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+namespace rsx { bool capturing(); }   // d3d.cpp
+
 namespace spu {
 namespace {
 
@@ -36,8 +38,13 @@ const std::vector<WatchRange> &watch_ranges() {
 }
 void watch(const SpuThread &t, const char *what, uint32_t cmd, uint32_t ea, uint32_t lsa, uint32_t size) {
     static std::atomic<int> logs{0};
+    // KZ2_SPU_WATCH_CAPTURE=1: log only around an F12 capture, so the log budget
+    // is not spent during loading.
+    static const bool only_capture = getenv("KZ2_SPU_WATCH_CAPTURE") != nullptr;
+    if (only_capture && !rsx::capturing()) return;
+    const int limit = only_capture ? 300000 : 20000;
     for (auto &w : watch_ranges())
-        if (ea < w.ea + w.len && w.ea < ea + size && logs++ < 20000)
+        if (ea < w.ea + w.len && w.ea < ea + size && logs++ < limit)
             LOG("spu", "watch: %s %s cmd 0x%x ea 0x%x size 0x%x lsa 0x%x pc 0x%x", t.name.c_str(), what, cmd, ea, size, lsa,
                 t.pc);
 }
