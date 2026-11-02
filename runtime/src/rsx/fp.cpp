@@ -6,6 +6,7 @@
 #include "rsx.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <set>
 
 namespace rsx {
@@ -110,6 +111,10 @@ FpInfo translate_fp(const FpKey &key) {
             used_tex[tex] = true;
             uint8_t dim = key.texdim[tex] & TEX_DIM_MASK;
             std::string cs = dim == TEX_2D ? "(" + coord + ").xy" : "(" + coord + ").xyz";
+            // Experiment (KZ2_CUBE_FLIP=1): read every cube face rotated 180 degrees (both
+            // face axes flipped) = negate the direction's two minor components.
+            static const bool cube_flip = getenv("KZ2_CUBE_FLIP") && atoi(getenv("KZ2_CUBE_FLIP"));
+            if (dim == TEX_CUBE && cube_flip) cs = "cubeflip(" + cs + ")";
             if (key.texdim[tex] & TEX_UNNORM) cs = "(" + cs + " * texscale[" + std::to_string(tex) + "].xy)";
             // Shadow lookup: compare z against the stored depth, filtered (PCF); every component is the result.
             if ((key.texdim[tex] & TEX_SHADOW) && dim == TEX_2D)
@@ -143,8 +148,8 @@ FpInfo translate_fp(const FpKey &key) {
         case 0x10: e = "frac(" + s0 + ")"; break;
         case 0x11: e = "floor(" + s0 + ")"; break;
         case 0x12: e = "KIL"; break;
-        case 0x13: e = "pk4(" + s0 + ")"; break;
-        case 0x14: e = "up4(" + s0 + ")"; break;
+        case 0x13: e = "pk4s(" + s0 + ")"; break;  // PK4: four signed normalised bytes
+        case 0x14: e = "up4s(" + s0 + ")"; break;
         case 0x15: e = "ddx(" + s0 + ")"; break;
         case 0x16: e = "ddy(" + s0 + ")"; break;
         case 0x17: e = sample(s0); break;
@@ -165,8 +170,8 @@ FpInfo translate_fp(const FpKey &key) {
         case 0x26: e = "pow(abs((" + s0 + ").xxxx), (" + s1 + ").xxxx)"; break;
         case 0x27: e = "pk4(" + s0 + ")"; break;   // PKB ~ unsigned bytes
         case 0x28: e = "up4(" + s0 + ")"; break;
-        case 0x29: e = "pk2(" + s0 + ")"; break;   // PK16
-        case 0x2a: e = "up2(" + s0 + ")"; break;
+        case 0x29: e = "pk16(" + s0 + ")"; break;  // PK16: two signed normalised 16-bit values (not halves)
+        case 0x2a: e = "up16(" + s0 + ")"; break;
         case 0x2c: e = "pk4(" + s0 + ")"; break;   // PKG
         case 0x2d: e = "up4(" + s0 + ")"; break;
         case 0x2e: e = "(dot((" + s0 + ").xy, (" + s1 + ").xy) + (" + s2 + ").x).xxxx"; break;
@@ -243,12 +248,21 @@ FpInfo translate_fp(const FpKey &key) {
     }
     h += "cbuffer PX : register(b0) { float4 alpha_ref; float4 wpos_info; float4 texscale[16]; float4 fc[128]; };\n"
          "float4 pk4(float4 v) { uint4 b = (uint4)round(saturate(v) * 255); return asfloat((b.x | b.y << 8 | b.z << 16 | b.w << 24)).xxxx; }\n"
+         "float4 pk4s(float4 v) { int4 b = (int4)round(clamp(v, -1, 1) * 127); "
+         "return asfloat((uint)(b.x & 255) | (uint)(b.y & 255) << 8 | (uint)(b.z & 255) << 16 | (uint)(b.w & 255) << 24).xxxx; }\n"
+         "float4 up4s(float4 v) { int u = asint(v.x); "
+         "return clamp(float4((u << 24) >> 24, (u << 16) >> 24, (u << 8) >> 24, u >> 24) / 127.0, -1, 1); }\n"
+         "float4 pk16(float4 v) { int2 b = (int2)round(clamp(v.xy, -1, 1) * 32767); "
+         "return asfloat((uint)(b.x & 0xffff) | (uint)(b.y & 0xffff) << 16).xxxx; }\n"
+         "float4 up16(float4 v) { int u = asint(v.x); return float4(clamp(float2((u << 16) >> 16, u >> 16) / 32767.0, -1, 1), 0, 0); }\n"
          "float4 up4(float4 v) { uint u = asuint(v.x); return float4(u & 255, (u >> 8) & 255, (u >> 16) & 255, u >> 24) / 255.0; }\n"
          "float4 pk2(float4 v) { return asfloat(f32tof16(v.x) | (f32tof16(v.y) << 16)).xxxx; }\n"
          "float4 up2(float4 v) { uint u = asuint(v.x); return float4(f16tof32(u & 0xffff), f16tof32(u >> 16), 0, 0); }\n"
          // m.x: 2-bit sources (0 A, 1 R, 2 G, 3 B) for outputs A, R, G, B; m.y: their types (0 zero, 1 one, 2 source)
          "float rmc(float4 t, uint2 m, uint i) { uint s = (m.x >> (2 * i)) & 3, k = (m.y >> (2 * i)) & 3;\n"
          "  return k == 2 ? (s == 0 ? t.a : s == 1 ? t.r : s == 2 ? t.g : t.b) : k == 1 ? 1 : 0; }\n"
+         "float3 cubeflip(float3 d) { float3 a = abs(d), r = -d; if (a.x >= a.y && a.x >= a.z) r.x = d.x; "
+         "else if (a.y >= a.z) r.y = d.y; else r.z = d.z; return r; }\n"
          "float4 remap(float4 t, uint4 m) { return float4(rmc(t, m.xy, 1), rmc(t, m.xy, 2), rmc(t, m.xy, 3), rmc(t, m.xy, 0)); }\n"
          "struct PIn { float4 pos : SV_Position;\n";
     for (int k = 1; k < 16; k++) h += "  float4 o" + std::to_string(k) + " : TEXCOORD" + std::to_string(k) + ";\n";

@@ -1047,6 +1047,71 @@ void dump_surface(Surface &s, const char *name) {
     st->Release();
 }
 
+// Capture: write any 2D texture view to a BMP as the shaders see it (first slice,
+// first mip). 8-bit colour as is; float formats clamped to [0,1]; depth as grey.
+int g_pass_dumps;
+void dump_srv(ID3D11ShaderResourceView *v, const char *path) {
+    if (!v) return;
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+    v->GetDesc(&vd);
+    ID3D11Resource *res = nullptr;
+    v->GetResource(&res);
+    ID3D11Texture2D *tex = nullptr;
+    if (!res || FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) { release(res); return; }
+    res->Release();
+    D3D11_TEXTURE2D_DESC d;
+    tex->GetDesc(&d);
+    DXGI_FORMAT f = vd.Format;
+    int bpp = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ? 4
+            : f == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : f == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16
+            : f == DXGI_FORMAT_R16_UNORM ? 2 : f == DXGI_FORMAT_R16G16_FLOAT ? 4 : 0;
+    if (!bpp || d.SampleDesc.Count != 1) { tex->Release(); return; }
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.MipLevels = 1, sd.ArraySize = 1, sd.Usage = D3D11_USAGE_STAGING, sd.BindFlags = 0, sd.MiscFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D *st = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &st))) { tex->Release(); return; }
+    g_ctx->CopySubresourceRegion(st, 0, 0, 0, 0, tex, 0, nullptr);
+    tex->Release();
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) { st->Release(); return; }
+    if (FILE *fp = fopen(path, "wb")) {
+        uint32_t sz = d.Width * d.Height * 4;
+        uint8_t hdr[54] = {'B', 'M'};
+        *(uint32_t *)&hdr[2] = 54 + sz, *(uint32_t *)&hdr[10] = 54, *(uint32_t *)&hdr[14] = 40;
+        *(int32_t *)&hdr[18] = d.Width, *(int32_t *)&hdr[22] = -(int32_t)d.Height;
+        *(uint16_t *)&hdr[26] = 1, *(uint16_t *)&hdr[28] = 32;
+        fwrite(hdr, 1, 54, fp);
+        std::vector<uint8_t> row(d.Width * 4);
+        auto u8 = [](float x) { return (uint8_t)(std::clamp(x, 0.f, 1.f) * 255.f + .5f); };
+        for (UINT y = 0; y < d.Height; y++) {
+            const uint8_t *p = (const uint8_t *)m.pData + y * m.RowPitch + 0;
+            for (UINT x = 0; x < d.Width; x++) {
+                const uint8_t *q = p + x * bpp;
+                uint8_t c[3] = {};
+                if (f == DXGI_FORMAT_R8G8B8A8_UNORM) c[0] = q[0], c[1] = q[1], c[2] = q[2];
+                else if (f == DXGI_FORMAT_B8G8R8A8_UNORM) c[0] = q[2], c[1] = q[1], c[2] = q[0];
+                else if (f == DXGI_FORMAT_R24_UNORM_X8_TYPELESS) {
+                    uint32_t w; memcpy(&w, q, 4); float z = (w & 0xffffff) / 16777215.f;
+                    c[0] = c[1] = c[2] = u8(1 - (1 - z) * 50);    // stretched: depth bunches near 1
+                } else if (f == DXGI_FORMAT_R16_UNORM) {
+                    uint16_t w; memcpy(&w, q, 2); c[0] = c[1] = c[2] = u8(w / 65535.f);
+                } else if (f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R16G16_FLOAT) {
+                    int n = f == DXGI_FORMAT_R16G16_FLOAT ? 2 : 3;
+                    for (int k = 0; k < n; k++) { uint16_t hv; memcpy(&hv, q + 2 * k, 2); c[k] = u8(std::fabs(h2f(hv))); }
+                } else {
+                    for (int k = 0; k < 3; k++) { float fv; memcpy(&fv, q + 4 * k, 4); c[k] = u8(std::fabs(fv)); }
+                }
+                row[x * 4] = c[2], row[x * 4 + 1] = c[1], row[x * 4 + 2] = c[0], row[x * 4 + 3] = 255;
+            }
+            fwrite(row.data(), 1, row.size(), fp);
+        }
+        fclose(fp);
+    }
+    g_ctx->Unmap(st, 0);
+    st->Release();
+}
+
 void draw() {
     if (!g_ok) return;
     if (g_ranges.empty()) { g_skip[0]++; return; }
@@ -1318,7 +1383,25 @@ void draw() {
     g_ctx->PSSetSamplers(0, 16, smp);
     g_ctx->IASetIndexBuffer(g_iring.buf, DXGI_FORMAT_R32_UINT, 0);
     g_ctx->IASetPrimitiveTopology(topo);
+    // Capture: full-screen passes (lighting, downsampling, post-processing) save every
+    // input texture exactly as the shader receives it, and their outputs after the draw.
+    const bool pass_dump = (int)g_frame == g_log_frame && list.size() <= 6 && g_pass_dumps < 400;
+    if (pass_dump)
+        for (int t = 0; t < 16; t++)
+            if (srv[t]) {
+                char path[96];
+                uint32_t tea = ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32));
+                snprintf(path, sizeof path, "pass_%04d_in%02d_%08x.bmp", g_draws_this_frame, t, tea);
+                dump_srv(srv[t], path), g_pass_dumps++;
+            }
     if (leak_mode() != 1) g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
+    if (pass_dump)
+        for (int k = 0; k < 4; k++)
+            if (b.color[k]) {
+                char path[96];
+                snprintf(path, sizeof path, "pass_%04d_out%d_%08x.bmp", g_draws_this_frame, k, b.color[k]->ea);
+                dump_srv(b.color[k]->srv, path), g_pass_dumps++;
+            }
     // Only what the RSX would write is dirty: a zeta buffer stays bound while depth
     // and stencil are off, and depth-only passes mask colour writes.
     if (reg(0x0324)) for (auto *c : b.color) if (c) c->dirty = true;
@@ -1668,7 +1751,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     g_frame++;
     if ((int)g_frame == g_dump_frame) dump_surfaces();
     if (g_capture_req.exchange(false)) {
-        g_log_frame = (int)g_frame, g_dump_frame = (int)g_frame + 1, g_step_dumps = 0;
+        g_log_frame = (int)g_frame, g_dump_frame = (int)g_frame + 1, g_step_dumps = 0, g_pass_dumps = 0;
         LOG("rsx", "capture: logging draws of frame %u, dumping its surfaces at the end", g_frame);
     }
     if (getenv("KZ2_TRACE_DRAWS") && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
@@ -1823,6 +1906,23 @@ void method(uint32_t m, uint32_t arg) {
         break;
     }
     case 0x1d94: clear(arg); break;
+    case 0x1800: {   // GET_REPORT: arg = type << 24 | offset; writes {u64 timer, u32 value, u32 0}
+        // Occlusion queries (type 1, ZPASS_PIXEL_CNT) are answered "visible" for now
+        // (KZ2_REPORT_ZERO=1 answers 0 instead): unanswered, the game culled objects and
+        // lights from whatever stale memory held. Report area: RSX local memory
+        // + 0x0e000000 (context 0x66626660) or io-mapped main memory.
+        uint32_t type = arg >> 24, off = arg & 0xffffff, ctx = reg(0x01a8);
+        uint32_t ea = ctx == 0x66626660 ? mem::LOCAL_BASE + 0x0e000000 + off : io_ea(off);
+        static int logs;
+        if (logs++ < 24) LOG("rsx", "GET_REPORT type %u offset 0x%x (dma ctx 0x%08x) -> ea 0x%x", type, off, ctx, ea);
+        if (!ea) break;
+        static const bool zero = getenv("KZ2_REPORT_ZERO") != nullptr;
+        uint32_t value = type == 1 ? (zero ? 0 : 0x100000) : 0;
+        uint64_t t = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count();
+        st32(ea, (uint32_t)(t >> 32)), st32(ea + 4, (uint32_t)t), st32(ea + 8, value), st32(ea + 12, 0);
+        break;
+    }
     case 0x2328: copy_m2mf(); break;
     default:
         if (m >= 0x4000 && m != 0xfeac) {
