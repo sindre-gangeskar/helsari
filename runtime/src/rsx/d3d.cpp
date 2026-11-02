@@ -1050,7 +1050,7 @@ void dump_surface(Surface &s, const char *name) {
 // Capture: write any 2D texture view to a BMP as the shaders see it (first slice,
 // first mip). 8-bit colour as is; float formats clamped to [0,1]; depth as grey.
 int g_pass_dumps;
-void dump_srv(ID3D11ShaderResourceView *v, const char *path) {
+void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = false) {
     if (!v) return;
     D3D11_SHADER_RESOURCE_VIEW_DESC vd;
     v->GetDesc(&vd);
@@ -1100,7 +1100,10 @@ void dump_srv(ID3D11ShaderResourceView *v, const char *path) {
                     int n = f == DXGI_FORMAT_R16G16_FLOAT ? 2 : 3;
                     for (int k = 0; k < n; k++) { uint16_t hv; memcpy(&hv, q + 2 * k, 2); c[k] = u8(std::fabs(h2f(hv))); }
                 } else {
-                    for (int k = 0; k < 3; k++) { float fv; memcpy(&fv, q + 4 * k, 4); c[k] = u8(std::fabs(fv)); }
+                    for (int k = 0; k < 3; k++) {
+                        float fv; memcpy(&fv, q + 4 * k, 4);
+                        c[k] = u8(signed_map ? fv * 0.5f + 0.5f : std::fabs(fv));   // signed: -1..1 -> 0..1
+                    }
                 }
                 row[x * 4] = c[2], row[x * 4 + 1] = c[1], row[x * 4 + 2] = c[0], row[x * 4 + 3] = 255;
             }
@@ -1385,7 +1388,16 @@ void draw() {
     g_ctx->IASetPrimitiveTopology(topo);
     // Capture: full-screen passes (lighting, downsampling, post-processing) save every
     // input texture exactly as the shader receives it, and their outputs after the draw.
-    const bool pass_dump = (int)g_frame == g_log_frame && list.size() <= 6 && g_pass_dumps < 400;
+    // Also any draw sampling a large main-memory texture (e.g. the composite of the SPU
+    // post-processing buffers, which is a mesh, not a quad).
+    bool samples_main = false;
+    for (int t = 0; t < 16; t++)
+        if (srv[t] && ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32)) < mem::LOCAL_BASE &&
+            (reg(0x1a18 + t * 32) >> 16) * (reg(0x1a18 + t * 32) & 0xffff) >= 160 * 90)
+            samples_main = true;
+    // Skip draws that write no colour (occlusion queries); main-memory samplers always dump.
+    const bool pass_dump = (int)g_frame == g_log_frame && reg(0x0324) &&
+                           ((list.size() <= 6 && g_pass_dumps < 600) || samples_main);
     if (pass_dump)
         for (int t = 0; t < 16; t++)
             if (srv[t]) {
@@ -1413,7 +1425,7 @@ void draw() {
     static const int step_every = getenv("KZ2_STEP_EVERY") ? atoi(getenv("KZ2_STEP_EVERY")) : 0;
     static const uint32_t step_rt = getenv("KZ2_STEP_RT") ? (uint32_t)strtoul(getenv("KZ2_STEP_RT"), nullptr, 16) : 0;
     bool step = step_every > 0 && b.color[0] && b.color[0]->ea == step_rt && g_draws_this_frame % step_every == 0;
-    if ((int)g_frame == g_log_frame && b.color[0] && g_step_dumps < 80 &&
+    if ((int)g_frame == g_log_frame && b.color[0] && g_step_dumps < (step_every ? 700 : 80) &&
         (step_every ? step : list.size() <= 96 && b.color[0]->w != b.color[0]->h)) {
         g_step_dumps++;
         char name[64];
@@ -1600,6 +1612,14 @@ void dump_surfaces() {
         char name[32];
         snprintf(name, sizeof name, "rt_%08x", ea);
         dump_surface(s, name);
+        // Also as the game reads its packed G-buffer target: two half floats per pixel
+        // (Y16_X16_FLOAT, e.g. view-space normal X/Y), mapped -1..1 -> 0..255 in red/green.
+        if (color_format(s.fmt) == DXGI_FORMAT_R8G8B8A8_UNORM && s.w >= 640)
+            if (ID3D11ShaderResourceView *v = reinterpret_view(s, 0x9f)) {
+                char path[48];
+                snprintf(path, sizeof path, "rt_%08x_as_y16x16f.bmp", ea);
+                dump_srv(v, path, true);
+            }
     }
     LOG("rsx", "dumped %zu surfaces at frame %u", g_surfaces.size(), g_frame);
 }
