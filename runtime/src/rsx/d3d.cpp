@@ -1182,13 +1182,22 @@ void draw() {
         if (!run.empty()) topo = gen_indices(g_prim, run.data(), (uint32_t)run.size(), list);
         run.clear();
     };
+    // A draw's ranges are usually one index stream cut into pieces: DRAW_INDEX_ARRAY and
+    // DRAW_ARRAYS hold at most 256 indices each, so libgcm splits large draws into
+    // back-to-back ranges. Assemble primitives across such ranges; break only at restart
+    // markers or where a range does not continue the previous one. (Per range, a
+    // triangle list dropped 256 % 3 = 1 index per piece and every later triangle was
+    // built from the wrong vertices.)
+    uint32_t next_first = ~0u;
     for (auto &r : g_ranges) {
+        if (r.first != next_first) flush_run();
+        next_first = r.first + r.count;
         for (uint32_t i = 0; i < r.count && at < src_idx.size(); i++, at++) {
             if (src_idx[at] == ~0u) { flush_run(); continue; }
             run.push_back(src_idx[at]);
         }
-        flush_run();
     }
+    flush_run();
     if (list.empty()) { g_skip[4]++; return; }
     if (leak_mode() != 2) {
         uint32_t *id = (uint32_t *)ring_map(g_iring, (UINT)list.size() * 4, 4, D3D11_BIND_INDEX_BUFFER, false, &start_index);
