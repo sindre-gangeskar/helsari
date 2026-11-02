@@ -44,8 +44,17 @@ struct Workload {
     // per workload id), where the SPU-side module updates them with atomics.
     uint8_t *ready_byte() const { return (uint8_t *)mem::ptr(spurs + 0x00 + id); }
     uint8_t *contention_byte() const { return (uint8_t *)mem::ptr(spurs + 0x10 + id); }
-    uint8_t ready() const { return __atomic_load_n(ready_byte(), __ATOMIC_SEQ_CST); }
+    uint8_t ready_raw() const { return __atomic_load_n(ready_byte(), __ATOMIC_SEQ_CST); }
+    // Experiment (KZ2_SPURS_BOOST="name:n,..."): while the game asks for any SPU for
+    // this workload, run up to n instances - the job manager hands independent jobs
+    // to whichever instances run it, so a workload the game gave one SPU (jm_anim)
+    // spreads over more host cores.
+    int boost = 0;
+    uint8_t ready() const { uint8_t r = ready_raw(); return r && boost > r ? (uint8_t)boost : r; }
     std::atomic<int> running{0};          // instances inside the policy module
+    // flip log statistics: time instances spent running SPU code, runs, ready count seen
+    std::atomic<uint64_t> busy_ns{0}, runs{0};
+    std::atomic<int> ready_max{0}, running_max{0};
     std::atomic<bool> shutdown{false};
     std::mutex m;
     std::condition_variable cv;
@@ -58,7 +67,10 @@ int instances_for(uint32_t max_contention) {
     static const int n = [] {
         const char *e = getenv("KZ2_SPURS_SPUS");
         int v = e ? atoi(e) : 5;
-        return v < 1 ? 1 : v > 8 ? 8 : v;
+        // At most the SPURS instance's SPU count (Killzone 2: 5, cellSpursInitialize*):
+        // SPURS keeps per-SPU state for that many, and a 6th instance corrupts it
+        // (tried 8: the game froze while loading).
+        return v < 1 ? 1 : v > 5 ? 5 : v;
     }();
     int m = max_contention ? (int)max_contention : n;
     return std::min(n, m);
@@ -149,7 +161,15 @@ void workload_thread(Workload *w, int k) {
         bool log = runs < 5 || runs % 1000 == 0;
         if (log) LOG("spurs", "%s: run #%llu (ready %d)", s.name.c_str(), (unsigned long long)runs, w->ready());
         auto t_run = clock::now();
+        w->runs++;
+        {
+            int r = w->ready(), m = w->ready_max.load();
+            while (r > m && !w->ready_max.compare_exchange_weak(m, r)) {}
+            int u = w->running.load(), mu = w->running_max.load();
+            while (u > mu && !w->running_max.compare_exchange_weak(mu, u)) {}
+        }
         s.run();
+        w->busy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_run).count();
         if (log) LOG("spurs", "%s: exited at 0x%x", s.name.c_str(), s.pc);
         exit_idle.step(clock::now() - t_run < std::chrono::microseconds(30));   // found nothing to do
         runs++;
@@ -249,6 +269,23 @@ HLE(cellSpursWorkloadAttributeSetName) {
     st32(ARG32(0) + A_INSTANCE, ARG32(2));
     RET(0);
 }
+// Per workload since the last call: "name busy ms/frame (runs/frame, ready max r,
+// instances used u/n)". Resets.
+std::string spurs_stats_line(double frames) {
+    std::string out;
+    std::lock_guard<std::mutex> lk(g_lock);
+    for (auto &[id, w] : g_workloads) {
+        uint64_t b = w->busy_ns.exchange(0), r = w->runs.exchange(0);
+        int rm = w->ready_max.exchange(0), um = w->running_max.exchange(0);
+        if (!b && !r) continue;
+        char buf[160];
+        snprintf(buf, sizeof buf, "%s%s %.1f ms (%.0f runs, ready max %d, instances %d/%zu)", out.empty() ? "" : "; ",
+                 w->name.c_str(), b / 1e6 / frames, r / frames, rm, um, w->spus.size());
+        out += buf;
+    }
+    return out;
+}
+
 // Wakes SPU instances: one thread checks every workload each millisecond and
 // notifies those asking for more SPUs (ready count) than are running.
 void ready_monitor() {
@@ -279,6 +316,16 @@ HLE(cellSpursAddWorkloadWithAttribute) {
         g_workloads[p->id] = std::move(w);
     }
     st32(ARG32(1), p->id);
+    if (const char *e = getenv("KZ2_SPURS_BOOST"))
+        for (const char *q = e; *q;) {
+            const char *c = strchr(q, ':'), *end = strchr(q, ',');
+            if (!end) end = q + strlen(q);
+            if (c && c < end && p->name == std::string(q, c - q)) {
+                p->boost = std::min(atoi(c + 1), n);
+                LOG("spurs", "workload '%s': boosted to %d instances while ready", p->name.c_str(), p->boost);
+            }
+            q = *end ? end + 1 : end;
+        }
     for (int k = 0; k < n; k++) std::thread(workload_thread, p, k).detach();
     RET(0);
 }

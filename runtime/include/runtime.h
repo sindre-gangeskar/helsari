@@ -41,6 +41,14 @@ void ensure(uint32_t ea, uint32_t size);  /* commit before host (kernel) I/O tou
 /* KZ2_WATCH_WRITE: kernel I/O into watched memory doesn't fault, so host I/O
    reports itself here (and the pages are unprotected for it). True if watched. */
 bool watch_host_write(uint32_t ea, uint32_t size, const char *what);
+/* Write tracking of RSX local memory (texture change detection, memory.cpp):
+   arm = make the pages read-only; a guest write faults once and marks the page
+   written. written() is true if any page of the range was written (or never
+   armed) since it was armed. Bulk host writers call unarm() first. */
+void track_arm(uint32_t ea, uint32_t size);
+bool track_written(uint32_t ea, uint32_t size);
+void track_unarm(uint32_t ea, uint32_t size);
+bool track_enabled();
 void watch_add(uint32_t ea, uint32_t size);
 /* KZ2_HOOK_WATCH="ea:len": does [ea, ea+size) overlap it? (debug_hooks.cpp) */
 bool hook_watched(uint32_t ea, uint32_t size);

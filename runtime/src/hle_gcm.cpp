@@ -38,6 +38,7 @@ void gcm_tl(const char *fmt, ...) {
 #define REG(n) hle_register(#n, hle_##n)
 
 namespace spu { std::string stats_line(double secs, uint32_t frames); }
+std::string spurs_stats_line(double frames);
 std::string fiber_stats();   // fibers.cpp
 
 namespace {
@@ -132,6 +133,7 @@ void flip(uint32_t id) {
             (rsx::stats_line(frames) + ", " + fiber_stats() + "; " + mem::host_regions()).c_str());
         g_acquire_max_us = 0;
         LOG("gcm", "   PPU time in OS calls (ms/frame): %s", thread::call_report("", frames).c_str());
+        LOG("gcm", "   SPURS workloads per frame: %s", spurs_stats_line(frames).c_str());
         if (std::string t = tb_report(frames); !t.empty()) LOG("gcm", "   timebase reads per frame by site:%s", t.c_str());
     }
     // Window title: fps and frame time, averaged over at least a second, and the

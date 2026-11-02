@@ -188,7 +188,75 @@ bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
 
 } // namespace
 
+// ---- write tracking of RSX local memory (see runtime.h) ----
+namespace {
+constexpr uint32_t TRACK_PAGES = LOCAL_SIZE >> 12;
+std::atomic<uint8_t> g_armed[TRACK_PAGES];   // 1: read-only, not written since armed
+const bool g_track_on = [] { const char *e = getenv("KZ2_TEX_TRACK"); return !e || atoi(e) != 0; }();
+bool track_range(uint32_t ea, uint32_t size, uint32_t &p0, uint32_t &p1) {
+    if (!size || ea < LOCAL_BASE || ea - LOCAL_BASE >= LOCAL_SIZE) return false;
+    uint64_t end = std::min<uint64_t>((uint64_t)ea + size, (uint64_t)LOCAL_BASE + LOCAL_SIZE);
+    p0 = (ea - LOCAL_BASE) >> 12, p1 = (uint32_t)((end - 1 - LOCAL_BASE) >> 12);
+    return true;
+}
+void protect_pages(uint32_t p0, uint32_t p1, DWORD prot) {
+    DWORD old;
+    VirtualProtect(g_mem + LOCAL_BASE + ((uintptr_t)p0 << 12), (uintptr_t)(p1 - p0 + 1) << 12, prot, &old);
+}
+// A guest write to an armed page: unprotect it, mark it written.
+bool track_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
+    if (ep->ExceptionRecord->ExceptionInformation[0] != 1) return false;
+    uint64_t ea = (uint64_t)(addr - g_mem);
+    if (ea < LOCAL_BASE || ea - LOCAL_BASE >= LOCAL_SIZE) return false;
+    uint32_t p = (uint32_t)((ea - LOCAL_BASE) >> 12);
+    if (!g_armed[p].exchange(0)) {
+        // Another thread unprotected it meanwhile, or it was never ours: if the page
+        // is writable now, retry the store; otherwise leave it to the other handlers.
+        MEMORY_BASIC_INFORMATION mi;
+        return VirtualQuery(addr, &mi, sizeof mi) && mi.State == MEM_COMMIT && mi.Protect == PAGE_READWRITE;
+    }
+    protect_pages(p, p, PAGE_READWRITE);
+    return true;
+}
+} // namespace
+
+bool track_enabled() { return g_track_on; }
+
+void track_arm(uint32_t ea, uint32_t size) {
+    uint32_t p0, p1;
+    if (!g_track_on || !track_range(ea, size, p0, p1)) return;
+    // Arm runs of not-yet-armed, committed pages with one call each.
+    for (uint32_t p = p0; p <= p1;) {
+        if (g_armed[p].load()) { p++; continue; }
+        uint32_t q = p;
+        while (q + 1 <= p1 && !g_armed[q + 1].load()) q++;
+        MEMORY_BASIC_INFORMATION mi;
+        if (VirtualQuery(g_mem + LOCAL_BASE + ((uintptr_t)p << 12), &mi, sizeof mi) && mi.State == MEM_COMMIT) {
+            for (uint32_t k = p; k <= q; k++) g_armed[k] = 1;
+            protect_pages(p, q, PAGE_READONLY);
+        }
+        p = q + 1;
+    }
+}
+
+bool track_written(uint32_t ea, uint32_t size) {
+    uint32_t p0, p1;
+    if (!g_track_on || !track_range(ea, size, p0, p1)) return true;
+    for (uint32_t p = p0; p <= p1; p++)
+        if (!g_armed[p].load(std::memory_order_relaxed)) return true;
+    return false;
+}
+
+void track_unarm(uint32_t ea, uint32_t size) {
+    uint32_t p0, p1;
+    if (!g_track_on || !track_range(ea, size, p0, p1)) return;
+    bool any = false;
+    for (uint32_t p = p0; p <= p1; p++) any |= g_armed[p].exchange(0) != 0;
+    if (any) protect_pages(p0, p1, PAGE_READWRITE);
+}
+
 bool watch_host_write(uint32_t ea, uint32_t size, const char *what) {
+    track_unarm(ea, size);
     bool hit = false;
     for (auto &w : g_watch) {
         uintptr_t lo = (uintptr_t)(g_mem + ea), hi = lo + size;
@@ -225,6 +293,7 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     auto addr = (uint8_t *)er->ExceptionInformation[1];
     if (addr < g_mem || addr >= g_mem + RESERVE) return EXCEPTION_CONTINUE_SEARCH;
+    if (g_track_on && track_fault(ep, addr)) return EXCEPTION_CONTINUE_EXECUTION;
     if (!g_watch.empty() && watch_fault(ep, addr)) return EXCEPTION_CONTINUE_EXECUTION;
     uint64_t ea = (uint64_t)(addr - g_mem);
     // A write to the NULL page is how the game crashes on purpose after a

@@ -29,6 +29,7 @@ float vp_consts[512 * 4];
 bool vp_consts_dirty = true;
 // Backend costs on the FIFO thread, reported with the fps (rsx::stats_line).
 uint64_t g_wb_us, g_wb_calls, g_draw_us, g_draw_calls, g_present_us;
+uint64_t g_hash_ns, g_hash_n;   // texture change detection (hashing guest memory)
 // Draws dropped before reaching the GPU, by reason (fps log): no vertex ranges, no render
 // target, index range too large, ring buffer full, no primitives, shader missing.
 uint64_t g_skip[6];
@@ -612,6 +613,7 @@ uint32_t image_size(uint32_t fmt, uint32_t w, uint32_t h, uint32_t pitch) {
 void write_back_surface(uint32_t ea, Surface &s) {
     sync_primary(s);
     if (!s.dirty || !s.pitch) return;
+    mem::track_unarm(ea, s.pitch * s.h);   // one call for the whole range instead of a fault per page
     s.dirty = false;
     ScopedUs timer{g_wbs_us};
     g_wbs_n++;
@@ -884,12 +886,22 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     if (leak_mode() == 4) return t.srv;   // leak hunting: no texture creation or updates
     uint32_t size = image_size(fmt, w, h, pitch);
     if (t.srv && t.checked_frame == g_frame) return t.srv;
+    // Local-memory textures: page write tracking says whether anything wrote the
+    // image since we last looked - no need to read it (KZ2_TEX_TRACK=0: always hash).
+    // The pages are armed before hashing, so a write during the hash is seen next time.
+    uint32_t span = cube ? 6 * image_size(fmt, w, h, pitch) + 6 * 128 : image_size(fmt, w, h, pitch) * 2;   // + mips
+    if (ea >= mem::LOCAL_BASE && mem::track_enabled()) {
+        if (t.srv && !mem::track_written(ea, span)) { t.checked_frame = g_frame; return t.srv; }
+        mem::track_arm(ea, span);
+    }
     // Detect CPU-side changes: hash up to 64 KiB spread over the image.
+    uint64_t t_hash = host_now_ns();
     uint64_t hv = 1469598103934665603ull;
     const uint8_t *p = (const uint8_t *)mem::ptr(ea);
     if (size <= 65536) hv = fnv(p, size);
     else for (uint32_t k = 0; k < 1024; k++) hv = fnv(p + (uint64_t)size * k / 1024, 64, hv);
     t.checked_frame = g_frame;
+    g_hash_ns += host_now_ns() - t_hash, g_hash_n++;
     if (t.srv && t.content == hv) return t.srv;
     t.content = hv;
     ScopedUs timer{g_tex_us};
@@ -1827,6 +1839,12 @@ void draw() {
     }
     lap(5);
     if (leak_mode() != 1) g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
+    // Hand queued work to the GPU regularly, so it draws while we translate the next
+    // commands: otherwise the driver submits only when a readback forces it, and the
+    // CPU then waits for the GPU to do the whole frame's work at once.
+    static const int flush_every = getenv("KZ2_FLUSH_EVERY") ? atoi(getenv("KZ2_FLUSH_EVERY")) : 64;
+    static int since_flush;
+    if (flush_every > 0 && ++since_flush >= flush_every) g_ctx->Flush(), since_flush = 0;
     lap(6);
     if (light_dump) {
         char path[96];
@@ -2130,9 +2148,11 @@ std::string stats_line(uint32_t frames) {
     g_fetch_us = g_fetch_verts = g_fetch_used = g_dcall_us = g_map_us = 0;
     char seg[200];
     snprintf(seg, sizeof seg, "; draw stages ms/frame: bind %.1f, geometry %.1f, vs+textures %.1f, ps %.1f, "
-             "constants %.1f, state+binds %.1f, DrawIndexed %.1f (of vs+textures: vertex shader %.1f)",
+             "constants %.1f, state+binds %.1f, DrawIndexed %.1f (of vs+textures: vertex shader %.1f, texture hashing %.1f (%.0f))",
              g_seg_ns[0] / 1e6 / f, g_seg_ns[1] / 1e6 / f, (g_seg_ns[2] + g_seg_ns[7]) / 1e6 / f, g_seg_ns[3] / 1e6 / f,
-             g_seg_ns[4] / 1e6 / f, g_seg_ns[5] / 1e6 / f, g_seg_ns[6] / 1e6 / f, g_seg_ns[7] / 1e6 / f);
+             g_seg_ns[4] / 1e6 / f, g_seg_ns[5] / 1e6 / f, g_seg_ns[6] / 1e6 / f, g_seg_ns[7] / 1e6 / f,
+             g_hash_ns / 1e6 / f, g_hash_n / f);
+    g_hash_ns = g_hash_n = 0;
     for (auto &x : g_seg_ns) x = 0;
     char sk[200];
     snprintf(sk, sizeof sk,
