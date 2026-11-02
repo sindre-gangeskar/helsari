@@ -298,6 +298,7 @@ FpInfo translate_fp(const FpKey &key) {
          "  [unroll] for (int y = -1; y <= 1; y++) [unroll] for (int x = -1; x <= 1; x++)\n"
          "    c += t.Sample(s, uv + o * float2(x, y)) * ((2 - abs(x)) * (2 - abs(y)) / 16.0);\n"
          "  return c; }\n"
+         "float3 lin2srgb(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1 / 2.4) - 0.055; }\n"
          "float srgb1(float c) { return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4); }\n"
          "float4 srgb(float4 t, uint4 m) { return float4(m.x ? srgb1(t.x) : t.x, m.y ? srgb1(t.y) : t.y, "
          "m.z ? srgb1(t.z) : t.z, m.w ? srgb1(t.w) : t.w); }\n"
@@ -318,6 +319,10 @@ FpInfo translate_fp(const FpKey &key) {
          body + "  POut o;\n";
     if (fp32) h += "  o.c0 = r[0]; o.c1 = r[2]; o.c2 = r[3]; o.c3 = r[4];\n";
     else h += "  o.c0 = h[0]; o.c1 = h[4]; o.c2 = h[6]; o.c3 = h[8];\n";
+    // sRGB framebuffer writes: the RSX converts each colour output before blending.
+    if (key.srgb_out)
+        h += "  o.c0.rgb = lin2srgb(o.c0.rgb); o.c1.rgb = lin2srgb(o.c1.rgb); o.c2.rgb = lin2srgb(o.c2.rgb); "
+             "o.c3.rgb = lin2srgb(o.c3.rgb);\n";
     if (depth_export) h += fp32 ? "  o.z = saturate(r[1].z);\n" : "  o.z = saturate(h[2].z);\n";
     if (key.alpha_func) {
         static const char *ops[] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};

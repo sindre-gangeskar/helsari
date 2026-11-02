@@ -39,6 +39,7 @@ struct FpKey {
     uint32_t alpha_func;    // 0 = alpha test off, else GL compare func
     uint16_t remap[16];     // TEXTURE_CONTROL1 channel remap per unit (0xaae4 = identity)
     uint8_t gamma[16];      // TEXTURE_ADDRESS bits 20-23: sRGB-decode channels R=1 G=2 B=4 A=8
+    bool srgb_out = false;  // SET_SHADER_PACKER: colour outputs converted linear -> sRGB before blending
 };
 struct FpInfo { std::string hlsl; uint64_t hash; int mrt_count; };
 FpInfo translate_fp(const FpKey &key);
@@ -60,4 +61,5 @@ void method(uint32_t m, uint32_t arg);  // state tracking for everything
 std::string stats_line(uint32_t frames);   // backend costs since the last call, for the fps log
 bool capturing();        // an F12 capture is pending or in progress (for other logs to follow it)
 void request_capture();  // F12: log the next frame's draws and dump its render targets
+void toggle_cube_maps(); // F11 (diagnostic): cube-map textures read as black
 } // namespace rsx

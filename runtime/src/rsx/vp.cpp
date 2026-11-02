@@ -164,11 +164,12 @@ VpInfo translate_vp(uint32_t start) {
     }
     std::string h = w +
         "cbuffer VC : register(b0) { float4 c[512]; };\n"
-        "cbuffer VX : register(b1) { float4 vscale; float4 voffset; float4 surf; uint4 vbase; };\n"
+        "cbuffer VX : register(b1) { float4 vscale; float4 voffset; float4 surf; uint4 vbase; float4 clipm0; float4 clipm1; };\n"
         "StructuredBuffer<float4> vtx : register(t0);\n"
         "struct VOut { float4 pos : SV_Position;\n";
     for (int k = 1; k < 16; k++) h += "  float4 o" + std::to_string(k) + " : TEXCOORD" + std::to_string(k) + ";\n";
-    h += "};\n"
+    h += "  float3 cd0 : SV_ClipDistance0; float3 cd1 : SV_ClipDistance1;\n"
+         "};\n"
          "VOut main(uint vid : SV_VertexID) {\n"
          "  float4 v[16];\n"
          "  [unroll] for (int k = 0; k < 16; k++) v[k] = vtx[(vid + vbase.x) * 16 + k];\n"
@@ -183,6 +184,10 @@ VpInfo translate_vp(uint32_t start) {
          "  float2 ndc = float2(win.x / surf.x * 2 - 1, surf.z > 0 ? win.y / surf.y * 2 - 1 : 1 - win.y / surf.y * 2);\n"
          "  res.pos = float4(ndc * p.w, win.z * p.w, p.w);\n";
     for (int k = 1; k < 16; k++) h += "  res.o" + std::to_string(k) + " = o[" + std::to_string(k) + "];\n";
+    // User clip planes: distances in o5.yzw (planes 0-2) and o6.yzw (3-5); clipm holds
+    // per plane 0 (off), +1 (keep where d >= 0) or -1 (keep where d < 0).
+    h += "  res.cd0 = clipm0.yzw == 0 ? 1 : o[5].yzw * clipm0.yzw;\n"
+         "  res.cd1 = clipm1.yzw == 0 ? 1 : o[6].yzw * clipm1.yzw;\n";
     h += "  return res;\n}\n";
     return {h, fnv(h.data(), h.size())};
 }

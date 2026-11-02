@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <set>
 #include <windows.h>
 #include <d3d11_1.h>
 #include <dxgi1_6.h>
@@ -75,6 +76,7 @@ uint64_t g_scene_sum;
 uint32_t g_aa_sx = 1, g_aa_sy = 1;
 // Frame capture: draws of g_log_frame are logged, surfaces dumped when g_dump_frame begins.
 std::atomic<bool> g_capture_req{false};
+std::atomic<bool> g_no_cube{false};   // F11 diagnostic: cube maps read as black
 int g_log_frame = getenv("KZ2_LOG_DRAWS") ? atoi(getenv("KZ2_LOG_DRAWS")) : -1;
 int g_dump_frame = getenv("KZ2_DUMP_RT") ? atoi(getenv("KZ2_DUMP_RT")) : -1;
 int g_step_dumps;   // per-draw dumps taken in the current capture
@@ -660,6 +662,44 @@ void run_pass(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, uint32
     release(dsv);
 }
 
+// Diagnostics for environment reflections: a black cube map (F11), and the six faces
+// of each cube map used in the captured frame (cube_<ea>_<face>.bmp, D3D face order
+// +X -X +Y -Y +Z -Z, each as seen from the centre).
+ID3D11ShaderResourceView *black_cube() {
+    static ID3D11ShaderResourceView *srv;
+    if (!srv) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = d.Height = 1, d.MipLevels = 1, d.ArraySize = 6, d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.SampleDesc.Count = 1, d.BindFlags = D3D11_BIND_SHADER_RESOURCE, d.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+        uint32_t zero[6] = {};
+        D3D11_SUBRESOURCE_DATA sd[6];
+        for (int f = 0; f < 6; f++) sd[f] = {&zero[f], 4, 0};
+        ID3D11Texture2D *t = nullptr;
+        g_dev->CreateTexture2D(&d, sd, &t);
+        g_dev->CreateShaderResourceView(t, nullptr, &srv);
+        t->Release();
+    }
+    return srv;
+}
+ID3D11PixelShader *g_cube_face_ps;
+bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, ID3D11Texture2D *&tex, ID3D11RenderTargetView *&rtv,
+                 ID3D11ShaderResourceView *&srv);
+void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map);
+void dump_cube(ID3D11ShaderResourceView *cube, uint32_t ea) {
+    static std::set<uint32_t> done;
+    static uint32_t frame;
+    if (frame != g_frame) done.clear(), frame = g_frame;
+    if (!g_cube_face_ps || !done.insert(ea).second) return;
+    static ID3D11Texture2D *tex; static ID3D11RenderTargetView *rtv; static ID3D11ShaderResourceView *srv;
+    if (!tex && !make_target(128, 128, DXGI_FORMAT_R8G8B8A8_UNORM, tex, rtv, srv)) return;
+    for (uint32_t f = 0; f < 6; f++) {
+        run_pass(cube, rtv, 128, 128, g_cube_face_ps, f);
+        char path[64];
+        snprintf(path, sizeof path, "cube_%08x_%u.bmp", ea, f);
+        dump_srv(srv, path, false);
+    }
+}
+
 // Depth copy for proxies (see copy_region): a full-screen pass over the top-left
 // w x h of dst writes the source depth. Bound targets and viewport are restored.
 void copy_depth_region(Surface &dst, Surface &src, uint32_t w, uint32_t h) {
@@ -813,33 +853,42 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     g_tex_n++;
 
     int faces = cube ? 6 : 1;
+    // Mip levels follow level 0 in memory, each face holding its full chain (faces
+    // 128-byte aligned). Linear (pitched) textures: level 0 only. KZ2_NO_MIPS=1: level 0.
+    static const bool no_mips = getenv("KZ2_NO_MIPS") && atoi(getenv("KZ2_NO_MIPS"));
+    uint32_t levels = (no_mips || (fmt & 0x20)) ? 1 : std::min(mips, log2u(std::max(w, h)) + 1);
     uint32_t face_stride = 0;
-    if (cube) {  // each face holds its full mip chain, 128-byte aligned
+    if (cube) {
         for (uint32_t m = 0, mw = w, mh = h; m < mips; m++, mw = std::max(1u, mw / 2), mh = std::max(1u, mh / 2))
             face_stride += image_size(fmt, mw, mh, (fmt & 0x20) ? pitch : 0);
         face_stride = (face_stride + 127) & ~127u;
     }
-    std::vector<std::vector<uint8_t>> data(faces);
-    D3D11_SUBRESOURCE_DATA sd[6];
+    std::vector<std::vector<uint8_t>> data(faces * levels);
+    std::vector<D3D11_SUBRESOURCE_DATA> sd(faces * levels);
     DXGI_FORMAT df = DXGI_FORMAT_UNKNOWN;
-    for (int f = 0; f < faces; f++) {
+    for (int f = 0; f < faces; f++)
+    for (uint32_t lv = 0, lw = w, lh = h, lofs = 0; lv < levels; lv++) {
         UINT row;
-        df = decode(ea + f * face_stride, fmt, w, h, pitch, data[f], row);
+        uint32_t k = f * levels + lv;
+        df = decode(ea + f * face_stride + lofs, fmt, lw, lh, pitch, data[k], row);
+        sd[k] = {data[k].data(), row, 0};
+        lofs += image_size(fmt, lw, lh, (fmt & 0x20) ? pitch : 0);
+        lw = std::max(1u, lw / 2), lh = std::max(1u, lh / 2);
+        if (lv) continue;
         // Diagnostic only (KZ2_DEBUG_IDENTITY_LUT): an all-zero 64x64 A8R8G8B8 texture
         // (the colour-grading table) becomes an identity ramp, to see what else renders.
         static const bool identity_lut = getenv("KZ2_DEBUG_IDENTITY_LUT") != nullptr;
         if (identity_lut && w == 64 && h == 64 && (fmt & ~0x60u) == 0x85 &&
-            std::all_of(data[f].begin(), data[f].end(), [](uint8_t b) { return b == 0; })) {
+            std::all_of(data[k].begin(), data[k].end(), [](uint8_t b) { return b == 0; })) {
             for (uint32_t y = 0; y < h; y++)
                 for (uint32_t x = 0; x < w; x++) {
-                    uint8_t v = (uint8_t)(x * 255 / 63), *d = &data[f][(size_t)y * row + x * 4];
+                    uint8_t v = (uint8_t)(x * 255 / 63), *d = &data[k][(size_t)y * row + x * 4];
                     d[0] = v, d[1] = v, d[2] = 0, d[3] = v;     // with remap aa93: rgb = v, a (desaturate) = 0
                 }
         }
-        sd[f] = {data[f].data(), row, 0};
     }
     D3D11_TEXTURE2D_DESC d{};
-    d.Width = w, d.Height = h, d.MipLevels = 1, d.ArraySize = faces, d.Format = df;
+    d.Width = w, d.Height = h, d.MipLevels = levels, d.ArraySize = faces, d.Format = df;
     d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -851,8 +900,8 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         D3D11_TEXTURE2D_DESC old;
         t.tex->GetDesc(&old);
         if (old.Width == d.Width && old.Height == d.Height && old.Format == d.Format && old.ArraySize == d.ArraySize &&
-            old.MiscFlags == d.MiscFlags) {
-            for (int f = 0; f < faces; f++) g_ctx->UpdateSubresource(t.tex, f, nullptr, sd[f].pSysMem, sd[f].SysMemPitch, 0);
+            old.MiscFlags == d.MiscFlags && old.MipLevels == d.MipLevels) {
+            for (uint32_t k = 0; k < sd.size(); k++) g_ctx->UpdateSubresource(t.tex, k, nullptr, sd[k].pSysMem, sd[k].SysMemPitch, 0);
             return t.srv;
         }
         release(t.srv);
@@ -861,7 +910,7 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     static int big_logs;
     if ((uint64_t)w * h >= (2u << 20) && big_logs++ < 20)
         LOG("rsx", "large texture created: ea 0x%x fmt 0x%x %ux%u", ea, fmt, w, h);
-    if (FAILED(g_dev->CreateTexture2D(&d, sd, &t.tex))) {
+    if (FAILED(g_dev->CreateTexture2D(&d, sd.data(), &t.tex))) {
         LOG("rsx", "texture create failed fmt 0x%x %ux%u", fmt, w, h);
         return nullptr;
     }
@@ -873,8 +922,8 @@ std::unordered_map<uint64_t, ID3D11SamplerState *> g_samplers;
 // shadow: depth texture compared against the lookup z with the address register's zfunc.
 ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     uint32_t b = 0x1a00 + unit * 32;
-    uint32_t addr = reg(b + 8), filt = reg(b + 0x14);
-    uint64_t key = ((uint64_t)addr << 32) | (filt & 0xffff0000) | shadow;
+    uint32_t addr = reg(b + 8), filt = reg(b + 0x14), ctl0 = reg(b + 0x0c);
+    uint64_t key = fnv(&ctl0, 4, fnv(&filt, 4, ((uint64_t)addr << 32) | shadow));
     auto it = g_samplers.find(key);
     if (it != g_samplers.end()) return it->second;
     auto wrap = [](uint32_t m) {
@@ -888,14 +937,31 @@ ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     };
     D3D11_SAMPLER_DESC d{};
     bool lin = ((filt >> 24) & 0xff) != 1;
-    d.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    // Min filter: 1 nearest, 2 linear (level 0 only), 3-6 mipmapped (nearest/linear within
+    // and between levels), 7 convolution. LOD: TEXTURE_CONTROL0 min (bits 19-30) and max
+    // (7-18) in 4.8 fixed point, filter bits 0-12 a signed 5.8 bias.
+    uint32_t minf = (filt >> 16) & 0xff;
+    bool min_lin = minf == 2 || minf == 4 || minf == 6 || minf == 7, mip_lin = minf == 5 || minf == 6;
+    bool mipmapped = minf >= 3 && minf <= 6;
+    int f = (min_lin ? 0x10 : 0) | (lin ? 0x04 : 0) | (mip_lin ? 0x01 : 0);   // D3D11 filter bits
+    d.Filter = (D3D11_FILTER)f;
     if (shadow) d.Filter = lin ? D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT : D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+    d.MinLOD = ((ctl0 >> 19) & 0xfff) / 256.f;
+    d.MaxLOD = mipmapped ? ((ctl0 >> 7) & 0xfff) / 256.f : 0.f;
+    if (d.MaxLOD < d.MinLOD) d.MaxLOD = d.MinLOD;
+    d.MipLODBias = (float)((int32_t)(filt << 19) >> 19) / 256.f;
     d.AddressU = wrap(addr & 0xf);
     d.AddressV = wrap((addr >> 8) & 0xf);
     d.AddressW = wrap((addr >> 16) & 0xf);
-    d.MaxLOD = D3D11_FLOAT32_MAX;
-    // RSX zfunc 0..7 (never, less, equal, lequal, greater, notequal, gequal, always) = D3D11 func - 1
-    d.ComparisonFunc = shadow ? (D3D11_COMPARISON_FUNC)((addr >> 28) + 1) : D3D11_COMPARISON_NEVER;
+    // RSX zfunc 0..7 (never, less, equal, lequal, greater, notequal, gequal, always) = D3D11 func - 1.
+    // The RSX compares the stored depth against the lookup's z (texel OP ref); D3D11
+    // compares ref OP texel. Mirror the operator: Killzone 2's shadow maps use GEQUAL
+    // (lit where stored >= z); taken as-is every shadow test was inverted.
+    // KZ2_SHADOW_CMP_RAW=1: pass the function through unmirrored.
+    static const bool cmp_raw = getenv("KZ2_SHADOW_CMP_RAW") && atoi(getenv("KZ2_SHADOW_CMP_RAW"));
+    static const uint8_t mirror[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+    uint32_t zf = addr >> 28;
+    d.ComparisonFunc = shadow ? (D3D11_COMPARISON_FUNC)((cmp_raw ? zf : mirror[zf]) + 1) : D3D11_COMPARISON_NEVER;
     ID3D11SamplerState *s = nullptr;
     g_dev->CreateSamplerState(&d, &s);
     g_samplers[key] = s;
@@ -1121,10 +1187,13 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
     FpScan sc = scan_fp(fp_ea);
     uint32_t control = reg(0x1d60);
     uint32_t alpha = (reg(0x0304) & 1) ? reg(0x0308) : 0;
-    uint64_t h = fnv(gamma, 16, fnv(remap, 32, fnv(texdim, 16, fnv(&control, 4, fnv(&alpha, 4, sc.hash)))));
+    // SET_SHADER_PACKER (0x1fc4): sRGB framebuffer writes. KZ2_NO_SRGB_OUT=1 ignores it.
+    static const bool no_srgb = getenv("KZ2_NO_SRGB_OUT") && atoi(getenv("KZ2_NO_SRGB_OUT"));
+    uint32_t srgb_out = !no_srgb && reg(0x1fc4) != 0;
+    uint64_t h = fnv(&srgb_out, 4, fnv(gamma, 16, fnv(remap, 32, fnv(texdim, 16, fnv(&control, 4, fnv(&alpha, 4, sc.hash))))));
     auto it = g_ps.find(h);
     if (it != g_ps.end()) return &it->second;
-    FpKey key{fp_ea, control, {}, alpha, {}, {}};
+    FpKey key{fp_ea, control, {}, alpha, {}, {}, srgb_out != 0};
     memcpy(key.texdim, texdim, 16);
     memcpy(key.remap, remap, 32);
     memcpy(key.gamma, gamma, 16);
@@ -1356,6 +1425,10 @@ void draw() {
         if (!(reg(0x1a0c + t * 32) & 0x80000000) || !(sampled & (1 << t))) continue;
         TexDim d;
         srv[t] = get_texture(t, d);
+        if (d == TEX_CUBE) {
+            if ((int)g_frame == g_log_frame && srv[t]) dump_cube(srv[t], ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32)));
+            if (g_no_cube) srv[t] = black_cube();
+        }
         texdim[t] = d;
         if ((reg(0x1a04 + t * 32) >> 8) & 0x40) texdim[t] |= TEX_UNNORM;
         // Convolution filter (min 7 / mag 4): a hardware kernel over neighbouring
@@ -1388,8 +1461,16 @@ void draw() {
         upload_cb(g_cb_vc, vp_consts, sizeof vp_consts);
     }
     vp_consts_dirty = false;
-    float vx[16] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
+    float vx[24] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
                     regf(0x0a28), regf(0x0a2c), (float)b.w, (float)b.h, 0, 0};
+    // SET_USER_CLIP_PLANE_CONTROL (0x1478): 4 bits per plane, 1 = clip where d >= 0
+    // (keep d < 0), 2 = clip where d < 0. Killzone 2 cuts mirrored geometry at the
+    // mirror plane this way. KZ2_NO_CLIP_PLANES=1 ignores them.
+    static const bool no_clip = getenv("KZ2_NO_CLIP_PLANES") && atoi(getenv("KZ2_NO_CLIP_PLANES"));
+    for (int i = 0; i < 6; i++) {
+        uint32_t m = no_clip ? 0 : (reg(0x1478) >> (4 * i)) & 0xf;
+        vx[16 + (i < 3 ? 1 + i : 5 + (i - 3))] = m == 1 ? -1.f : m == 2 ? 1.f : 0.f;
+    }
     memcpy(&vx[12], &base_vertex, 4);   // vbase.x: first vertex of this draw in the ring (uint)
     bool origin_bottom = (reg(0x1d88) >> 12) & 0xf;
     // Window-origin "bottom" (0x1d88 bit 12) maps to D3D top-down here; verified against
@@ -1437,7 +1518,7 @@ void draw() {
         LOG("draw", "#%d rt=%x tex0=%x ps=%016llx cmask=%08x blend=%x/%x/%x fc0=(%g %g %g %g) fc1=(%g %g %g %g) n=%zu",
             g_draws_this_frame, b.color[0] ? b.color[0]->ea : 0, srv[0] ? ea_for((reg(0x1a04) & 3) == 2, reg(0x1a00)) : 0,
             (unsigned long long)psh, reg(0x324), reg(0x310), reg(0x314), reg(0x318), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], list.size());
-        LOG("draw", "   fp control %08x (register now %08x)", ps->control, reg(0x1d60));
+        LOG("draw", "   fp control %08x (register now %08x), shader packer (sRGB out) %x", ps->control, reg(0x1d60), reg(0x1fc4));
         for (size_t k = 2; k < ps->consts.size(); k++) {   // fc0/fc1 are on the line above
             float v[4];
             memcpy(v, &px.fc[k * 4], 16);
@@ -1587,7 +1668,28 @@ void draw() {
                 snprintf(path, sizeof path, "pass_%04d_in%02d_%08x.bmp", g_draws_this_frame, t, tea);
                 dump_srv(srv[t], path), g_pass_dumps++;
             }
+    // Capture: shadowed lights (a shadow-compare sampler) save the light buffer before and
+    // after the draw, and the shadow map, to see exactly what the light adds and where.
+    bool shadow_light = false;
+    for (int t = 0; t < 16; t++) if (srv[t] && (texdim[t] & TEX_SHADOW)) shadow_light = true;
+    const bool light_dump = (int)g_frame == g_log_frame && shadow_light && b.color[0] && g_pass_dumps < 600;
+    if (light_dump) {
+        char path[96];
+        snprintf(path, sizeof path, "light_%04d_before_%08x.bmp", g_draws_this_frame, b.color[0]->ea);
+        dump_srv(b.color[0]->srv, path), g_pass_dumps++;
+        for (int t = 0; t < 16; t++)
+            if (srv[t] && (texdim[t] & TEX_SHADOW)) {
+                uint32_t tea = ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32));
+                snprintf(path, sizeof path, "light_%04d_shadow%02d_%08x.bmp", g_draws_this_frame, t, tea);
+                dump_srv(srv[t], path), g_pass_dumps++;
+            }
+    }
     if (leak_mode() != 1) g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
+    if (light_dump) {
+        char path[96];
+        snprintf(path, sizeof path, "light_%04d_after_%08x.bmp", g_draws_this_frame, b.color[0]->ea);
+        dump_srv(b.color[0]->srv, path), g_pass_dumps++;
+    }
     if (pass_dump)
         for (int k = 0; k < 4; k++)
             if (b.color[k]) {
@@ -1732,6 +1834,19 @@ bool create_device() {
         g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_depth_copy_ps);
         code->Release();
     }
+    static const char CUBE_FACE_HLSL[] =
+        "TextureCube c : register(t0); SamplerState s : register(s0);" "\n"
+        "cbuffer P : register(b0) { uint4 mode; };" "\n"
+        "float4 ps(float4 p : SV_Position) : SV_Target { float2 q = p.xy / 128 * 2 - 1; float3 d;" "\n"
+        "  switch (mode.x) { case 0: d = float3(1, -q.y, -q.x); break; case 1: d = float3(-1, -q.y, q.x); break;" "\n"
+        "  case 2: d = float3(q.x, 1, q.y); break; case 3: d = float3(q.x, -1, -q.y); break;" "\n"
+        "  case 4: d = float3(q.x, -q.y, 1); break; default: d = float3(-q.x, -q.y, -1); break; }" "\n"
+        "  return float4(c.SampleLevel(s, d, 0).rgb, 1); }" "\n";
+    if (SUCCEEDED(D3DCompile(CUBE_FACE_HLSL, sizeof CUBE_FACE_HLSL - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0,
+                             &code, &err))) {
+        g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_cube_face_ps);
+        code->Release();
+    }
     D3D11_DEPTH_STENCIL_DESC dsd{};
     dsd.DepthEnable = TRUE, dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL, dsd.DepthFunc = D3D11_COMPARISON_ALWAYS;
     g_dev->CreateDepthStencilState(&dsd, &g_ds_always);
@@ -1748,7 +1863,7 @@ bool create_device() {
         if (!g_cbring) release(g_ctx1);
     }
     if (!g_cbring) LOG("rsx", "driver lacks constant buffer offsets: constants are re-uploaded per draw");
-    g_cb_vx = make_cb(64);
+    g_cb_vx = make_cb(96);
     g_cb_px = make_cb(32 + 256 + 128 * 16);
     g_cb_present = make_cb(16);
     g_cb_unit_uv = make_cb(16);
@@ -1821,6 +1936,7 @@ void dump_surfaces() {
 }
 
 void request_capture() { g_capture_req = true; }
+void toggle_cube_maps() { g_no_cube = !g_no_cube; LOG("rsx", "F11: cube maps %s", g_no_cube ? "off (black)" : "on"); }
 bool capturing() {
     return g_capture_req || (g_log_frame >= 0 && (int)g_frame >= g_log_frame && (int)g_frame <= g_dump_frame);
 }
