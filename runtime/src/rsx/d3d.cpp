@@ -1013,7 +1013,7 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
 }
 
 // Debug: write a RGBA8 / RGBA16F colour surface to <name>_f<fmt>.bmp (half floats clamped to 0..1).
-void dump_surface(Surface &s, const char *name) {
+void dump_surface(Surface &s, const char *name, bool alpha = false) {
     DXGI_FORMAT df = color_format(s.fmt);
     bool half = df == DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (df != DXGI_FORMAT_R8G8B8A8_UNORM && !half) return;
@@ -1026,7 +1026,7 @@ void dump_surface(Surface &s, const char *name) {
     D3D11_MAPPED_SUBRESOURCE m;
     g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m);
     char path[64];
-    snprintf(path, sizeof path, "%s_f%x.bmp", name, s.fmt);
+    snprintf(path, sizeof path, alpha ? "%s_f%x_alpha.bmp" : "%s_f%x.bmp", name, s.fmt);
     if (FILE *f = fopen(path, "wb")) {
         uint32_t sz = d.Width * d.Height * 4;
         uint8_t hdr[54] = {'B', 'M'};
@@ -1040,6 +1040,7 @@ void dump_surface(Surface &s, const char *name) {
             for (UINT x = 0; x < d.Width; x++) {
                 uint8_t c[3];
                 for (int k = 0; k < 3; k++) {
+                    if (alpha && !half) { c[k] = p[x * 4 + 3]; continue; }   // alpha as grey
                     if (!half) { c[k] = p[x * 4 + k]; continue; }
                     uint16_t hv;
                     memcpy(&hv, p + x * 8 + 2 * k, 2);
@@ -1636,6 +1637,7 @@ void dump_surfaces() {
         char name[32];
         snprintf(name, sizeof name, "rt_%08x", ea);
         dump_surface(s, name);
+        dump_surface(s, name, true);   // alpha channel (specular etc. often live there)
         // Also as the game reads its packed G-buffer target: two half floats per pixel
         // (Y16_X16_FLOAT, e.g. view-space normal X/Y), mapped -1..1 -> 0..255 in red/green.
         if (color_format(s.fmt) == DXGI_FORMAT_R8G8B8A8_UNORM && s.w >= 640)
