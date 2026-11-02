@@ -79,7 +79,35 @@ void emit_write(std::string &o, const Insn &in, const std::string &dst, const st
 }
 } // namespace
 
-VpInfo translate_vp(uint32_t start) {
+// Vertex inputs, decoded per attribute from the raw guest bytes in vtx (see the
+// VX cbuffer: vattr[k] = byte offset of the draw's first vertex, stride, -, -).
+// afmt[k]: 0 constant (vdef), 1-7 RSX type | size << 4, 8 host float4.
+std::string fetch_code(const uint8_t afmt[16]) {
+    std::string c;
+    for (int k = 0; k < 16; k++) {
+        std::string K = std::to_string(k), b = "(vattr[" + K + "].x + vid * vattr[" + K + "].y)";
+        uint32_t t = afmt[k] & 15, n = afmt[k] >> 4;
+        if (!t) { c += "  v[" + K + "] = vdef[" + K + "];\n"; continue; }
+        if (t == 8) { c += "  v[" + K + "] = vtx[" + b + " >> 4];\n"; continue; }
+        if (t == 6) { c += "  v[" + K + "] = cmp(rd32(" + b + "));\n"; continue; }
+        c += "  { uint b = " + b + "; v[" + K + "] = float4(";
+        for (uint32_t i = 0; i < 4; i++) {
+            std::string I = std::to_string(i), e;
+            if (i >= n) e = i == 3 ? "1" : "0";
+            else if (t == 1) e = "float((int)(rd16(b + " + std::to_string(2 * i) + ") << 16) >> 16) / 32767.0";
+            else if (t == 2) e = "asfloat(rd32(b + " + std::to_string(4 * i) + "))";
+            else if (t == 3) e = "f16tof32(rd16(b + " + std::to_string(2 * i) + "))";
+            else if (t == 4) e = "rd8(b + " + I + ") / 255.0";
+            else if (t == 5) e = "float((int)(rd16(b + " + std::to_string(2 * i) + ") << 16) >> 16)";
+            else e = "float(rd8(b + " + I + "))";
+            c += e + (i < 3 ? ", " : "");
+        }
+        c += "); }\n";
+    }
+    return c;
+}
+
+VpInfo translate_vp(uint32_t start, const uint8_t afmt[16]) {
     std::string body;
     std::set<std::string> warn;
     int n = 0;
@@ -176,34 +204,14 @@ VpInfo translate_vp(uint32_t start) {
         "uint rd16(uint b) { if ((b & 1) == 0) { uint w = rdw(b & ~3u) >> ((b & 2) * 8); return ((w & 255) << 8) | ((w >> 8) & 255); }\n"
         "  return (rd8(b) << 8) | rd8(b + 1); }\n"
         "uint rd32(uint b) { if ((b & 3) == 0) return bswap(rdw(b)); return (rd16(b) << 16) | rd16(b + 2); }\n"
-        "float4 fetch(uint k, uint vid) {\n"
-        "  uint4 a = vattr[k];\n"
-        "  if (a.w == 0) return vdef[k];\n"
-        "  uint t = a.z & 15, n = a.z >> 4, b = a.x + vid * a.y;\n"
-        "  if (t == 8) return vtx[b >> 4];\n"
-        "  if (t == 6) { uint p = rd32(b); return float4(float((int)(p << 21) >> 21) / 1023.0,\n"
-        "    float((int)(p << 10) >> 21) / 1023.0, float((int)p >> 22) / 511.0, 1); }\n"
-        "  float4 r = float4(0, 0, 0, 1);\n"
-        "  [unroll] for (uint c = 0; c < 4; c++) {\n"
-        "    if (c >= n) break;\n"
-        "    float v;\n"
-        "    if (t == 1) v = float((int)(rd16(b + 2 * c) << 16) >> 16) / 32767.0;\n"
-        "    else if (t == 2) v = asfloat(rd32(b + 4 * c));\n"
-        "    else if (t == 3) v = f16tof32(rd16(b + 2 * c));\n"
-        "    else if (t == 4) v = rd8(b + c) / 255.0;\n"
-        "    else if (t == 5) v = float((int)(rd16(b + 2 * c) << 16) >> 16);\n"
-        "    else v = float(rd8(b + c));\n"
-        "    r[c] = v;\n"
-        "  }\n"
-        "  return r;\n"
-        "}\n"
+        "float4 cmp(uint p) { return float4(float((int)(p << 21) >> 21) / 1023.0, float((int)(p << 10) >> 21) / 1023.0, float((int)p >> 22) / 511.0, 1); }\n"
         "struct VOut { float4 pos : SV_Position;\n";
     for (int k = 1; k < 16; k++) h += "  float4 o" + std::to_string(k) + " : TEXCOORD" + std::to_string(k) + ";\n";
     h += "  float3 cd0 : SV_ClipDistance0; float3 cd1 : SV_ClipDistance1;\n"
          "};\n"
          "VOut main(uint vid : SV_VertexID) {\n"
-         "  float4 v[16];\n"
-         "  [unroll] for (int k = 0; k < 16; k++) v[k] = fetch(k, vid);\n"
+         "  float4 v[16];\n" +
+         fetch_code(afmt) +
          "  float4 r[32]; [unroll] for (int k = 0; k < 32; k++) r[k] = 0;\n"
          "  float4 o[16]; [unroll] for (int k = 0; k < 16; k++) o[k] = float4(0, 0, 0, 1);\n"
          "  float4 cc0 = 0, cc1 = 0; int4 a0 = 0, a1 = 0;\n" +

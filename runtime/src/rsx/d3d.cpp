@@ -6,6 +6,7 @@
 //    read in the vertex shader through SV_VertexID.
 //  * Shaders are translated from RSX microcode and cached by microcode hash.
 #include "rsx.h"
+#include "idle_backoff.h"
 
 #include <algorithm>
 #include <atomic>
@@ -98,6 +99,24 @@ std::unordered_map<uint64_t, PsEntry> g_ps;
 
 ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
     ID3DBlob *code = nullptr, *err = nullptr;
+    // Disk cache of compiled shaders (shader_cache/<target>_<source hash>.bin): later
+    // runs load bytecode instead of compiling. KZ2_NO_SHADER_CACHE=1: always compile.
+    static const bool no_cache = getenv("KZ2_NO_SHADER_CACHE") && atoi(getenv("KZ2_NO_SHADER_CACHE"));
+    char cpath[96];
+    snprintf(cpath, sizeof cpath, "shader_cache/%s_%016llx.bin", target,
+             (unsigned long long)fnv(target, strlen(target), fnv(src.data(), src.size())));
+    if (!no_cache)
+        if (FILE *f = fopen(cpath, "rb")) {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)n, &code)) && fread(code->GetBufferPointer(), 1, n, f) == (size_t)n) {
+                fclose(f);
+                return code;
+            }
+            if (code) code->Release(), code = nullptr;
+            fclose(f);
+        }
     ScopedUs timer{g_compile_us};
     g_compile_n++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "main", target,
@@ -112,6 +131,11 @@ ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
         return nullptr;
     }
     release(err);
+    if (!no_cache) {
+        std::error_code ec;
+        std::filesystem::create_directories("shader_cache", ec);
+        if (FILE *f = fopen(cpath, "wb")) { fwrite(code->GetBufferPointer(), 1, code->GetBufferSize(), f); fclose(f); }
+    }
     if (getenv("KZ2_DUMP_SHADERS")) {
         std::filesystem::create_directories("shaders");
         char path[64];
@@ -1195,10 +1219,20 @@ ID3D11VertexShader *vertex_shader() {
         h = fnv(&vp_ucode[i * 4], 16, h);
         if (vp_ucode[i * 4 + 3] & 1) break;
     }
+    // Attribute formats are compiled into the shader (a decode per attribute, see
+    // vp.cpp fetch_code): 0 constant, RSX type | size << 4, 8 host float4 (CPU fetch).
+    static const bool cpu_vertex = getenv("KZ2_CPU_VERTEX") && atoi(getenv("KZ2_CPU_VERTEX"));
+    uint8_t afmt[16] = {};
+    for (int a = 0; a < 16; a++) {
+        uint32_t fmt = reg(0x1740 + a * 4), type = fmt & 0xf, size = (fmt >> 4) & 0xf;
+        if (cpu_vertex) afmt[a] = 8;
+        else if ((reg(0x1ff0) & (1 << a)) && size && type >= 1 && type <= 7) afmt[a] = (uint8_t)(type | size << 4);
+    }
+    h = fnv(afmt, 16, h);
     g_vs_hash = h;
     auto it = g_vs.find(h);
     if (it != g_vs.end()) return it->second;
-    VpInfo vi = translate_vp(start);
+    VpInfo vi = translate_vp(start, afmt);
     ID3D11VertexShader *vs = nullptr;
     if (ID3DBlob *b = compile(vi.hlsl, "vs_5_0", h)) {
         g_dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &vs);
@@ -1345,8 +1379,13 @@ void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = f
     st->Release();
 }
 
+// Per-stage time of draw() (flip log): where the RSX thread's per-draw cost goes.
+uint64_t g_seg_ns[8], g_seg_t;
+inline void lap(int i) { uint64_t n = host_now_ns(); g_seg_ns[i] += n - g_seg_t; g_seg_t = n; }
+
 void draw() {
     if (!g_ok) return;
+    g_seg_t = host_now_ns();
     if (g_ranges.empty()) { g_skip[0]++; return; }
     g_draws_this_frame++;
     if (leak_mode() >= 5) return;
@@ -1359,6 +1398,7 @@ void draw() {
     }();
     for (int k : skip) if (k == g_draws_this_frame) return;
     Bound b = bind_surfaces();
+    lap(0);
     if (!b.w) { g_skip[1]++; return; }
     if (b.color[0] && b.color[1] && b.color[2] && b.color[3]) g_scene_draws++;
 
@@ -1487,8 +1527,10 @@ void draw() {
         g_ctx->Unmap(g_iring.buf, 0);
     }
 
+    lap(1);
     // shaders
     ID3D11VertexShader *vs = vertex_shader();
+    lap(7);
     uint32_t sp = reg(0x08e4);
     uint32_t fp_ea = ea_for((sp & 3) == 2 ? 1 : 0, sp & ~3u);
     uint8_t texdim[16] = {};
@@ -1536,6 +1578,7 @@ void draw() {
         }
         smp[t] = get_sampler(t, texdim[t] & TEX_SHADOW);
     }
+    lap(2);
     uint16_t remap[16];
     for (int t = 0; t < 16; t++) remap[t] = (reg(0x1a0c + t * 32) & 0x80000000) ? reg(0x1a10 + t * 32) & 0xffff : 0xaae4;
     uint8_t gamma[16];   // per-channel sRGB decode (TEXTURE_ADDRESS bits 20-23); KZ2_NO_TEX_GAMMA=1 ignores it
@@ -1546,6 +1589,7 @@ void draw() {
     if (!vs || !ps->ps) { g_skip[5]++; return; }
 
     // constants
+    lap(3);
     static CbSlice s_vc, s_vx, s_px;   // static: a skipped upload (leak_mode 3) keeps the last binding
     const bool cb_on = leak_mode() != 3;
     if (!cb_on) {
@@ -1721,6 +1765,7 @@ void draw() {
         }
     }
 
+    lap(4);
     apply_state();
     g_ctx->VSSetShader(vs, nullptr, 0);
     g_ctx->PSSetShader(ps->ps, nullptr, 0);
@@ -1780,7 +1825,9 @@ void draw() {
                 dump_srv(srv[t], path), g_pass_dumps++;
             }
     }
+    lap(5);
     if (leak_mode() != 1) g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
+    lap(6);
     if (light_dump) {
         char path[96];
         snprintf(path, sizeof path, "light_%04d_after_%08x.bmp", g_draws_this_frame, b.color[0]->ea);
@@ -2081,6 +2128,12 @@ std::string stats_line(uint32_t frames) {
     g_wb_us = g_wb_calls = g_draw_us = g_draw_calls = g_present_us = 0;
     g_wbs_us = g_wbs_n = g_tex_us = g_tex_n = g_compile_us = g_compile_n = 0;
     g_fetch_us = g_fetch_verts = g_fetch_used = g_dcall_us = g_map_us = 0;
+    char seg[200];
+    snprintf(seg, sizeof seg, "; draw stages ms/frame: bind %.1f, geometry %.1f, vs+textures %.1f, ps %.1f, "
+             "constants %.1f, state+binds %.1f, DrawIndexed %.1f (of vs+textures: vertex shader %.1f)",
+             g_seg_ns[0] / 1e6 / f, g_seg_ns[1] / 1e6 / f, (g_seg_ns[2] + g_seg_ns[7]) / 1e6 / f, g_seg_ns[3] / 1e6 / f,
+             g_seg_ns[4] / 1e6 / f, g_seg_ns[5] / 1e6 / f, g_seg_ns[6] / 1e6 / f, g_seg_ns[7] / 1e6 / f);
+    for (auto &x : g_seg_ns) x = 0;
     char sk[200];
     snprintf(sk, sizeof sk,
              "; draws skipped per frame: no ranges %.0f, no target %.0f, bad range %.0f, ring full %.0f, no primitives "
@@ -2092,7 +2145,7 @@ std::string stats_line(uint32_t frames) {
         snprintf(sc, sizeof sc, "; scene draws per frame min %d avg %.0f max %d", g_scene_min,
                  (double)g_scene_sum / g_scene_frames, g_scene_max);
     g_scene_min = 1 << 30, g_scene_max = 0, g_scene_sum = 0, g_scene_frames = 0;
-    return std::string(b) + sk + sc;
+    return std::string(b) + seg + sk + sc;
 }
 
 // Debug: KZ2_SCREENSHOT=<sec> writes the presented frame, half size, to

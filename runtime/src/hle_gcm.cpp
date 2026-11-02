@@ -132,6 +132,7 @@ void flip(uint32_t id) {
             (rsx::stats_line(frames) + ", " + fiber_stats() + "; " + mem::host_regions()).c_str());
         g_acquire_max_us = 0;
         LOG("gcm", "   PPU time in OS calls (ms/frame): %s", thread::call_report("", frames).c_str());
+        if (std::string t = tb_report(frames); !t.empty()) LOG("gcm", "   timebase reads per frame by site:%s", t.c_str());
     }
     // Window title: fps and frame time, averaged over at least a second, and the
     // process's memory (private bytes: what it has committed, as Task Manager shows).

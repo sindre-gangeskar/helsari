@@ -24,7 +24,7 @@ uint32_t ea_for(uint32_t location, uint32_t off); // location: 0 local, 1 main
 
 /* shader translation (vp.cpp / fp.cpp) */
 struct VpInfo { std::string hlsl; uint64_t hash; };
-VpInfo translate_vp(uint32_t start);
+VpInfo translate_vp(uint32_t start, const uint8_t afmt[16]);
 
 enum TexDim : uint8_t { TEX_2D = 0, TEX_CUBE = 1, TEX_3D = 2 };
 constexpr uint8_t TEX_UNNORM = 0x80;  // flag OR-ed into texdim: coordinates are in texels

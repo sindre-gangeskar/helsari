@@ -94,7 +94,8 @@ uint32_t hle_make_opd(hle_fn fn);  /* OPD for a runtime function, callable by gu
 void ppu_invoke(PPUContext *ctx, uint32_t opd);
 
 /* ---- threads ---- */
-void gcm_tl(const char *fmt, ...);   /* frame timeline log around an F12 capture (hle_gcm.cpp) */
+void gcm_tl(const char *fmt, ...);
+std::string tb_report(double frames);   /* KZ2_TB_SITES: clock reads per site (core.cpp) */   /* frame timeline log around an F12 capture (hle_gcm.cpp) */
 namespace thread {
 PPUContext *create_context();
 uint32_t current_id();

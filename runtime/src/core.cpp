@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -166,7 +167,37 @@ extern "C" void ppu_trap(PPUContext *ctx, uint32_t addr) {
     if (n++ < 50) LOG("ppu", "trap instruction hit at 0x%08x (lr=0x%llx) - continuing", addr, (unsigned long long)ctx->lr);
 }
 
+// Who reads the clock (KZ2_TB_SITES=1): calls per host return address, reported
+// in the flip log (tb_report) - finds the game's frame timer among 842 read sites.
+namespace {
+std::mutex g_tb_lock;
+std::map<uintptr_t, uint64_t> g_tb_sites;
+const bool g_tb_on = getenv("KZ2_TB_SITES") && atoi(getenv("KZ2_TB_SITES"));
+}
+std::string tb_report(double frames) {
+    if (!g_tb_on) return "";
+    std::vector<std::pair<uint64_t, uintptr_t>> v;
+    {
+        std::lock_guard<std::mutex> lk(g_tb_lock);
+        for (auto &[a, n] : g_tb_sites) v.push_back({n, a});
+        g_tb_sites.clear();
+    }
+    std::sort(v.rbegin(), v.rend());
+    std::string out;
+    char buf[64];
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    for (size_t i = 0; i < v.size() && i < 12; i++) {
+        snprintf(buf, sizeof buf, " +0x%llx:%.1f", (unsigned long long)(v[i].second - base), v[i].first / frames);
+        out += buf;
+    }
+    return out;
+}
+
 extern "C" uint64_t ppu_timebase(void) {
+    if (g_tb_on) {
+        std::lock_guard<std::mutex> lk(g_tb_lock);
+        g_tb_sites[(uintptr_t)__builtin_return_address(0)]++;
+    }
     // PS3 timebase runs at 79.8 MHz
     static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     LARGE_INTEGER c;
