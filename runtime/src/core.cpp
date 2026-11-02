@@ -55,10 +55,17 @@ bool fast_wake() {
     return on;
 }
 
+thread_local uint64_t t_backoff_ns;   // time this thread spent in host_backoff sleeps (workload stats)
+uint64_t take_backoff_ns() { uint64_t v = t_backoff_ns; t_backoff_ns = 0; return v; }
+
 void host_backoff(uint32_t n) {
     if (n < 64) YieldProcessor();          // a few hundred ns: the other side is about to answer
     else if (n < 256) SwitchToThread();    // give the core to a ready thread, if any
-    else host_sleep_us(n < 1024 || fast_wake() ? 50 : n < 2048 ? 200 : 1000);   // long idle (~0.25 s): fewer wake-ups
+    else {
+        uint64_t t0 = host_now_ns();
+        host_sleep_us(n < 1024 || fast_wake() ? 50 : n < 2048 ? 200 : 1000);   // long idle (~0.25 s): fewer wake-ups
+        t_backoff_ns += host_now_ns() - t0;
+    }
 }
 
 void fatal(const char *fmt, ...) {

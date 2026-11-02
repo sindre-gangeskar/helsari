@@ -240,14 +240,25 @@ ID3D11DeviceContext1 *g_ctx1;
 ID3D11Buffer *g_cbring;
 UINT g_cbring_pos, g_cbring_gen;
 constexpr UINT CBRING_SIZE = 16 << 20;
+// The ring stays mapped across a draw's pushes (one Map/Unmap per draw instead of
+// one per block); cb_flush() unmaps it before the draw binds it.
+uint8_t *g_cb_map;
+void cb_flush() {
+    if (g_cb_map) g_ctx->Unmap(g_cbring, 0), g_cb_map = nullptr;
+}
 CbSlice cb_push(const void *data, size_t n) {
     UINT bytes = (UINT)((n + 255) & ~size_t(255));                    // offsets and sizes: multiples of 16 constants
     D3D11_MAP mode = D3D11_MAP_WRITE_NO_OVERWRITE;
-    if (g_cbring_pos + bytes > CBRING_SIZE) g_cbring_pos = 0, g_cbring_gen++, mode = D3D11_MAP_WRITE_DISCARD;
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(g_ctx->Map(g_cbring, 0, mode, 0, &m))) return {};
-    memcpy((uint8_t *)m.pData + g_cbring_pos, data, n);
-    g_ctx->Unmap(g_cbring, 0);
+    if (g_cbring_pos + bytes > CBRING_SIZE) {
+        cb_flush();
+        g_cbring_pos = 0, g_cbring_gen++, mode = D3D11_MAP_WRITE_DISCARD;
+    }
+    if (!g_cb_map) {
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(g_ctx->Map(g_cbring, 0, mode, 0, &m))) return {};
+        g_cb_map = (uint8_t *)m.pData;
+    }
+    memcpy(g_cb_map + g_cbring_pos, data, n);
     CbSlice s{g_cbring_pos / 16, bytes / 16, g_cbring_gen};
     g_cbring_pos += bytes;
     return s;
@@ -281,6 +292,15 @@ struct Surface {
     // into a draw-sized stand-in instead, see bind_surfaces().
     struct Surface *proxy = nullptr;
     uint8_t newer = 0;                          // with a proxy: 1 this surface newer, 2 the proxy newer
+    // Early readback: serial of the last change, and of the change the staging copy holds.
+    uint64_t drawn_serial = 1, copied_serial = 0;
+    // A texture reading the top-left w x h of this surface (same address and pitch):
+    // a GPU copy of that region, refreshed when the surface changed (sub_view()).
+    uint32_t sub_w = 0, sub_h = 0;
+    uint64_t sub_serial = 0;
+    ID3D11Texture2D *sub_tex = nullptr;
+    ID3D11ShaderResourceView *sub_srv = nullptr;
+    ID3D11RenderTargetView *sub_rtv = nullptr;
 };
 
 // The RSX lets a shader sample the surface it is rendering to; D3D11 does
@@ -321,6 +341,7 @@ void free_surface(Surface &s) {
     release(s.rtv); release(s.dsv); release(s.srv); release(s.tex); release(s.copy_srv); release(s.copy); release(s.staging);
     release(s.as_color_srv); release(s.as_color_rtv); release(s.as_color);
     release(s.view_srv); release(s.view_rtv); release(s.view);
+    release(s.sub_srv); release(s.sub_rtv); release(s.sub_tex);
     if (s.proxy) { free_surface(*s.proxy); delete s.proxy; }
     s = Surface{};
 }
@@ -380,8 +401,9 @@ void copy_region(Surface &dst, Surface &src, uint32_t w, uint32_t h) {
 }
 
 // Bring a surface up to date with what was drawn into its proxy.
+uint64_t g_surface_serial = 1;
 void sync_primary(Surface &s) {
-    if (s.proxy && s.newer == 2) copy_region(s, *s.proxy, s.proxy->w, s.proxy->h), s.newer = 0;
+    if (s.proxy && s.newer == 2) copy_region(s, *s.proxy, s.proxy->w, s.proxy->h), s.newer = 0, s.drawn_serial = ++g_surface_serial;
 }
 
 // The w x h stand-in for s, holding s's current top-left contents.
@@ -407,6 +429,7 @@ Surface *use_proxy(Surface &s, uint32_t w, uint32_t h) {
 // After rendering to s (directly or through its proxy).
 void mark_drawn(Surface &s, bool via_proxy) {
     s.dirty = true;
+    s.drawn_serial = ++g_surface_serial;
     if (s.proxy) s.newer = via_proxy ? 2 : 1;
 }
 
@@ -630,7 +653,7 @@ void write_back_surface(uint32_t ea, Surface &s) {
         d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &s.staging))) return;
     }
-    g_ctx->CopyResource(s.staging, s.tex);
+    if (s.copied_serial != s.drawn_serial) g_ctx->CopyResource(s.staging, s.tex), s.copied_serial = s.drawn_serial;
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(g_ctx->Map(s.staging, 0, D3D11_MAP_READ, 0, &m))) return;
     for (uint32_t y = 0; y < h; y++) {
@@ -832,6 +855,29 @@ bool same_layout(uint32_t sfmt, uint32_t base) {
     }
 }
 
+// The top-left w x h of surface s as a texture, copied on the GPU - instead of writing
+// the whole surface back to guest memory (a CPU stall on the GPU queue) and decoding the
+// region from there. Colour surfaces: a region copy in the surface's format. 16-bit depth
+// read as X16: a pass writing the depth into all four channels (as decode() does).
+ID3D11PixelShader *g_depth_x16_ps;
+ID3D11ShaderResourceView *sub_view(Surface &s, uint32_t w, uint32_t h) {
+    if (s.sub_w != w || s.sub_h != h || !s.sub_tex) {
+        release(s.sub_srv), release(s.sub_rtv), release(s.sub_tex);
+        DXGI_FORMAT f = s.depth ? DXGI_FORMAT_R16G16B16A16_UNORM : color_format(s.fmt);
+        if (!make_target(w, h, f, s.sub_tex, s.sub_rtv, s.sub_srv)) return nullptr;
+        s.sub_w = w, s.sub_h = h, s.sub_serial = 0;
+    }
+    if (s.sub_serial != s.drawn_serial) {
+        if (s.depth) run_pass(s.srv, s.sub_rtv, w, h, g_depth_x16_ps);
+        else {
+            D3D11_BOX box{0, 0, 0, w, h, 1};
+            g_ctx->CopySubresourceRegion(s.sub_tex, 0, 0, 0, 0, s.tex, 0, &box);
+        }
+        s.sub_serial = s.drawn_serial;
+    }
+    return s.sub_srv;
+}
+
 ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     uint32_t b = 0x1a00 + unit * 32;
     uint32_t off = reg(b), fmtreg = reg(b + 4), rect = reg(b + 0x18);
@@ -869,6 +915,19 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
                 LOG("rsx", "   texture %08x fmt %02x %ux%u (depth surface %ux%u): %s", ea, base, w, h, ds->second.w,
                     ds->second.h, how);
         };
+        // KZ2_SUBRECT_GPU=0: read such regions back through guest memory, as before.
+        static const bool subrect = !getenv("KZ2_SUBRECT_GPU") || atoi(getenv("KZ2_SUBRECT_GPU"));
+        if (subrect && (fmt & 0x20) && s != g_surfaces.end() && !s->second.depth && pitch == s->second.pitch &&
+            s->second.w >= w && s->second.h >= h && (s->second.w != w || s->second.h != h) &&
+            same_layout(s->second.fmt, base) && color_format(s->second.fmt) != DXGI_FORMAT_UNKNOWN) {
+            trace("GPU region copy of the colour surface");
+            if (ID3D11ShaderResourceView *v = sub_view(s->second, w, h)) return v;
+        }
+        if (subrect && (fmt & 0x20) && base == 0x94 && ds != g_depth_surfaces.end() && ds->second.fmt == 1 &&
+            pitch == ds->second.pitch && ds->second.w >= w && ds->second.h >= h) {
+            trace("GPU region copy of the Z16 depth surface");
+            if (ID3D11ShaderResourceView *v = sub_view(ds->second, w, h)) return v;
+        }
         if (s != g_surfaces.end()) {
             Surface &rt = s->second;
             if (rt.w == w && rt.h == h) {
@@ -1834,6 +1893,7 @@ void draw() {
     g_ctx->PSSetShader(ps->ps, nullptr, 0);
     ID3D11Buffer *vcb[2] = {g_cb_vc, g_cb_vx};
     if (g_cbring) {
+        cb_flush();
         ID3D11Buffer *rings[3] = {g_cbring, g_cbring, g_cbring};
         UINT first[3] = {s_vc.first, s_vx.first, s_vch.first}, num[3] = {s_vc.num, s_vx.num, s_vch.num};
         g_ctx1->VSSetConstantBuffers1(0, 3, rings, first, num);
@@ -1912,6 +1972,25 @@ void draw() {
     // Only what the RSX would write is dirty: a zeta buffer stays bound while depth
     // and stencil are off, and depth-only passes mask colour writes.
     if (reg(0x0324)) for (int i = 0; i < 4; i++) if (b.color[i]) mark_drawn(*b.color[i], b.proxied[i]);
+    // Early readback: a colour target in main memory is read by the SPUs (post-processing
+    // inputs) once the game signals them. Start its GPU->CPU copy now and hand it to the
+    // GPU, so the write-back at that signal finds it done instead of stalling the RSX
+    // thread on the whole queue. KZ2_EARLY_READBACK=0: copy at write-back time.
+    static const bool early_rb = !getenv("KZ2_EARLY_READBACK") || atoi(getenv("KZ2_EARLY_READBACK"));
+    if (early_rb && reg(0x0324))
+        for (int i = 0; i < 4; i++) {
+            Surface *c = b.color[i];
+            if (!c || b.proxied[i] || c->ea >= mem::LOCAL_BASE || c->depth) continue;
+            if (!c->staging) {
+                D3D11_TEXTURE2D_DESC d;
+                c->tex->GetDesc(&d);
+                d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &c->staging))) continue;
+            }
+            g_ctx->CopyResource(c->staging, c->tex);
+            c->copied_serial = c->drawn_serial;
+            g_ctx->Flush();
+        }
     bool zwrite = ((reg(0x0a74) & 1) && (reg(0x0a70) & 1)) || (reg(0x0328) & 1);
     if (b.depth && zwrite) mark_drawn(*b.depth, b.proxied[4]);
     // Capture: after each small draw (post-processing quads), save its target.
@@ -2034,6 +2113,14 @@ bool create_device() {
         LOG("rsx", "depth->colour shader: %s", err ? (const char *)err->GetBufferPointer() : "?");
     } else {
         g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_depth_color_ps);
+        code->Release();
+    }
+    static const char DEPTH_X16_HLSL[] =
+        "Texture2D<float> d : register(t0);" "\n"
+        "float4 ps(float4 p : SV_Position) : SV_Target { return d.Load(int3(p.xy, 0)).xxxx; }" "\n";
+    if (SUCCEEDED(D3DCompile(DEPTH_X16_HLSL, sizeof DEPTH_X16_HLSL - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0,
+                             &code, &err))) {
+        g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_depth_x16_ps);
         code->Release();
     }
     static const char DEPTH_COPY_HLSL[] =
@@ -2301,6 +2388,7 @@ void maybe_screenshot() {
 
 void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     if (!g_ok) return;
+    cb_flush();
     g_frame++;
     if ((int)g_frame == g_dump_frame) dump_surfaces();
     if (g_capture_req.exchange(false)) {

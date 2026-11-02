@@ -18,6 +18,7 @@
 
 uint8_t *g_mem;
 uint32_t g_line_locks[LINE_LOCKS];
+uint8_t g_line_notify[LINE_LOCKS];
 uint32_t g_line_seq[LINE_LOCKS];
 
 namespace mem {

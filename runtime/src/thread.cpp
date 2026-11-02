@@ -106,7 +106,8 @@ void note_call(const char *name, PPUContext *ctx, bool entering) {
         if (t_cur->call_depth++ == 0) t_cur->call_name = name, t_cur->call_t0 = host_now_ns();
     } else if (t_cur->call_depth > 0 && --t_cur->call_depth == 0) {
         if (!strncmp(t_cur->call_name, "usleep@", 7) && t_cur->name == "main")
-            gcm_tl("main %s %.3f ms", t_cur->call_name, (host_now_ns() - t_cur->call_t0) / 1e6);
+            gcm_tl("main %s %.3f ms (r30 0x%llx r31 0x%llx)", t_cur->call_name, (host_now_ns() - t_cur->call_t0) / 1e6,
+                   (unsigned long long)ctx->r[30], (unsigned long long)ctx->r[31]);
         std::lock_guard<std::mutex> lk(t_cur->stats_lock);
         t_cur->call_ns[t_cur->call_name] += host_now_ns() - t_cur->call_t0;
     }

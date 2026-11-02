@@ -53,7 +53,7 @@ struct Workload {
     uint8_t ready() const { uint8_t r = ready_raw(); return r && boost > r ? (uint8_t)boost : r; }
     std::atomic<int> running{0};          // instances inside the policy module
     // flip log statistics: time instances spent running SPU code, runs, ready count seen
-    std::atomic<uint64_t> busy_ns{0}, runs{0};
+    std::atomic<uint64_t> busy_ns{0}, runs{0}, idle_ns{0}, backoff_ns{0};
     std::atomic<int> ready_max{0}, running_max{0};
     std::atomic<bool> shutdown{false};
     std::mutex m;
@@ -142,7 +142,9 @@ void workload_thread(Workload *w, int k) {
             // atomics, which notify no one, so ready_monitor() polls it for everyone (one
             // thread instead of each instance polling: libc++'s wait_for rounds short
             // timeouts down to 0 ms on Windows, so a 1 ms poll loop mostly spins).
+            uint64_t t_idle = host_now_ns();
             w->cv.wait(lk, [w, k] { return w->ready() > k || w->shutdown; });
+            w->idle_ns += host_now_ns() - t_idle;
         }
         if (w->shutdown) break;
         if (w->ready() <= k) continue;
@@ -170,6 +172,7 @@ void workload_thread(Workload *w, int k) {
         }
         s.run();
         w->busy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_run).count();
+        w->backoff_ns += take_backoff_ns();   // of busy: sleeping in polling loops (empty queue, locks)
         if (log) LOG("spurs", "%s: exited at 0x%x", s.name.c_str(), s.pc);
         exit_idle.step(clock::now() - t_run < std::chrono::microseconds(30));   // found nothing to do
         runs++;
@@ -269,18 +272,39 @@ HLE(cellSpursWorkloadAttributeSetName) {
     st32(ARG32(0) + A_INSTANCE, ARG32(2));
     RET(0);
 }
+// An atomic commit to a SPURS instance's first line, where the ready counts live (SPU
+// job managers and libspurs change them with atomics, which notify no one): wake that
+// instance's workloads that now want more SPUs than run. Without this, waiting
+// instances only noticed new work at the ready monitor's next poll - ~0.3-0.5 ms per
+// hand-off, hundreds of times a frame in a chain of dependent post-processing jobs.
+// KZ2_SPURS_WAKE_ON_WRITE=0: monitor only.
+namespace { std::atomic<uint32_t> g_spurs_lines[8]; }
+extern "C" void line_notify(uint64_t ea) {
+    uint32_t line = (uint32_t)ea & ~127u;
+    bool ours = false;
+    for (auto &l : g_spurs_lines) if (l.load(std::memory_order_relaxed) == line) ours = true;
+    if (!ours) return;
+    std::lock_guard<std::mutex> lk(g_lock);
+    for (auto &[id, w] : g_workloads)
+        if ((w->spurs & ~127u) == line && w->ready() > w->running) {
+            { std::lock_guard<std::mutex> wl(w->m); }   // a waiter is either past its check or asleep
+            w->cv.notify_all();
+        }
+}
+
 // Per workload since the last call: "name busy ms/frame (runs/frame, ready max r,
 // instances used u/n)". Resets.
 std::string spurs_stats_line(double frames) {
     std::string out;
     std::lock_guard<std::mutex> lk(g_lock);
     for (auto &[id, w] : g_workloads) {
-        uint64_t b = w->busy_ns.exchange(0), r = w->runs.exchange(0);
+        uint64_t b = w->busy_ns.exchange(0), r = w->runs.exchange(0), idl = w->idle_ns.exchange(0), bo = w->backoff_ns.exchange(0);
         int rm = w->ready_max.exchange(0), um = w->running_max.exchange(0);
         if (!b && !r) continue;
-        char buf[160];
-        snprintf(buf, sizeof buf, "%s%s %.1f ms (%.0f runs, ready max %d, instances %d/%zu)", out.empty() ? "" : "; ",
-                 w->name.c_str(), b / 1e6 / frames, r / frames, rm, um, w->spus.size());
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s%s run %.1f ms (of it backoff sleeps %.1f), between runs %.1f ms (%.0f runs, ready max %d, instances %d/%zu)",
+                 out.empty() ? "" : "; ", w->name.c_str(), b / 1e6 / frames, bo / 1e6 / frames, idl / 1e6 / frames, r / frames, rm,
+                 um, w->spus.size());
         out += buf;
     }
     return out;
@@ -316,6 +340,17 @@ HLE(cellSpursAddWorkloadWithAttribute) {
         g_workloads[p->id] = std::move(w);
     }
     st32(ARG32(1), p->id);
+    static const bool wake_on_write = !getenv("KZ2_SPURS_WAKE_ON_WRITE") || atoi(getenv("KZ2_SPURS_WAKE_ON_WRITE"));
+    if (wake_on_write) {
+        uint32_t line = p->spurs & ~127u;
+        bool have = false;
+        for (auto &l : g_spurs_lines) if (l.load() == line) have = true;
+        for (auto &l : g_spurs_lines) {
+            uint32_t z = 0;
+            if (have || l.compare_exchange_strong(z, line)) break;
+        }
+        g_line_notify[line_index(line)] = 1;
+    }
     if (const char *e = getenv("KZ2_SPURS_BOOST"))
         for (const char *q = e; *q;) {
             const char *c = strchr(q, ':'), *end = strchr(q, ',');

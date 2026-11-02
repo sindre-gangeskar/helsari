@@ -103,6 +103,7 @@ void ppu_invoke(PPUContext *ctx, uint32_t opd);
 
 /* ---- threads ---- */
 void gcm_tl(const char *fmt, ...);
+uint32_t gcm_parked_ea();   /* guest address of the jump the RSX is parked on, 0 if none */
 std::string tb_report(double frames);   /* KZ2_TB_SITES: clock reads per site (core.cpp) */   /* frame timeline log around an F12 capture (hle_gcm.cpp) */
 namespace thread {
 PPUContext *create_context();

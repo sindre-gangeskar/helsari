@@ -164,6 +164,10 @@ static inline uint64_t cntlzd_(uint64_t x) { return x ? __builtin_clzll(x) : 64;
 #define LINE_LOCKS 4096
 extern uint32_t g_line_locks[LINE_LOCKS];
 extern uint32_t g_line_seq[LINE_LOCKS];
+/* Lines whose commits wake someone (SPURS ready counts: spurs_kernel.cpp line_notify).
+   Checked after every atomic commit's unlock: one byte load. */
+extern uint8_t g_line_notify[LINE_LOCKS];
+void line_notify(uint64_t ea);
 static inline uint32_t line_index(uint64_t ea) { return (uint32_t)(EA(ea) >> 7) & (LINE_LOCKS - 1); }
 static inline void line_lock(uint64_t ea) {
     uint32_t *l = &g_line_locks[line_index(ea)];
@@ -172,6 +176,7 @@ static inline void line_lock(uint64_t ea) {
 }
 static inline void line_unlock(uint64_t ea) {
     __atomic_store_n(&g_line_locks[line_index(ea)], 0, __ATOMIC_RELEASE);
+    if (__builtin_expect(g_line_notify[line_index(ea)], 0)) line_notify(ea);
 }
 /* Under line_lock: record a commit to the line, breaking others' reservations. */
 static inline void line_commit(uint64_t ea) {

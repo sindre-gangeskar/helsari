@@ -128,6 +128,10 @@ void SpuThread::mfc_command(uint32_t cmd) {
         break;
     case 0x20: case 0x21: case 0x22:                // PUT, PUTB, PUTF
     case 0x30: case 0x31: case 0x32:                // PUTR variants
+        if (uint32_t pe = gcm_parked_ea(); pe && pe >= ea && pe < ea + size)   // releases the parked RSX
+            gcm_tl("%s PUT releases the parked RSX: ea 0x%x size 0x%x", name.c_str(), ea, size);
+        if (ea >= 0x40300000 && ea < 0x40301000 && size >= 4)   // RSX labels (frame timeline)
+            gcm_tl("%s puts label 0x%x = 0x%08x", name.c_str(), ea - 0x40300000, __builtin_bswap32(*(uint32_t *)(ls + lsa)));
         mem::track_unarm(ea, size);
         memcpy(ea_ptr(ea), ls + lsa, size);
         break;
@@ -208,7 +212,11 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
         if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, la, sz);
         if (get && same_code_reload(la, ea_ptr(eal), sz)) loaded_from(la, eal, sz);
         else if (get) ls_written(la, sz), memcpy(ls + la, ea_ptr(eal), sz), loaded_from(la, eal, sz);
-        else mem::track_unarm(eal, sz), memcpy(ea_ptr(eal), ls + la, sz);
+        else {
+            if (uint32_t pe = gcm_parked_ea(); pe && pe >= eal && pe < eal + sz)
+                gcm_tl("%s list PUT releases the parked RSX: ea 0x%x size 0x%x", name.c_str(), eal, sz);
+            mem::track_unarm(eal, sz), memcpy(ea_ptr(eal), ls + la, sz);
+        }
         lsa = (lsa + sz + 15) & (LS_SIZE - 16);
         if (ts & 0x80000000u) {
             stalled[tag] = {true, cmd, lsa, list, i + 1, count};

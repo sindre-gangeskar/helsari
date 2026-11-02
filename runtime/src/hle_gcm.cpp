@@ -21,8 +21,13 @@
 
 // Frame timeline (around an F12 capture): timestamped events of the RSX, the user
 // handler and the waiting PPU, to see which step holds up the frame.
+// F9: timeline only (no surface dumps, which distort the frame after the flip),
+// for the next few frames.
+std::atomic<uint32_t> g_tl_flips{0};
+std::atomic<uint32_t> g_parked_ea{0};   // guest address of the jump the RSX is parked on (0: not parked)
+std::atomic<uint32_t> g_flip_count{0};
 void gcm_tl(const char *fmt, ...) {
-    if (!rsx::capturing()) return;
+    if (!rsx::capturing() && g_flip_count.load() >= g_tl_flips.load()) return;
     static uint64_t t0;
     uint64_t now = host_now_ns();
     if (!t0 || now - t0 > 2000000000ull) t0 = now;
@@ -34,6 +39,7 @@ void gcm_tl(const char *fmt, ...) {
     LOG("tl", "%9.3f ms  %s", (now - t0) / 1e6, buf);
 }
 #define tl gcm_tl
+uint32_t gcm_parked_ea() { return g_parked_ea.load(); }
 
 #define REG(n) hle_register(#n, hle_##n)
 
@@ -98,6 +104,7 @@ void map_io(uint32_t ea, uint32_t io, uint32_t size) {
 LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_CLOSE) { LOG("gcm", "window closed - exiting"); ExitProcess(0); }
     if (m == WM_KEYDOWN && w == VK_F12) rsx::request_capture();
+    if (m == WM_KEYDOWN && w == VK_F9) { g_tl_flips = g_flip_count.load() + 4; LOG("tl", "F9: timeline for 4 frames"); }
     if (m == WM_KEYDOWN && w == VK_F11) rsx::toggle_cube_maps();
     return DefWindowProcW(h, m, w, l);
 }
@@ -214,7 +221,7 @@ void method(uint32_t m, uint32_t arg) {
         tl("rsx label 0x%x = 0x%x (back end)", g_rsx.be_semaphore_offset, arg);
         break;
     case 0x1d74: st32(LABEL_ADDR + g_rsx.be_semaphore_offset, arg); tl("rsx label 0x%x = 0x%x (tex)", g_rsx.be_semaphore_offset, arg); break;
-    case GCM_FLIP_METHOD: tl("rsx flip 0x%x", arg); flip(arg); break;
+    case GCM_FLIP_METHOD: tl("rsx flip 0x%x", arg); flip(arg); g_flip_count++; break;
     case 0xeb00: {                                                      // GCM_SET_USER_COMMAND
         static std::atomic<int> logs{0};
         if (logs++ < 5) LOG("rsx", "user command 0x%x (handler 0x%x)", arg, g_user_handler);
@@ -242,7 +249,7 @@ void fifo_thread() {
         uint32_t ea0 = get != put ? io_ea(get) : 0;
         bool parked = ea0 && ld32(ea0) == (0x20000000 | get) || ea0 && ld32(ea0) == (get | 1);
         if (get == put || parked) {
-            if (!idle) tl("rsx %s at 0x%x", parked ? "parked" : "empty", get);
+            if (!idle) tl("rsx %s at 0x%x (ea 0x%x)", parked ? "parked" : "empty", get, ea0), g_parked_ea = parked ? ea0 : 0;
             auto t0 = std::chrono::steady_clock::now();
             host_backoff(idle++);
             uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -259,7 +266,7 @@ void fifo_thread() {
             idle = 0;
             continue;   // re-read put/get: more may have been released meanwhile
         }
-        if (idle) tl("rsx resumes at 0x%x (put 0x%x)", get, put);
+        if (idle) tl("rsx resumes at 0x%x (put 0x%x), word now 0x%08x", get, put, ld32(io_ea(get))), g_parked_ea = 0;
         idle = 0;
         if (trace && put != last_put) { LOG("rsx", "put=0x%x get=0x%x", put, get); last_put = put; }
         uint32_t ea = io_ea(get);

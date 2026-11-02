@@ -10,6 +10,8 @@
 void host_backoff(uint32_t n);
 /* KZ2_FAST_WAKE=1 experiment: short sleeps only (core.cpp). */
 bool fast_wake();
+/* Time the calling thread spent sleeping in host_backoff since the last call (core.cpp). */
+uint64_t take_backoff_ns();
 /* Monotonic time in nanoseconds (core.cpp). */
 uint64_t host_now_ns();
 
