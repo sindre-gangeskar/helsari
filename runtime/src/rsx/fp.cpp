@@ -120,6 +120,14 @@ FpInfo translate_fp(const FpKey &key) {
             if ((key.texdim[tex] & TEX_SHADOW) && dim == TEX_2D)
                 return texs + ".SampleCmpLevelZero(" + smp + ", " + cs + ", (" + coord + ").z).xxxx";
             std::string e = texs + "." + fn + "(" + smp + ", " + cs + extra + ")";
+            // Convolution filter. Multisampled surfaces hold each pixel's two samples
+            // side by side, so a pixel's neighbourhood is (+-1, +-0.5) texels away.
+            // Quincunx: the pixel's own samples 1/2, four diagonal neighbours 1/8 each.
+            if ((key.texdim[tex] & (TEX_QUINCUNX | TEX_GAUSS)) && dim == TEX_2D && fn == "Sample") {
+                std::string ts = "texscale[" + std::to_string(tex) + "].xy";
+                e = std::string(key.texdim[tex] & TEX_QUINCUNX ? "quincunx(" : "gauss3(") + texs + ", " + smp + ", " +
+                    cs + ", " + ts + ")";
+            }
             // TEXTURE_CONTROL1 remap: per output channel a source (A, R, G, B) or the constant 0 / 1.
             uint16_t rm = key.remap[tex];
             if (rm && rm != 0xaae4)
@@ -201,6 +209,18 @@ FpInfo translate_fp(const FpKey &key) {
         case 6: e = "(" + e + ") / 4"; break;
         case 7: e = "(" + e + ") / 8"; break;
         }
+        // Instruction precision (dst bits 22-23): 0 fp32, 1 fp16, 2 fx12 (fixed point,
+        // [-2, 2)), 3 fx9 ([-1, 1]). The result is clamped to its range; shaders rely
+        // on it (Killzone 2's specular exponent is formed in fx12). KZ2_NO_FP_PREC=1: off.
+        static const bool no_prec = getenv("KZ2_NO_FP_PREC") && atoi(getenv("KZ2_NO_FP_PREC"));
+        uint32_t prec = bits(c.dst, 22, 2);
+        bool packs = op == 0x13 || op == 0x24 || op == 0x27 || op == 0x29 || op == 0x2c;   // results are bit patterns
+        bool clampable = !e.empty() && e != "KIL" && !bits(c.dst, 31, 1) && !packs;
+        if (clampable && !no_prec) {
+            if (prec == 1) e = "clamp(" + e + ", -65504.0, 65504.0)";
+            else if (prec == 2) e = "clamp(" + e + ", -2.0, 2.0)";
+            else if (prec == 3) e = "clamp(" + e + ", -1.0, 1.0)";
+        }
         if (bits(c.dst, 31, 1) && e != "KIL" && !e.empty()) e = "saturate(" + e + ")";
 
         // condition for executing this instruction (per component)
@@ -271,6 +291,13 @@ FpInfo translate_fp(const FpKey &key) {
          "  return k == 2 ? (s == 0 ? t.a : s == 1 ? t.r : s == 2 ? t.g : t.b) : k == 1 ? 1 : 0; }\n"
          "float3 cubeflip(float3 d) { float3 a = abs(d), r = -d; if (a.x >= a.y && a.x >= a.z) r.x = d.x; "
          "else if (a.y >= a.z) r.y = d.y; else r.z = d.z; return r; }\n"
+         "float4 quincunx(Texture2D t, SamplerState s, float2 uv, float2 ts) { float2 o = ts * float2(1, 0.5);\n"
+         "  return 0.5 * t.Sample(s, uv) + 0.125 * (t.Sample(s, uv + o) + t.Sample(s, uv - o) +\n"
+         "    t.Sample(s, uv + float2(o.x, -o.y)) + t.Sample(s, uv + float2(-o.x, o.y))); }\n"
+         "float4 gauss3(Texture2D t, SamplerState s, float2 uv, float2 ts) { float2 o = ts * float2(2, 1); float4 c = 0;\n"
+         "  [unroll] for (int y = -1; y <= 1; y++) [unroll] for (int x = -1; x <= 1; x++)\n"
+         "    c += t.Sample(s, uv + o * float2(x, y)) * ((2 - abs(x)) * (2 - abs(y)) / 16.0);\n"
+         "  return c; }\n"
          "float srgb1(float c) { return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4); }\n"
          "float4 srgb(float4 t, uint4 m) { return float4(m.x ? srgb1(t.x) : t.x, m.y ? srgb1(t.y) : t.y, "
          "m.z ? srgb1(t.z) : t.z, m.w ? srgb1(t.w) : t.w); }\n"

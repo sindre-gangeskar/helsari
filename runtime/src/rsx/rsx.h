@@ -29,7 +29,9 @@ VpInfo translate_vp(uint32_t start);
 enum TexDim : uint8_t { TEX_2D = 0, TEX_CUBE = 1, TEX_3D = 2 };
 constexpr uint8_t TEX_UNNORM = 0x80;  // flag OR-ed into texdim: coordinates are in texels
 constexpr uint8_t TEX_SHADOW = 0x40;  // flag: depth texture with a compare function (lookup = filtered depth test)
-constexpr uint8_t TEX_DIM_MASK = 0x3f;
+constexpr uint8_t TEX_QUINCUNX = 0x20; // flag: convolution filter, quincunx kernel (the RSX's AA resolve filter)
+constexpr uint8_t TEX_GAUSS = 0x10;    // flag: convolution filter, 3x3 Gaussian kernel
+constexpr uint8_t TEX_DIM_MASK = 0x0f;
 struct FpKey {
     uint32_t addr;          // guest address of the program
     uint32_t control;       // SET_SHADER_CONTROL

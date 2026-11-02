@@ -89,6 +89,8 @@ ID3D11PixelShader *g_reinterpret_ps;    // A8R8G8B8 texels -> another 32-bit tex
 ID3D11Buffer *g_cb_pass;                // mode constant for the conversion passes
 ID3D11Buffer *g_cb_unit_uv;             // uvscale (1, 1) for g_present_vs in run_pass
 std::unordered_map<uint64_t, ID3D11VertexShader *> g_vs;
+std::unordered_map<uint64_t, std::string> g_vs_hlsl;   // translated source, for the frame capture
+std::unordered_map<uint64_t, bool> g_vs_dumped;
 struct PsEntry { ID3D11PixelShader *ps; std::vector<uint32_t> consts; std::string hlsl; uint32_t control; bool dumped; };
 std::unordered_map<uint64_t, PsEntry> g_ps;
 
@@ -1111,6 +1113,7 @@ ID3D11VertexShader *vertex_shader() {
         b->Release();
     }
     g_vs[h] = vs;
+    g_vs_hlsl[h] = vi.hlsl;
     return vs;
 }
 
@@ -1355,6 +1358,15 @@ void draw() {
         srv[t] = get_texture(t, d);
         texdim[t] = d;
         if ((reg(0x1a04 + t * 32) >> 8) & 0x40) texdim[t] |= TEX_UNNORM;
+        // Convolution filter (min 7 / mag 4): a hardware kernel over neighbouring
+        // texels, done in the shader (see fp.cpp). Killzone 2 resolves its 2x
+        // multisampled frame with the quincunx kernel.
+        uint32_t filt = reg(0x1a14 + t * 32);
+        if (((filt >> 16) & 0xff) == 7 || ((filt >> 24) & 0xff) == 4) {
+            uint32_t k = (filt >> 13) & 7;
+            if (k == 1 || k == 3) texdim[t] |= TEX_QUINCUNX;
+            else if (k == 2) texdim[t] |= TEX_GAUSS;
+        }
         smp[t] = get_sampler(t, texdim[t] & TEX_SHADOW);
     }
     uint16_t remap[16];
@@ -1426,6 +1438,19 @@ void draw() {
             g_draws_this_frame, b.color[0] ? b.color[0]->ea : 0, srv[0] ? ea_for((reg(0x1a04) & 3) == 2, reg(0x1a00)) : 0,
             (unsigned long long)psh, reg(0x324), reg(0x310), reg(0x314), reg(0x318), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], list.size());
         LOG("draw", "   fp control %08x (register now %08x)", ps->control, reg(0x1d60));
+        for (size_t k = 2; k < ps->consts.size(); k++) {   // fc0/fc1 are on the line above
+            float v[4];
+            memcpy(v, &px.fc[k * 4], 16);
+            LOG("draw", "   fc%zu = (%g %g %g %g)", k, v[0], v[1], v[2], v[3]);
+        }
+        if (!g_vs_dumped[g_vs_hash]) {
+            g_vs_dumped[g_vs_hash] = true;
+            std::filesystem::create_directories("shaders");
+            char path[64];
+            snprintf(path, sizeof path, "shaders/cap_vs_%016llx.hlsl", (unsigned long long)g_vs_hash);
+            const std::string &src = g_vs_hlsl[g_vs_hash];
+            if (FILE *f = fopen(path, "w")) { fwrite(src.data(), 1, src.size(), f); fclose(f); }
+        }
         LOG("draw", "   depth test %u func %x write %u, stencil %u func %x ref %x mask %x/%x ops %x/%x/%x two-sided %u, "
             "depth bounds %u [%g, %g]", reg(0x0a74) & 1, reg(0x0a6c), reg(0x0a70) & 1, reg(0x0328) & 1, reg(0x0330),
             reg(0x0334), reg(0x0338), reg(0x032c), reg(0x033c), reg(0x0340), reg(0x0344), reg(0x0348) & 1,
@@ -1949,8 +1974,9 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         for (auto &e : std::filesystem::directory_iterator(".", ec))
             if (e.path().extension() == ".bmp") std::filesystem::remove(e.path(), ec);
         for (auto &e : std::filesystem::directory_iterator("shaders", ec))
-            if (e.path().filename().string().rfind("cap_ps_", 0) == 0) std::filesystem::remove(e.path(), ec);
+            if (e.path().filename().string().rfind("cap_", 0) == 0) std::filesystem::remove(e.path(), ec);
         for (auto &[k, v] : g_ps) v.dumped = false;
+        g_vs_dumped.clear();
         LOG("rsx", "capture: logging draws of frame %u, dumping its surfaces at the end", g_frame);
     }
     if (getenv("KZ2_TRACE_DRAWS") && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
