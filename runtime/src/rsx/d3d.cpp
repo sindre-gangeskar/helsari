@@ -85,6 +85,7 @@ ID3D11PixelShader *g_present_ps;
 ID3D11PixelShader *g_depth_color_ps;    // depth -> RSX D24S8 bytes as A8R8G8B8
 ID3D11PixelShader *g_reinterpret_ps;    // A8R8G8B8 texels -> another 32-bit texture format
 ID3D11Buffer *g_cb_pass;                // mode constant for the conversion passes
+ID3D11Buffer *g_cb_unit_uv;             // uvscale (1, 1) for g_present_vs in run_pass
 std::unordered_map<uint64_t, ID3D11VertexShader *> g_vs;
 struct PsEntry { ID3D11PixelShader *ps; std::vector<uint32_t> consts; };
 std::unordered_map<uint64_t, PsEntry> g_ps;
@@ -558,6 +559,11 @@ void run_pass(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, uint32
     g_ctx->OMSetDepthStencilState(nullptr, 0);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_ctx->VSSetShader(g_present_vs, nullptr, 0);
+    // g_present_vs scales its texture coordinates by uvscale (VS b0). Bind (1, 1):
+    // otherwise b0 still holds the game's vertex constants from the last draw, and
+    // every helper pass (depth read as colour, G-buffer reinterpretation) sampled
+    // its source mirrored or scaled by whatever c[0] happened to be.
+    g_ctx->VSSetConstantBuffers(0, 1, &g_cb_unit_uv);
     g_ctx->PSSetShader(ps, nullptr, 0);
     uint32_t m[4] = {mode, 0, 0, 0};
     upload_cb(g_cb_pass, m, sizeof m);
@@ -1456,6 +1462,8 @@ bool create_device() {
     g_cb_vx = make_cb(64);
     g_cb_px = make_cb(32 + 256 + 128 * 16);
     g_cb_present = make_cb(16);
+    g_cb_unit_uv = make_cb(16);
+    { float one[4] = {1, 1, 0, 0}; upload_cb(g_cb_unit_uv, one, sizeof one); }
     for (auto &a : g_vattr) a[0] = a[1] = a[2] = 0, a[3] = 1;
     LOG("rsx", "Direct3D 11 renderer ready");
     return true;

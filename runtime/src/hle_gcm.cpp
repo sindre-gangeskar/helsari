@@ -219,6 +219,15 @@ void fifo_thread() {
             g_fifo_idle_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
             continue;
         }
+        // Experiment (KZ2_RSX_RESUME_DELAY_MS): after idling, give in-flight SPU writes
+        // time to land before running the commands just released - tests whether
+        // the RSX overtakes data the SPUs write after releasing it.
+        static const int resume_ms = getenv("KZ2_RSX_RESUME_DELAY_MS") ? atoi(getenv("KZ2_RSX_RESUME_DELAY_MS")) : 0;
+        if (idle && resume_ms > 0) {
+            host_sleep_us(resume_ms * 1000);
+            idle = 0;
+            continue;   // re-read put/get: more may have been released meanwhile
+        }
         idle = 0;
         if (trace && put != last_put) { LOG("rsx", "put=0x%x get=0x%x", put, get); last_put = put; }
         uint32_t ea = io_ea(get);
