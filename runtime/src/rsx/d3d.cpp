@@ -501,6 +501,25 @@ DXGI_FORMAT decode(uint32_t ea, uint32_t fmt, uint32_t w, uint32_t h, uint32_t p
     }
     // One or two components per big-endian word: swap each word into a
     // matching D3D format (Y16_X16: Y in the high half, so X lands in R).
+    // X16: one 16-bit value that the RSX returns in every channel (Killzone 2 reads its
+    // quarter-size depth through remap 0xee, i.e. from the blue channel); replicated
+    // into R16G16B16A16. KZ2_X16_RED_ONLY=1: old behaviour (value in red only).
+    static const bool x16_red = getenv("KZ2_X16_RED_ONLY") && atoi(getenv("KZ2_X16_RED_ONLY"));
+    if (base == 0x94 && !x16_red) {
+        if (!pitch || !linear) pitch = w * 2;
+        uint32_t lw = log2u(w), lh = log2u(h);
+        const uint8_t *src = (const uint8_t *)mem::ptr(ea);
+        row = w * 8;
+        out.resize((size_t)row * h);
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                size_t o = linear ? (size_t)y * pitch + (size_t)x * 2 : (size_t)swizzled_offset(x, y, lw, lh) * 2;
+                uint16_t v = (uint16_t)(src[o] << 8 | src[o + 1]);
+                uint16_t *d = (uint16_t *)&out[(size_t)y * row + (size_t)x * 8];
+                d[0] = d[1] = d[2] = d[3] = v;
+            }
+        return DXGI_FORMAT_R16G16B16A16_UNORM;
+    }
     if (base == 0x94 || base == 0x95 || base == 0x9c || base == 0x9f) {
         uint32_t bpp = base == 0x94 ? 2 : 4;
         if (!pitch || !linear) pitch = w * bpp;
@@ -1268,7 +1287,7 @@ void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = f
     DXGI_FORMAT f = vd.Format;
     int bpp = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ? 4
             : f == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : f == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16
-            : f == DXGI_FORMAT_R16_UNORM ? 2 : f == DXGI_FORMAT_R16G16_FLOAT ? 4 : 0;
+            : f == DXGI_FORMAT_R16_UNORM ? 2 : f == DXGI_FORMAT_R16G16_FLOAT ? 4 : f == DXGI_FORMAT_R16G16B16A16_UNORM ? 8 : 0;
     if (!bpp || d.SampleDesc.Count != 1) { tex->Release(); return; }
     D3D11_TEXTURE2D_DESC sd = d;
     sd.MipLevels = 1, sd.ArraySize = 1, sd.Usage = D3D11_USAGE_STAGING, sd.BindFlags = 0, sd.MiscFlags = 0;
@@ -1298,7 +1317,7 @@ void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = f
                 else if (f == DXGI_FORMAT_R24_UNORM_X8_TYPELESS) {
                     uint32_t w; memcpy(&w, q, 4); float z = (w & 0xffffff) / 16777215.f;
                     c[0] = c[1] = c[2] = u8(1 - (1 - z) * 50);    // stretched: depth bunches near 1
-                } else if (f == DXGI_FORMAT_R16_UNORM) {
+                } else if (f == DXGI_FORMAT_R16_UNORM || f == DXGI_FORMAT_R16G16B16A16_UNORM) {
                     uint16_t w; memcpy(&w, q, 2); c[0] = c[1] = c[2] = u8(w / 65535.f);
                 } else if (f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R16G16_FLOAT) {
                     int n = f == DXGI_FORMAT_R16G16_FLOAT ? 2 : 3;
