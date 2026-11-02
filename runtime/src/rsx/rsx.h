@@ -23,7 +23,11 @@ uint32_t io_ea(uint32_t off);          // 0 if unmapped
 uint32_t ea_for(uint32_t location, uint32_t off); // location: 0 local, 1 main
 
 /* shader translation (vp.cpp / fp.cpp) */
-struct VpInfo { std::string hlsl; uint64_t hash; };
+// Constant windows (in vec4 units, multiples of 16): the shader reads c[lo_base ..
+// lo_base+lo_count) as cbuffer b0 and c[hi_base .. hi_base+hi_count) as b2 (hi_count 0:
+// none). Shaders with relative addressing use the whole 512 in b0.
+struct VpInfo { std::string hlsl; uint64_t hash; uint16_t lo_base = 0, lo_count = 512, hi_base = 0, hi_count = 0; };
+extern bool g_vp_windows;   // false: always the whole 512 (no D3D11.1 constant buffer offsets)
 VpInfo translate_vp(uint32_t start, const uint8_t afmt[16]);
 
 enum TexDim : uint8_t { TEX_2D = 0, TEX_CUBE = 1, TEX_3D = 2 };

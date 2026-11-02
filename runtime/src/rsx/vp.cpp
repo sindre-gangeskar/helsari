@@ -3,11 +3,14 @@
 // Each instruction is 4 words (D0..D3) issuing one vector op and one scalar
 // op in parallel. Source operands are 17-bit fields split across words.
 #include "rsx.h"
+#include <cctype>
+#include <cstdlib>
 
 #include <cstdio>
 #include <set>
 
 namespace rsx {
+bool g_vp_windows = false;
 namespace {
 inline uint32_t bits(uint32_t v, int lo, int n) { return (v >> lo) & ((1u << n) - 1); }
 
@@ -228,6 +231,45 @@ VpInfo translate_vp(uint32_t start, const uint8_t afmt[16]) {
     h += "  res.cd0 = clipm0.yzw == 0 ? 1 : o[5].yzw * clipm0.yzw;\n"
          "  res.cd1 = clipm1.yzw == 0 ? 1 : o[6].yzw * clipm1.yzw;\n";
     h += "  return res;\n}\n";
-    return {h, fnv(h.data(), h.size())};
+    // Constant windows: upload/bind only what the shader reads (see VpInfo).
+    VpInfo vi;
+    bool relative = h.find("c[(") != std::string::npos;
+    const std::string decl = "cbuffer VC : register(b0) { float4 c[512]; };\n";
+    size_t dpos = h.find(decl);
+    if (g_vp_windows && !relative && dpos != std::string::npos) {
+        h.erase(dpos, decl.size());   // the declaration itself is not a reference
+        int lo = 512, lhi = -1, hlo = 512, hhi = -1;
+        for (size_t at = h.find("c["); at != std::string::npos; at = h.find("c[", at + 2)) {
+            if (at && (isalnum((unsigned char)h[at - 1]) || h[at - 1] == '_')) continue;
+            int k = atoi(h.c_str() + at + 2);
+            if (k < 448) lo = std::min(lo, k), lhi = std::max(lhi, k);
+            else hlo = std::min(hlo, k), hhi = std::max(hhi, k);
+        }
+        auto win = [](int a, int b, uint16_t &base, uint16_t &count) {
+            if (b < 0) { base = 0, count = 0; return; }
+            base = (uint16_t)(a & ~15), count = (uint16_t)(((b - base) / 16 + 1) * 16);
+        };
+        win(lo, lhi, vi.lo_base, vi.lo_count);
+        win(hlo, hhi, vi.hi_base, vi.hi_count);
+        std::string out;
+        size_t last = 0;
+        for (size_t at = h.find("c["); at != std::string::npos; at = h.find("c[", at + 2)) {
+            if (at && (isalnum((unsigned char)h[at - 1]) || h[at - 1] == '_')) continue;
+            int k = atoi(h.c_str() + at + 2);
+            size_t close = h.find(']', at);
+            out += h.substr(last, at - last);
+            out += k < 448 ? "c[" + std::to_string(k - vi.lo_base) + "]" : "ch[" + std::to_string(k - vi.hi_base) + "]";
+            last = close + 1;
+        }
+        h = out + h.substr(last);
+        std::string repl = "cbuffer VC : register(b0) { float4 c[" + std::to_string(std::max<int>(vi.lo_count, 16)) +
+                           "]; };\n";
+        if (vi.hi_count) repl += "cbuffer VCH : register(b2) { float4 ch[" + std::to_string(vi.hi_count) + "]; };\n";
+        h.insert(dpos, repl);
+        if (!vi.lo_count) vi.lo_count = 16;   // bind something at b0 anyway
+    }
+    vi.hlsl = h;
+    vi.hash = fnv(h.data(), h.size());
+    return vi;
 }
 } // namespace rsx

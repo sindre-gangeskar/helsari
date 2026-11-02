@@ -33,6 +33,20 @@ INDIRECT = {'BI', 'BISL', 'BIZ', 'BINZ', 'BIHZ', 'BIHNZ'}
 TO_INTERP = {'STOP', 'STOPD', 'IRET', 'BISLED', 'INVALID'}   # the interpreter runs these
 CHANNEL = {'RDCH', 'RCHCNT', 'WRCH'}
 HALT = {'HEQ', 'HEQI', 'HGT', 'HGTI', 'HLGT', 'HLGTI'}
+# Instructions that write no register (everything else writes rt; see reg_fields).
+NO_WRITE = {'STQD', 'STQX', 'STQA', 'STQR', 'BR', 'BRA', 'BRZ', 'BRNZ', 'BRHZ', 'BRHNZ', 'BI', 'BIZ', 'BINZ', 'BIHZ',
+            'BIHNZ', 'WRCH', 'STOP', 'STOPD', 'LNOP', 'NOP', 'SYNC', 'DSYNC', 'IRET', 'HBR', 'HBRA', 'HBRR', 'MTSPR',
+            'INVALID'} | HALT
+
+
+def reg_fields(op, fmt, x):
+    """(registers an instruction may read or write, register it writes or None).
+    Over-approximates reads: every 7-bit register field of the encoding."""
+    rt = (x >> 21) & 0x7f if fmt == 'Q' else x & 0x7f
+    used = {x & 0x7f, (x >> 7) & 0x7f, (x >> 14) & 0x7f}
+    if fmt == 'Q':
+        used.add((x >> 21) & 0x7f)
+    return used, (None if op in NO_WRITE else rt)
 
 
 def load_ops():
@@ -58,6 +72,9 @@ class Decoder:
 
     def op(self, x):
         return self.ops[self.table[x >> 21]][0]
+
+    def fmt(self, x):
+        return self.ops[self.table[x >> 21]][4]
 
 
 def sext16(v):
@@ -202,18 +219,30 @@ def gen_module(dec, m, prefix):
                 if t <= pc:   # backward: let pending interrupts in, as the interpreter would
                     return f'if (t.interrupts) {{ next = 0x{t:x}; goto redispatch; }} goto L_{t:x};'
                 return f'goto L_{t:x};'
-            return f'return 0x{t:x};'
+            return f'{{ ret = 0x{t:x}; goto out; }}'
 
+        # SPU registers live in a local array g for the whole function: loaded on entry
+        # (those the chunk's code uses), written back at the single exit (those it writes).
+        used, written = set(), set()
+        for k in range((lo - m.ls_base) // 4, (hi - m.ls_base) // 4):
+            if m.is_code(pcs[k]):
+                u, w = reg_fields(ops[k], dec.fmt(words[k]), words[k])
+                used |= u
+                if w is not None:
+                    written.add(w)
         o = [f'uint32_t {fn}(SpuThread &t, uint32_t next) {{',
              '    const uint32_t epoch = t.code_epoch;',
-             '    goto dispatch;',
-             'redispatch:',
-             '    if (t.interrupts && t.poll_interrupt(next)) return next;',
-             '    if (t.code_epoch != epoch) return next;',
-             'dispatch:',
-             '    switch (next) {']
+             '    uint32_t ret;',
+             '    V g[128];']
+        o += [f'    g[{r}] = t.gpr[{r}];' for r in sorted(used)]
+        o += ['    goto dispatch;',
+              'redispatch:',
+              '    if (t.interrupts && t.poll_interrupt(next)) { ret = next; goto out; }',
+              '    if (t.code_epoch != epoch) { ret = next; goto out; }',
+              'dispatch:',
+              '    switch (next) {']
         o += [f'    case 0x{s:x}: goto L_{s:x};' for s in labels]
-        o += ['    default: return next;', '    }']
+        o += ['    default: ret = next; goto out;', '    }']
         for k in range((lo - m.ls_base) // 4, (hi - m.ls_base) // 4):
             x, op, pc = words[k], ops[k], pcs[k]
             nxt = (pc + 4) & LS_MASK
@@ -221,9 +250,9 @@ def gen_module(dec, m, prefix):
                 continue
             if pc in starts:
                 o.append(f'L_{pc:x}:')
-            s = f'step<{op}>(t, 0x{x:08x}u, 0x{pc:x}u)'
+            s = f'step_r<{op}>(t, g, 0x{x:08x}u, 0x{pc:x}u)'
             if op in TO_INTERP:
-                o.append(f'    t.interp_once = true; return 0x{pc:x};')
+                o.append(f'    t.interp_once = true; ret = 0x{pc:x}; goto out;')
             elif op in DIRECT:
                 o.append(f'    {s}; {jump(branch_target(op, x, pc), pc)}')
             elif op in COND:
@@ -234,14 +263,17 @@ def gen_module(dec, m, prefix):
                 else:
                     o.append(f'    {{ uint32_t n = {s}; if (n != 0x{nxt:x}u) {{ next = n; goto redispatch; }} }}')
             elif op in CHANNEL:
-                o.append(f'    t.pc = 0x{pc:x}; {s}; if (!t.running || t.code_epoch != epoch) return 0x{nxt:x};')
+                o.append(f'    t.pc = 0x{pc:x}; {s}; if (!t.running || t.code_epoch != epoch) {{ ret = 0x{nxt:x}; goto out; }}')
             elif op in HALT:
-                o.append(f'    {s}; if (!t.running) return 0x{nxt:x};')
+                o.append(f'    {s}; if (!t.running) {{ ret = 0x{nxt:x}; goto out; }}')
             else:
                 o.append(f'    {s};')
             if m.ls_base <= nxt < m.end and not m.is_code(nxt):
-                o.append(f'    return 0x{nxt:x};')   # falls into data: not compiled
-        o.append(f'    return 0x{hi & LS_MASK:x};')
+                o.append(f'    ret = 0x{nxt:x}; goto out;')   # falls into data: not compiled
+        o.append(f'    ret = 0x{hi & LS_MASK:x};')
+        o.append('out:')
+        o += [f'    t.gpr[{r}] = g[{r}];' for r in sorted(written)]
+        o.append('    return ret;')
         o.append('}')
         out.append('\n'.join(o))
     return '\n\n'.join(out) + '\n', entries, fns

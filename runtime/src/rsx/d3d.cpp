@@ -94,6 +94,9 @@ ID3D11Buffer *g_cb_pass;                // mode constant for the conversion pass
 ID3D11Buffer *g_cb_unit_uv;             // uvscale (1, 1) for g_present_vs in run_pass
 std::unordered_map<uint64_t, ID3D11VertexShader *> g_vs;
 std::unordered_map<uint64_t, std::string> g_vs_hlsl;   // translated source, for the frame capture
+struct VsWin { uint16_t lo_base = 0, lo_count = 512, hi_base = 0, hi_count = 0; };
+std::unordered_map<uint64_t, VsWin> g_vs_win;          // constant windows per shader (VpInfo)
+VsWin g_cur_win;                                        // of the current draw's shader
 std::unordered_map<uint64_t, bool> g_vs_dumped;
 struct PsEntry { ID3D11PixelShader *ps; std::vector<uint32_t> consts; std::string hlsl; uint32_t control; bool dumped; };
 std::unordered_map<uint64_t, PsEntry> g_ps;
@@ -1243,7 +1246,7 @@ ID3D11VertexShader *vertex_shader() {
     h = fnv(afmt, 16, h);
     g_vs_hash = h;
     auto it = g_vs.find(h);
-    if (it != g_vs.end()) return it->second;
+    if (it != g_vs.end()) { g_cur_win = g_vs_win[h]; return it->second; }
     VpInfo vi = translate_vp(start, afmt);
     ID3D11VertexShader *vs = nullptr;
     if (ID3DBlob *b = compile(vi.hlsl, "vs_5_0", h)) {
@@ -1252,6 +1255,7 @@ ID3D11VertexShader *vertex_shader() {
     }
     g_vs[h] = vs;
     g_vs_hlsl[h] = vi.hlsl;
+    g_cur_win = g_vs_win[h] = {vi.lo_base, vi.lo_count, vi.hi_base, vi.hi_count};
     return vs;
 }
 
@@ -1417,7 +1421,42 @@ void draw() {
     // vertices + indices
     std::vector<uint32_t> src_idx;
     uint32_t vmin = ~0u, vmax = 0;
-    if (g_indexed) {
+    std::vector<uint32_t> list;
+    // Fast path for the common case, one indexed triangle list (libgcm cuts it into
+    // back-to-back ranges): read the big-endian indices straight into the final list,
+    // then rebase them, instead of building intermediate index vectors. A restart
+    // marker in the stream falls back to the general path. KZ2_SLOW_INDEX=1: always general.
+    static const bool slow_index = getenv("KZ2_SLOW_INDEX") && atoi(getenv("KZ2_SLOW_INDEX"));
+    bool fast = false;
+    if (g_indexed && g_prim == 5 && !slow_index) {
+        bool chained = true;
+        uint64_t total = 0;
+        for (size_t i = 0; i < g_ranges.size(); i++) {
+            if (i && g_ranges[i].first != g_ranges[i - 1].first + g_ranges[i - 1].count) chained = false;
+            total += g_ranges[i].count;
+        }
+        total -= total % 3;
+        if (chained && total) {
+            uint32_t loc = reg(0x1820) & 0xf, type = (reg(0x1820) >> 4) & 0xf;
+            uint32_t ea = ea_for(loc ? 1 : 0, reg(0x181c)) + (type ? 2 : 4) * g_ranges[0].first;
+            bool restart = reg(0x1dac) & 1;
+            uint32_t rval = reg(0x1db0);
+            const uint8_t *p = (const uint8_t *)mem::ptr(ea);
+            list.resize((size_t)total);
+            fast = true;
+            for (size_t i = 0; i < total; i++) {
+                uint32_t v;
+                if (type) v = (uint32_t)p[2 * i] << 8 | p[2 * i + 1];
+                else { memcpy(&v, p + 4 * i, 4); v = __builtin_bswap32(v); }
+                if (restart && v == rval) { fast = false; break; }
+                list[i] = v;
+                vmin = std::min(vmin, v), vmax = std::max(vmax, v);
+            }
+            if (!fast) list.clear(), vmin = ~0u, vmax = 0;
+        }
+    }
+    if (fast) {
+    } else if (g_indexed) {
         uint32_t loc = reg(0x1820) & 0xf, type = (reg(0x1820) >> 4) & 0xf;
         uint32_t ea = ea_for(loc ? 1 : 0, reg(0x181c));
         bool restart = reg(0x1dac) & 1;
@@ -1448,7 +1487,7 @@ void draw() {
     if (leak_mode() != 2 && !cpu_vertex) {
         ScopedUs timer{g_fetch_us};
         g_fetch_verts += nv;
-        g_fetch_used += src_idx.size();
+        g_fetch_used += fast ? list.size() : src_idx.size();
         uint32_t mask = reg(0x1ff0), base_off = reg(0x1738), base_idx = reg(0x173c);
         struct Span { uint64_t lo, hi; int attr; };
         Span spans[16];
@@ -1489,7 +1528,7 @@ void draw() {
     } else if (leak_mode() != 2) {
         ScopedUs timer{g_fetch_us};
         g_fetch_verts += nv;
-        g_fetch_used += src_idx.size();
+        g_fetch_used += fast ? list.size() : src_idx.size();
         // Decode into ordinary memory, then copy once: the mapped buffer is
         // write-combined, where scattered partial writes are very slow.
         static std::vector<float> scratch;
@@ -1505,7 +1544,6 @@ void draw() {
         base_vertex = 0;
     }
 
-    std::vector<uint32_t> list;
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     // split at restart markers / range boundaries for strip-like primitives
     std::vector<uint32_t> run;
@@ -1521,16 +1559,20 @@ void draw() {
     // markers or where a range does not continue the previous one. (Per range, a
     // triangle list dropped 256 % 3 = 1 index per piece and every later triangle was
     // built from the wrong vertices.)
-    uint32_t next_first = ~0u;
-    for (auto &r : g_ranges) {
-        if (r.first != next_first) flush_run();
-        next_first = r.first + r.count;
-        for (uint32_t i = 0; i < r.count && at < src_idx.size(); i++, at++) {
-            if (src_idx[at] == ~0u) { flush_run(); continue; }
-            run.push_back(src_idx[at]);
+    if (fast) {
+        for (auto &v : list) v -= vmin;
+    } else {
+        uint32_t next_first = ~0u;
+        for (auto &r : g_ranges) {
+            if (r.first != next_first) flush_run();
+            next_first = r.first + r.count;
+            for (uint32_t i = 0; i < r.count && at < src_idx.size(); i++, at++) {
+                if (src_idx[at] == ~0u) { flush_run(); continue; }
+                run.push_back(src_idx[at]);
+            }
         }
+        flush_run();
     }
-    flush_run();
     if (list.empty()) { g_skip[4]++; return; }
     if (leak_mode() != 2) {
         uint32_t *id = (uint32_t *)ring_map(g_iring, (UINT)list.size() * 4, 4, D3D11_BIND_INDEX_BUFFER, false, &start_index);
@@ -1602,11 +1644,20 @@ void draw() {
 
     // constants
     lap(3);
-    static CbSlice s_vc, s_vx, s_px;   // static: a skipped upload (leak_mode 3) keeps the last binding
+    static CbSlice s_vc, s_vx, s_px, s_vch;   // static: a skipped upload (leak_mode 3) keeps the last binding
     const bool cb_on = leak_mode() != 3;
+    // Vertex constants: only the windows the shader reads (VpInfo), re-sent when the
+    // constants or the windows changed.
+    static VsWin last_win{0xffff, 0, 0, 0};
+    auto push_vc = [&] {
+        s_vc = cb_push(&vp_consts[g_cur_win.lo_base * 4], g_cur_win.lo_count * 16);
+        s_vch = g_cur_win.hi_count ? cb_push(&vp_consts[g_cur_win.hi_base * 4], g_cur_win.hi_count * 16) : s_vc;
+        last_win = g_cur_win;
+    };
+    bool win_changed = memcmp(&last_win, &g_cur_win, sizeof last_win) != 0;
     if (!cb_on) {
     } else if (g_cbring) {
-        if (vp_consts_dirty || s_vc.gen != g_cbring_gen) s_vc = cb_push(vp_consts, sizeof vp_consts);
+        if (vp_consts_dirty || win_changed || s_vc.gen != g_cbring_gen) push_vc();
     } else if (vp_consts_dirty) {
         upload_cb(g_cb_vc, vp_consts, sizeof vp_consts);
     }
@@ -1654,7 +1705,7 @@ void draw() {
     if (!cb_on) {
     } else if (g_cbring) s_px = cb_push(&px, 32 + 256 + ps->consts.size() * 16);
     else upload_cb(g_cb_px, &px, 32 + 256 + ps->consts.size() * 16);
-    if (cb_on && g_cbring && s_vx.gen != s_vc.gen) s_vc = cb_push(vp_consts, sizeof vp_consts);   // ring wrapped in between
+    if (cb_on && g_cbring && s_vx.gen != s_vc.gen) push_vc();   // ring wrapped in between
     if ((int)g_frame == g_log_frame) {
         float f[8];
         memcpy(f, px.fc, 32);
@@ -1783,9 +1834,9 @@ void draw() {
     g_ctx->PSSetShader(ps->ps, nullptr, 0);
     ID3D11Buffer *vcb[2] = {g_cb_vc, g_cb_vx};
     if (g_cbring) {
-        ID3D11Buffer *rings[2] = {g_cbring, g_cbring};
-        UINT first[2] = {s_vc.first, s_vx.first}, num[2] = {s_vc.num, s_vx.num};
-        g_ctx1->VSSetConstantBuffers1(0, 2, rings, first, num);
+        ID3D11Buffer *rings[3] = {g_cbring, g_cbring, g_cbring};
+        UINT first[3] = {s_vc.first, s_vx.first, s_vch.first}, num[3] = {s_vc.num, s_vx.num, s_vch.num};
+        g_ctx1->VSSetConstantBuffers1(0, 3, rings, first, num);
         g_ctx1->PSSetConstantBuffers1(0, 1, &g_cbring, &s_px.first, &s_px.num);
     } else {
         g_ctx->VSSetConstantBuffers(0, 2, vcb);
@@ -2021,6 +2072,7 @@ bool create_device() {
     if (opts.ConstantBufferOffsetting && opts.MapNoOverwriteOnDynamicConstantBuffer &&
         SUCCEEDED(g_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&g_ctx1))) {
         g_cbring = make_cb(CBRING_SIZE);
+        g_vp_windows = g_cbring != nullptr;   // constant windows need buffer offsets (D3D11.1)
         if (!g_cbring) release(g_ctx1);
     }
     if (!g_cbring) LOG("rsx", "driver lacks constant buffer offsets: constants are re-uploaded per draw");

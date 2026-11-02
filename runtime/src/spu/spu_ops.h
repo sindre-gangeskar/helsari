@@ -319,10 +319,13 @@ inline uint32_t sat_u32(double v) { return v >= 4294967295.0 ? 0xffffffffu : v <
 
 #define SPU_INLINE inline __attribute__((always_inline))
 
-template <Op OP> SPU_INLINE uint32_t step(SpuThread &t, uint32_t x, uint32_t pc) {
+// One instruction on register file gpr: t.gpr for the interpreter, a function-local
+// copy in recompiled code (tools/recomp/spu.py), which the compiler can keep in
+// host registers - t.gpr itself may be aliased by every LS store.
+template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, uint32_t pc) {
     uint32_t next = (pc + 4) & (LS_SIZE - 4);
     uint32_t rt = x & 0x7f, ra = (x >> 7) & 0x7f, rb = (x >> 14) & 0x7f;
-    const V &va = t.gpr[ra], &vb = t.gpr[rb];
+    const V &va = gpr[ra], &vb = gpr[rb];
     V r{};
     int32_t i7 = sext(rb, 7), i10 = sext((x >> 14) & 0x3ff, 10);
     uint32_t i16 = (x >> 7) & 0xffff;
@@ -336,174 +339,174 @@ template <Op OP> SPU_INLINE uint32_t step(SpuThread &t, uint32_t x, uint32_t pc)
     }
     switch (OP) {
     /* ---------- memory ---------- */
-    case LQD: t.gpr[rt] = t.lq((va.w[0] + (i10 << 4)) & (LS_SIZE - 16)); break;
-    case LQX: t.gpr[rt] = t.lq((va.w[0] + vb.w[0]) & (LS_SIZE - 16)); break;
-    case LQA: t.gpr[rt] = t.lq((i16 << 2) & (LS_SIZE - 16)); break;
-    case LQR: t.gpr[rt] = t.lq((pc + (s16 << 2)) & (LS_SIZE - 16)); break;
-    case STQD: t.stq((va.w[0] + (i10 << 4)) & (LS_SIZE - 16), t.gpr[rt]); break;
-    case STQX: t.stq((va.w[0] + vb.w[0]) & (LS_SIZE - 16), t.gpr[rt]); break;
-    case STQA: t.stq((i16 << 2) & (LS_SIZE - 16), t.gpr[rt]); break;
-    case STQR: t.stq((pc + (s16 << 2)) & (LS_SIZE - 16), t.gpr[rt]); break;
-    case CBD: t.gpr[rt] = insert_mask(va.w[0] + i7, 1); break;
-    case CHD: t.gpr[rt] = insert_mask(va.w[0] + i7, 2); break;
-    case CWD: t.gpr[rt] = insert_mask(va.w[0] + i7, 4); break;
-    case CDD: t.gpr[rt] = insert_mask(va.w[0] + i7, 8); break;
-    case CBX: t.gpr[rt] = insert_mask(va.w[0] + vb.w[0], 1); break;
-    case CHX: t.gpr[rt] = insert_mask(va.w[0] + vb.w[0], 2); break;
-    case CWX: t.gpr[rt] = insert_mask(va.w[0] + vb.w[0], 4); break;
-    case CDX: t.gpr[rt] = insert_mask(va.w[0] + vb.w[0], 8); break;
+    case LQD: gpr[rt] = t.lq((va.w[0] + (i10 << 4)) & (LS_SIZE - 16)); break;
+    case LQX: gpr[rt] = t.lq((va.w[0] + vb.w[0]) & (LS_SIZE - 16)); break;
+    case LQA: gpr[rt] = t.lq((i16 << 2) & (LS_SIZE - 16)); break;
+    case LQR: gpr[rt] = t.lq((pc + (s16 << 2)) & (LS_SIZE - 16)); break;
+    case STQD: t.stq((va.w[0] + (i10 << 4)) & (LS_SIZE - 16), gpr[rt]); break;
+    case STQX: t.stq((va.w[0] + vb.w[0]) & (LS_SIZE - 16), gpr[rt]); break;
+    case STQA: t.stq((i16 << 2) & (LS_SIZE - 16), gpr[rt]); break;
+    case STQR: t.stq((pc + (s16 << 2)) & (LS_SIZE - 16), gpr[rt]); break;
+    case CBD: gpr[rt] = insert_mask(va.w[0] + i7, 1); break;
+    case CHD: gpr[rt] = insert_mask(va.w[0] + i7, 2); break;
+    case CWD: gpr[rt] = insert_mask(va.w[0] + i7, 4); break;
+    case CDD: gpr[rt] = insert_mask(va.w[0] + i7, 8); break;
+    case CBX: gpr[rt] = insert_mask(va.w[0] + vb.w[0], 1); break;
+    case CHX: gpr[rt] = insert_mask(va.w[0] + vb.w[0], 2); break;
+    case CWX: gpr[rt] = insert_mask(va.w[0] + vb.w[0], 4); break;
+    case CDX: gpr[rt] = insert_mask(va.w[0] + vb.w[0], 8); break;
 
     /* ---------- constants ---------- */
-    case ILH: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)i16); t.gpr[rt] = r; break;
-    case ILHU: t.gpr[rt] = splat(i16 << 16); break;
-    case IL: t.gpr[rt] = splat((uint32_t)s16); break;
-    case IOHL: for (int i = 0; i < 4; i++) t.gpr[rt].w[i] |= i16; break;
-    case ILA: t.gpr[rt] = splat((x >> 7) & 0x3ffff); break;
-    case FSMBI: for (int i = 0; i < 16; i++) r.set_b(i, (i16 >> (15 - i)) & 1 ? 0xff : 0); t.gpr[rt] = r; break;
+    case ILH: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)i16); gpr[rt] = r; break;
+    case ILHU: gpr[rt] = splat(i16 << 16); break;
+    case IL: gpr[rt] = splat((uint32_t)s16); break;
+    case IOHL: for (int i = 0; i < 4; i++) gpr[rt].w[i] |= i16; break;
+    case ILA: gpr[rt] = splat((x >> 7) & 0x3ffff); break;
+    case FSMBI: for (int i = 0; i < 16; i++) r.set_b(i, (i16 >> (15 - i)) & 1 ? 0xff : 0); gpr[rt] = r; break;
 
     /* ---------- integer arithmetic ---------- */
-    case AH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) + vb.h(i)); t.gpr[rt] = r; break;
-    case AHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) + (uint16_t)i10); t.gpr[rt] = r; break;
-    case A: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + vb.w[i]; t.gpr[rt] = r; break;
-    case AI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + (uint32_t)i10; t.gpr[rt] = r; break;
-    case SFH: for (int i = 0; i < 8; i++) r.set_h(i, vb.h(i) - va.h(i)); t.gpr[rt] = r; break;
-    case SFHI: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)i10 - va.h(i)); t.gpr[rt] = r; break;
-    case SF: for (int i = 0; i < 4; i++) r.w[i] = vb.w[i] - va.w[i]; t.gpr[rt] = r; break;
-    case SFI: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)i10 - va.w[i]; t.gpr[rt] = r; break;
-    case ADDX: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + vb.w[i] + (t.gpr[rt].w[i] & 1); t.gpr[rt] = r; break;
-    case CG: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((uint64_t)va.w[i] + vb.w[i]) >> 32); t.gpr[rt] = r; break;
-    case CGX: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((uint64_t)va.w[i] + vb.w[i] + (t.gpr[rt].w[i] & 1)) >> 32); t.gpr[rt] = r; break;
-    case SFX: for (int i = 0; i < 4; i++) r.w[i] = vb.w[i] - va.w[i] - (1 - (t.gpr[rt].w[i] & 1)); t.gpr[rt] = r; break;
-    case BG: for (int i = 0; i < 4; i++) r.w[i] = vb.w[i] >= va.w[i]; t.gpr[rt] = r; break;
+    case AH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) + vb.h(i)); gpr[rt] = r; break;
+    case AHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) + (uint16_t)i10); gpr[rt] = r; break;
+    case A: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + vb.w[i]; gpr[rt] = r; break;
+    case AI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + (uint32_t)i10; gpr[rt] = r; break;
+    case SFH: for (int i = 0; i < 8; i++) r.set_h(i, vb.h(i) - va.h(i)); gpr[rt] = r; break;
+    case SFHI: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)i10 - va.h(i)); gpr[rt] = r; break;
+    case SF: for (int i = 0; i < 4; i++) r.w[i] = vb.w[i] - va.w[i]; gpr[rt] = r; break;
+    case SFI: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)i10 - va.w[i]; gpr[rt] = r; break;
+    case ADDX: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + vb.w[i] + (gpr[rt].w[i] & 1); gpr[rt] = r; break;
+    case CG: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((uint64_t)va.w[i] + vb.w[i]) >> 32); gpr[rt] = r; break;
+    case CGX: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((uint64_t)va.w[i] + vb.w[i] + (gpr[rt].w[i] & 1)) >> 32); gpr[rt] = r; break;
+    case SFX: for (int i = 0; i < 4; i++) r.w[i] = vb.w[i] - va.w[i] - (1 - (gpr[rt].w[i] & 1)); gpr[rt] = r; break;
+    case BG: for (int i = 0; i < 4; i++) r.w[i] = vb.w[i] >= va.w[i]; gpr[rt] = r; break;
     case BGX:
         for (int i = 0; i < 4; i++)
-            r.w[i] = (t.gpr[rt].w[i] & 1) ? vb.w[i] >= va.w[i] : vb.w[i] > va.w[i];
-        t.gpr[rt] = r;
+            r.w[i] = (gpr[rt].w[i] & 1) ? vb.w[i] >= va.w[i] : vb.w[i] > va.w[i];
+        gpr[rt] = r;
         break;
-    case MPY: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * (int16_t)vb.w[i]); t.gpr[rt] = r; break;
-    case MPYU: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] & 0xffff) * (vb.w[i] & 0xffff); t.gpr[rt] = r; break;
-    case MPYI: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * i10); t.gpr[rt] = r; break;
-    case MPYUI: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] & 0xffff) * ((uint32_t)i10 & 0xffff); t.gpr[rt] = r; break;
+    case MPY: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * (int16_t)vb.w[i]); gpr[rt] = r; break;
+    case MPYU: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] & 0xffff) * (vb.w[i] & 0xffff); gpr[rt] = r; break;
+    case MPYI: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * i10); gpr[rt] = r; break;
+    case MPYUI: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] & 0xffff) * ((uint32_t)i10 & 0xffff); gpr[rt] = r; break;
     case MPYA: {
-        const V &C = t.gpr[rt];
+        const V &C = gpr[rt];
         for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * (int16_t)vb.w[i]) + C.w[i];
-        t.gpr[(x >> 21) & 0x7f] = r;
+        gpr[(x >> 21) & 0x7f] = r;
         break;
     }
-    case MPYH: for (int i = 0; i < 4; i++) r.w[i] = ((va.w[i] >> 16) * (vb.w[i] & 0xffff)) << 16; t.gpr[rt] = r; break;
-    case MPYS: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((int16_t)va.w[i] * (int16_t)vb.w[i]) >> 16); t.gpr[rt] = r; break;
-    case MPYHH: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)(va.w[i] >> 16) * (int16_t)(vb.w[i] >> 16)); t.gpr[rt] = r; break;
-    case MPYHHA: for (int i = 0; i < 4; i++) r.w[i] = t.gpr[rt].w[i] + (uint32_t)((int16_t)(va.w[i] >> 16) * (int16_t)(vb.w[i] >> 16)); t.gpr[rt] = r; break;
-    case MPYHHU: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] >> 16) * (vb.w[i] >> 16); t.gpr[rt] = r; break;
-    case MPYHHAU: for (int i = 0; i < 4; i++) r.w[i] = t.gpr[rt].w[i] + (va.w[i] >> 16) * (vb.w[i] >> 16); t.gpr[rt] = r; break;
-    case CLZ: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ? __builtin_clz(va.w[i]) : 32; t.gpr[rt] = r; break;
-    case CNTB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)__builtin_popcount(va.b(i))); t.gpr[rt] = r; break;
-    case FSMB: for (int i = 0; i < 16; i++) r.set_b(i, (va.w[0] >> (15 - i)) & 1 ? 0xff : 0); t.gpr[rt] = r; break;
-    case FSMH: for (int i = 0; i < 8; i++) r.set_h(i, (va.w[0] >> (7 - i)) & 1 ? 0xffff : 0); t.gpr[rt] = r; break;
-    case FSM: for (int i = 0; i < 4; i++) r.w[i] = (va.w[0] >> (3 - i)) & 1 ? 0xffffffffu : 0; t.gpr[rt] = r; break;
-    case GBB: { uint32_t v = 0; for (int i = 0; i < 16; i++) v = (v << 1) | (va.b(i) & 1); r.w[0] = v; t.gpr[rt] = r; break; }
-    case GBH: { uint32_t v = 0; for (int i = 0; i < 8; i++) v = (v << 1) | (va.h(i) & 1); r.w[0] = v; t.gpr[rt] = r; break; }
-    case GB: { uint32_t v = 0; for (int i = 0; i < 4; i++) v = (v << 1) | (va.w[i] & 1); r.w[0] = v; t.gpr[rt] = r; break; }
-    case AVGB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)((va.b(i) + vb.b(i) + 1) >> 1)); t.gpr[rt] = r; break;
-    case ABSDB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)std::abs(va.b(i) - vb.b(i))); t.gpr[rt] = r; break;
+    case MPYH: for (int i = 0; i < 4; i++) r.w[i] = ((va.w[i] >> 16) * (vb.w[i] & 0xffff)) << 16; gpr[rt] = r; break;
+    case MPYS: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((int16_t)va.w[i] * (int16_t)vb.w[i]) >> 16); gpr[rt] = r; break;
+    case MPYHH: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)(va.w[i] >> 16) * (int16_t)(vb.w[i] >> 16)); gpr[rt] = r; break;
+    case MPYHHA: for (int i = 0; i < 4; i++) r.w[i] = gpr[rt].w[i] + (uint32_t)((int16_t)(va.w[i] >> 16) * (int16_t)(vb.w[i] >> 16)); gpr[rt] = r; break;
+    case MPYHHU: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] >> 16) * (vb.w[i] >> 16); gpr[rt] = r; break;
+    case MPYHHAU: for (int i = 0; i < 4; i++) r.w[i] = gpr[rt].w[i] + (va.w[i] >> 16) * (vb.w[i] >> 16); gpr[rt] = r; break;
+    case CLZ: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ? __builtin_clz(va.w[i]) : 32; gpr[rt] = r; break;
+    case CNTB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)__builtin_popcount(va.b(i))); gpr[rt] = r; break;
+    case FSMB: for (int i = 0; i < 16; i++) r.set_b(i, (va.w[0] >> (15 - i)) & 1 ? 0xff : 0); gpr[rt] = r; break;
+    case FSMH: for (int i = 0; i < 8; i++) r.set_h(i, (va.w[0] >> (7 - i)) & 1 ? 0xffff : 0); gpr[rt] = r; break;
+    case FSM: for (int i = 0; i < 4; i++) r.w[i] = (va.w[0] >> (3 - i)) & 1 ? 0xffffffffu : 0; gpr[rt] = r; break;
+    case GBB: { uint32_t v = 0; for (int i = 0; i < 16; i++) v = (v << 1) | (va.b(i) & 1); r.w[0] = v; gpr[rt] = r; break; }
+    case GBH: { uint32_t v = 0; for (int i = 0; i < 8; i++) v = (v << 1) | (va.h(i) & 1); r.w[0] = v; gpr[rt] = r; break; }
+    case GB: { uint32_t v = 0; for (int i = 0; i < 4; i++) v = (v << 1) | (va.w[i] & 1); r.w[0] = v; gpr[rt] = r; break; }
+    case AVGB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)((va.b(i) + vb.b(i) + 1) >> 1)); gpr[rt] = r; break;
+    case ABSDB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)std::abs(va.b(i) - vb.b(i))); gpr[rt] = r; break;
     case SUMB:
         for (int i = 0; i < 4; i++) {
             uint16_t sb = 0, sa = 0;
             for (int k = 0; k < 4; k++) sb += vb.b(4 * i + k), sa += va.b(4 * i + k);
             r.w[i] = ((uint32_t)sb << 16) | sa;
         }
-        t.gpr[rt] = r;
+        gpr[rt] = r;
         break;
-    case XSBH: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)(int8_t)va.h(i)); t.gpr[rt] = r; break;
-    case XSHW: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(int16_t)va.w[i]; t.gpr[rt] = r; break;
-    case XSWD: for (int i = 0; i < 2; i++) r.set_d(i, (uint64_t)(int64_t)(int32_t)va.w[2 * i + 1]); t.gpr[rt] = r; break;
+    case XSBH: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)(int8_t)va.h(i)); gpr[rt] = r; break;
+    case XSHW: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(int16_t)va.w[i]; gpr[rt] = r; break;
+    case XSWD: for (int i = 0; i < 2; i++) r.set_d(i, (uint64_t)(int64_t)(int32_t)va.w[2 * i + 1]); gpr[rt] = r; break;
 
     /* ---------- logical ---------- */
-    case AND: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & vb.w[i]; t.gpr[rt] = r; break;
-    case ANDC: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & ~vb.w[i]; t.gpr[rt] = r; break;
-    case ANDBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) & (uint8_t)i10); t.gpr[rt] = r; break;
-    case ANDHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) & (uint16_t)i10); t.gpr[rt] = r; break;
-    case ANDI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & (uint32_t)i10; t.gpr[rt] = r; break;
-    case OR: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | vb.w[i]; t.gpr[rt] = r; break;
-    case ORC: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | ~vb.w[i]; t.gpr[rt] = r; break;
-    case ORBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) | (uint8_t)i10); t.gpr[rt] = r; break;
-    case ORHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) | (uint16_t)i10); t.gpr[rt] = r; break;
-    case ORI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | (uint32_t)i10; t.gpr[rt] = r; break;
-    case ORX: r.w[0] = va.w[0] | va.w[1] | va.w[2] | va.w[3]; t.gpr[rt] = r; break;
-    case XOR: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ^ vb.w[i]; t.gpr[rt] = r; break;
-    case XORBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) ^ (uint8_t)i10); t.gpr[rt] = r; break;
-    case XORHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) ^ (uint16_t)i10); t.gpr[rt] = r; break;
-    case XORI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ^ (uint32_t)i10; t.gpr[rt] = r; break;
-    case NAND: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] & vb.w[i]); t.gpr[rt] = r; break;
-    case NOR: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] | vb.w[i]); t.gpr[rt] = r; break;
-    case EQV: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] ^ vb.w[i]); t.gpr[rt] = r; break;
+    case AND: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & vb.w[i]; gpr[rt] = r; break;
+    case ANDC: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & ~vb.w[i]; gpr[rt] = r; break;
+    case ANDBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) & (uint8_t)i10); gpr[rt] = r; break;
+    case ANDHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) & (uint16_t)i10); gpr[rt] = r; break;
+    case ANDI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & (uint32_t)i10; gpr[rt] = r; break;
+    case OR: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | vb.w[i]; gpr[rt] = r; break;
+    case ORC: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | ~vb.w[i]; gpr[rt] = r; break;
+    case ORBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) | (uint8_t)i10); gpr[rt] = r; break;
+    case ORHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) | (uint16_t)i10); gpr[rt] = r; break;
+    case ORI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | (uint32_t)i10; gpr[rt] = r; break;
+    case ORX: r.w[0] = va.w[0] | va.w[1] | va.w[2] | va.w[3]; gpr[rt] = r; break;
+    case XOR: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ^ vb.w[i]; gpr[rt] = r; break;
+    case XORBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) ^ (uint8_t)i10); gpr[rt] = r; break;
+    case XORHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) ^ (uint16_t)i10); gpr[rt] = r; break;
+    case XORI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ^ (uint32_t)i10; gpr[rt] = r; break;
+    case NAND: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] & vb.w[i]); gpr[rt] = r; break;
+    case NOR: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] | vb.w[i]); gpr[rt] = r; break;
+    case EQV: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] ^ vb.w[i]); gpr[rt] = r; break;
     case SELB: {
-        const V &C = t.gpr[rt];
+        const V &C = gpr[rt];
         for (int i = 0; i < 4; i++) r.w[i] = (C.w[i] & vb.w[i]) | (~C.w[i] & va.w[i]);
-        t.gpr[(x >> 21) & 0x7f] = r;
+        gpr[(x >> 21) & 0x7f] = r;
         break;
     }
     case SHUFB: {
         uint8_t ab[32], c[16], o[16];
-        to_bytes(va, ab), to_bytes(vb, ab + 16), to_bytes(t.gpr[rt], c);
+        to_bytes(va, ab), to_bytes(vb, ab + 16), to_bytes(gpr[rt], c);
         for (int i = 0; i < 16; i++)
             o[i] = c[i] >= 0xe0 ? 0x80 : c[i] >= 0xc0 ? 0xff : c[i] >= 0x80 ? 0x00 : ab[c[i] & 0x1f];
-        t.gpr[(x >> 21) & 0x7f] = from_bytes(o);
+        gpr[(x >> 21) & 0x7f] = from_bytes(o);
         break;
     }
 
     /* ---------- shifts and rotates ---------- */
-    case SHLH: for (int i = 0; i < 8; i++) { int s = vb.h(i) & 0x1f; r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) << s)); } t.gpr[rt] = r; break;
-    case SHLHI: { int s = i7 & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) << s)); t.gpr[rt] = r; break; }
-    case SHL: for (int i = 0; i < 4; i++) { int s = vb.w[i] & 0x3f; r.w[i] = s > 31 ? 0 : va.w[i] << s; } t.gpr[rt] = r; break;
-    case SHLI: { int s = i7 & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = s > 31 ? 0 : va.w[i] << s; t.gpr[rt] = r; break; }
-    case ROTH: for (int i = 0; i < 8; i++) { int s = vb.h(i) & 0xf; uint16_t v = va.h(i); r.set_h(i, (uint16_t)((v << s) | (v >> ((16 - s) & 15)))); } t.gpr[rt] = r; break;
-    case ROTHI: { int s = i7 & 0xf; for (int i = 0; i < 8; i++) { uint16_t v = va.h(i); r.set_h(i, (uint16_t)((v << s) | (v >> ((16 - s) & 15)))); } t.gpr[rt] = r; break; }
-    case ROT: for (int i = 0; i < 4; i++) { int s = vb.w[i] & 0x1f; r.w[i] = (va.w[i] << s) | (s ? va.w[i] >> (32 - s) : 0); } t.gpr[rt] = r; break;
-    case ROTI: { int s = i7 & 0x1f; for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] << s) | (s ? va.w[i] >> (32 - s) : 0); t.gpr[rt] = r; break; }
-    case ROTHM: for (int i = 0; i < 8; i++) { int s = (0 - vb.h(i)) & 0x1f; r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) >> s)); } t.gpr[rt] = r; break;
-    case ROTHMI: { int s = (0 - i7) & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) >> s)); t.gpr[rt] = r; break; }
-    case ROTM: for (int i = 0; i < 4; i++) { int s = (0 - vb.w[i]) & 0x3f; r.w[i] = s > 31 ? 0 : va.w[i] >> s; } t.gpr[rt] = r; break;
-    case ROTMI: { int s = (0 - i7) & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = s > 31 ? 0 : va.w[i] >> s; t.gpr[rt] = r; break; }
-    case ROTMAH: for (int i = 0; i < 8; i++) { int s = (0 - vb.h(i)) & 0x1f; r.set_h(i, (uint16_t)((int16_t)va.h(i) >> (s > 15 ? 15 : s))); } t.gpr[rt] = r; break;
-    case ROTMAHI: { int s = (0 - i7) & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)((int16_t)va.h(i) >> (s > 15 ? 15 : s))); t.gpr[rt] = r; break; }
-    case ROTMA: for (int i = 0; i < 4; i++) { int s = (0 - vb.w[i]) & 0x3f; r.w[i] = (uint32_t)((int32_t)va.w[i] >> (s > 31 ? 31 : s)); } t.gpr[rt] = r; break;
-    case ROTMAI: { int s = (0 - i7) & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int32_t)va.w[i] >> (s > 31 ? 31 : s)); t.gpr[rt] = r; break; }
-    case SHLQBI: t.gpr[rt] = shl_bits(va, vb.w[0] & 7); break;
-    case SHLQBII: t.gpr[rt] = shl_bits(va, i7 & 7); break;
-    case SHLQBY: t.gpr[rt] = shl_bytes(va, vb.w[0] & 0x1f); break;
-    case SHLQBYI: t.gpr[rt] = shl_bytes(va, i7 & 0x1f); break;
-    case SHLQBYBI: t.gpr[rt] = shl_bytes(va, (vb.w[0] >> 3) & 0x1f); break;
-    case ROTQBI: t.gpr[rt] = rot_bits(va, vb.w[0] & 7); break;
-    case ROTQBII: t.gpr[rt] = rot_bits(va, i7 & 7); break;
-    case ROTQBY: t.gpr[rt] = rot_bytes(va, vb.w[0] & 0xf); break;
-    case ROTQBYI: t.gpr[rt] = rot_bytes(va, i7 & 0xf); break;
-    case ROTQBYBI: t.gpr[rt] = rot_bytes(va, (vb.w[0] >> 3) & 0xf); break;
-    case ROTQMBI: t.gpr[rt] = shr_bits(va, (0 - vb.w[0]) & 7); break;
-    case ROTQMBII: t.gpr[rt] = shr_bits(va, (0 - i7) & 7); break;
-    case ROTQMBY: t.gpr[rt] = shr_bytes(va, (0 - vb.w[0]) & 0x1f); break;
-    case ROTQMBYI: t.gpr[rt] = shr_bytes(va, (0 - i7) & 0x1f); break;
-    case ROTQMBYBI: t.gpr[rt] = shr_bytes(va, (0 - (vb.w[0] >> 3)) & 0x1f); break;
+    case SHLH: for (int i = 0; i < 8; i++) { int s = vb.h(i) & 0x1f; r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) << s)); } gpr[rt] = r; break;
+    case SHLHI: { int s = i7 & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) << s)); gpr[rt] = r; break; }
+    case SHL: for (int i = 0; i < 4; i++) { int s = vb.w[i] & 0x3f; r.w[i] = s > 31 ? 0 : va.w[i] << s; } gpr[rt] = r; break;
+    case SHLI: { int s = i7 & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = s > 31 ? 0 : va.w[i] << s; gpr[rt] = r; break; }
+    case ROTH: for (int i = 0; i < 8; i++) { int s = vb.h(i) & 0xf; uint16_t v = va.h(i); r.set_h(i, (uint16_t)((v << s) | (v >> ((16 - s) & 15)))); } gpr[rt] = r; break;
+    case ROTHI: { int s = i7 & 0xf; for (int i = 0; i < 8; i++) { uint16_t v = va.h(i); r.set_h(i, (uint16_t)((v << s) | (v >> ((16 - s) & 15)))); } gpr[rt] = r; break; }
+    case ROT: for (int i = 0; i < 4; i++) { int s = vb.w[i] & 0x1f; r.w[i] = (va.w[i] << s) | (s ? va.w[i] >> (32 - s) : 0); } gpr[rt] = r; break;
+    case ROTI: { int s = i7 & 0x1f; for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] << s) | (s ? va.w[i] >> (32 - s) : 0); gpr[rt] = r; break; }
+    case ROTHM: for (int i = 0; i < 8; i++) { int s = (0 - vb.h(i)) & 0x1f; r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) >> s)); } gpr[rt] = r; break;
+    case ROTHMI: { int s = (0 - i7) & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) >> s)); gpr[rt] = r; break; }
+    case ROTM: for (int i = 0; i < 4; i++) { int s = (0 - vb.w[i]) & 0x3f; r.w[i] = s > 31 ? 0 : va.w[i] >> s; } gpr[rt] = r; break;
+    case ROTMI: { int s = (0 - i7) & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = s > 31 ? 0 : va.w[i] >> s; gpr[rt] = r; break; }
+    case ROTMAH: for (int i = 0; i < 8; i++) { int s = (0 - vb.h(i)) & 0x1f; r.set_h(i, (uint16_t)((int16_t)va.h(i) >> (s > 15 ? 15 : s))); } gpr[rt] = r; break;
+    case ROTMAHI: { int s = (0 - i7) & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)((int16_t)va.h(i) >> (s > 15 ? 15 : s))); gpr[rt] = r; break; }
+    case ROTMA: for (int i = 0; i < 4; i++) { int s = (0 - vb.w[i]) & 0x3f; r.w[i] = (uint32_t)((int32_t)va.w[i] >> (s > 31 ? 31 : s)); } gpr[rt] = r; break;
+    case ROTMAI: { int s = (0 - i7) & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int32_t)va.w[i] >> (s > 31 ? 31 : s)); gpr[rt] = r; break; }
+    case SHLQBI: gpr[rt] = shl_bits(va, vb.w[0] & 7); break;
+    case SHLQBII: gpr[rt] = shl_bits(va, i7 & 7); break;
+    case SHLQBY: gpr[rt] = shl_bytes(va, vb.w[0] & 0x1f); break;
+    case SHLQBYI: gpr[rt] = shl_bytes(va, i7 & 0x1f); break;
+    case SHLQBYBI: gpr[rt] = shl_bytes(va, (vb.w[0] >> 3) & 0x1f); break;
+    case ROTQBI: gpr[rt] = rot_bits(va, vb.w[0] & 7); break;
+    case ROTQBII: gpr[rt] = rot_bits(va, i7 & 7); break;
+    case ROTQBY: gpr[rt] = rot_bytes(va, vb.w[0] & 0xf); break;
+    case ROTQBYI: gpr[rt] = rot_bytes(va, i7 & 0xf); break;
+    case ROTQBYBI: gpr[rt] = rot_bytes(va, (vb.w[0] >> 3) & 0xf); break;
+    case ROTQMBI: gpr[rt] = shr_bits(va, (0 - vb.w[0]) & 7); break;
+    case ROTQMBII: gpr[rt] = shr_bits(va, (0 - i7) & 7); break;
+    case ROTQMBY: gpr[rt] = shr_bytes(va, (0 - vb.w[0]) & 0x1f); break;
+    case ROTQMBYI: gpr[rt] = shr_bytes(va, (0 - i7) & 0x1f); break;
+    case ROTQMBYBI: gpr[rt] = shr_bytes(va, (0 - (vb.w[0] >> 3)) & 0x1f); break;
 
     /* ---------- compares ---------- */
-    case CEQB: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) == vb.b(i) ? 0xff : 0); t.gpr[rt] = r; break;
-    case CEQBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) == (uint8_t)i10 ? 0xff : 0); t.gpr[rt] = r; break;
-    case CEQH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) == vb.h(i) ? 0xffff : 0); t.gpr[rt] = r; break;
-    case CEQHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) == (uint16_t)i10 ? 0xffff : 0); t.gpr[rt] = r; break;
-    case CEQ: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] == vb.w[i] ? ~0u : 0; t.gpr[rt] = r; break;
-    case CEQI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] == (uint32_t)i10 ? ~0u : 0; t.gpr[rt] = r; break;
-    case CGTB: for (int i = 0; i < 16; i++) r.set_b(i, (int8_t)va.b(i) > (int8_t)vb.b(i) ? 0xff : 0); t.gpr[rt] = r; break;
-    case CGTBI: for (int i = 0; i < 16; i++) r.set_b(i, (int8_t)va.b(i) > (int8_t)(uint8_t)i10 ? 0xff : 0); t.gpr[rt] = r; break;
-    case CGTH: for (int i = 0; i < 8; i++) r.set_h(i, (int16_t)va.h(i) > (int16_t)vb.h(i) ? 0xffff : 0); t.gpr[rt] = r; break;
-    case CGTHI: for (int i = 0; i < 8; i++) r.set_h(i, (int16_t)va.h(i) > (int16_t)i10 ? 0xffff : 0); t.gpr[rt] = r; break;
-    case CGT: for (int i = 0; i < 4; i++) r.w[i] = (int32_t)va.w[i] > (int32_t)vb.w[i] ? ~0u : 0; t.gpr[rt] = r; break;
-    case CGTI: for (int i = 0; i < 4; i++) r.w[i] = (int32_t)va.w[i] > i10 ? ~0u : 0; t.gpr[rt] = r; break;
-    case CLGTB: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) > vb.b(i) ? 0xff : 0); t.gpr[rt] = r; break;
-    case CLGTBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) > (uint8_t)i10 ? 0xff : 0); t.gpr[rt] = r; break;
-    case CLGTH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) > vb.h(i) ? 0xffff : 0); t.gpr[rt] = r; break;
-    case CLGTHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) > (uint16_t)i10 ? 0xffff : 0); t.gpr[rt] = r; break;
-    case CLGT: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] > vb.w[i] ? ~0u : 0; t.gpr[rt] = r; break;
-    case CLGTI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] > (uint32_t)i10 ? ~0u : 0; t.gpr[rt] = r; break;
+    case CEQB: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) == vb.b(i) ? 0xff : 0); gpr[rt] = r; break;
+    case CEQBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) == (uint8_t)i10 ? 0xff : 0); gpr[rt] = r; break;
+    case CEQH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) == vb.h(i) ? 0xffff : 0); gpr[rt] = r; break;
+    case CEQHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) == (uint16_t)i10 ? 0xffff : 0); gpr[rt] = r; break;
+    case CEQ: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] == vb.w[i] ? ~0u : 0; gpr[rt] = r; break;
+    case CEQI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] == (uint32_t)i10 ? ~0u : 0; gpr[rt] = r; break;
+    case CGTB: for (int i = 0; i < 16; i++) r.set_b(i, (int8_t)va.b(i) > (int8_t)vb.b(i) ? 0xff : 0); gpr[rt] = r; break;
+    case CGTBI: for (int i = 0; i < 16; i++) r.set_b(i, (int8_t)va.b(i) > (int8_t)(uint8_t)i10 ? 0xff : 0); gpr[rt] = r; break;
+    case CGTH: for (int i = 0; i < 8; i++) r.set_h(i, (int16_t)va.h(i) > (int16_t)vb.h(i) ? 0xffff : 0); gpr[rt] = r; break;
+    case CGTHI: for (int i = 0; i < 8; i++) r.set_h(i, (int16_t)va.h(i) > (int16_t)i10 ? 0xffff : 0); gpr[rt] = r; break;
+    case CGT: for (int i = 0; i < 4; i++) r.w[i] = (int32_t)va.w[i] > (int32_t)vb.w[i] ? ~0u : 0; gpr[rt] = r; break;
+    case CGTI: for (int i = 0; i < 4; i++) r.w[i] = (int32_t)va.w[i] > i10 ? ~0u : 0; gpr[rt] = r; break;
+    case CLGTB: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) > vb.b(i) ? 0xff : 0); gpr[rt] = r; break;
+    case CLGTBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) > (uint8_t)i10 ? 0xff : 0); gpr[rt] = r; break;
+    case CLGTH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) > vb.h(i) ? 0xffff : 0); gpr[rt] = r; break;
+    case CLGTHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) > (uint16_t)i10 ? 0xffff : 0); gpr[rt] = r; break;
+    case CLGT: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] > vb.w[i] ? ~0u : 0; gpr[rt] = r; break;
+    case CLGTI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] > (uint32_t)i10 ? ~0u : 0; gpr[rt] = r; break;
 
     /* ---------- halts (raise an error) ---------- */
     case HEQ: case HEQI: case HGT: case HGTI: case HLGT: case HLGTI: {
@@ -522,64 +525,64 @@ template <Op OP> SPU_INLINE uint32_t step(SpuThread &t, uint32_t x, uint32_t pc)
     /* ---------- branches ---------- */
     case BR: next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
     case BRA: next = (s16 << 2) & (LS_SIZE - 4); break;
-    case BRSL: t.gpr[rt] = V{{next, 0, 0, 0}}; next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
-    case BRASL: t.gpr[rt] = V{{next, 0, 0, 0}}; next = (s16 << 2) & (LS_SIZE - 4); break;
+    case BRSL: gpr[rt] = V{{next, 0, 0, 0}}; next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
+    case BRASL: gpr[rt] = V{{next, 0, 0, 0}}; next = (s16 << 2) & (LS_SIZE - 4); break;
     case BI: next = va.w[0] & (LS_SIZE - 4); break;
     case IRET: next = t.srr0 & (LS_SIZE - 4); break;
-    case BISLED: case BISL: { uint32_t target = va.w[0] & (LS_SIZE - 4); t.gpr[rt] = V{{next, 0, 0, 0}}; if (OP == BISL) next = target; break; }
-    case BRNZ: if (t.gpr[rt].w[0] != 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
-    case BRZ: if (t.gpr[rt].w[0] == 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
-    case BRHNZ: if ((t.gpr[rt].w[0] & 0xffff) != 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
-    case BRHZ: if ((t.gpr[rt].w[0] & 0xffff) == 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
-    case BIZ: if (t.gpr[rt].w[0] == 0) next = va.w[0] & (LS_SIZE - 4); break;
-    case BINZ: if (t.gpr[rt].w[0] != 0) next = va.w[0] & (LS_SIZE - 4); break;
-    case BIHZ: if ((t.gpr[rt].w[0] & 0xffff) == 0) next = va.w[0] & (LS_SIZE - 4); break;
-    case BIHNZ: if ((t.gpr[rt].w[0] & 0xffff) != 0) next = va.w[0] & (LS_SIZE - 4); break;
+    case BISLED: case BISL: { uint32_t target = va.w[0] & (LS_SIZE - 4); gpr[rt] = V{{next, 0, 0, 0}}; if (OP == BISL) next = target; break; }
+    case BRNZ: if (gpr[rt].w[0] != 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
+    case BRZ: if (gpr[rt].w[0] == 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
+    case BRHNZ: if ((gpr[rt].w[0] & 0xffff) != 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
+    case BRHZ: if ((gpr[rt].w[0] & 0xffff) == 0) next = (pc + (s16 << 2)) & (LS_SIZE - 4); break;
+    case BIZ: if (gpr[rt].w[0] == 0) next = va.w[0] & (LS_SIZE - 4); break;
+    case BINZ: if (gpr[rt].w[0] != 0) next = va.w[0] & (LS_SIZE - 4); break;
+    case BIHZ: if ((gpr[rt].w[0] & 0xffff) == 0) next = va.w[0] & (LS_SIZE - 4); break;
+    case BIHNZ: if ((gpr[rt].w[0] & 0xffff) != 0) next = va.w[0] & (LS_SIZE - 4); break;
     case HBR: case HBRA: case HBRR: case NOP: case LNOP: case SYNC: case DSYNC: break;
 
     /* ---------- single precision ---------- */
-    case FA: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) + spf(vb.f(i)))); t.gpr[rt] = r; break;
-    case FS: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) - spf(vb.f(i)))); t.gpr[rt] = r; break;
-    case FM: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) * spf(vb.f(i)))); t.gpr[rt] = r; break;
-    case FMA: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) + spf(C.f(i)))); t.gpr[(x >> 21) & 0x7f] = r; break; }
-    case FMS: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) - spf(C.f(i)))); t.gpr[(x >> 21) & 0x7f] = r; break; }
-    case FNMS: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(C.f(i)) - spr(spf(va.f(i)) * spf(vb.f(i))))); t.gpr[(x >> 21) & 0x7f] = r; break; }
+    case FA: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) + spf(vb.f(i)))); gpr[rt] = r; break;
+    case FS: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) - spf(vb.f(i)))); gpr[rt] = r; break;
+    case FM: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) * spf(vb.f(i)))); gpr[rt] = r; break;
+    case FMA: { const V &C = gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) + spf(C.f(i)))); gpr[(x >> 21) & 0x7f] = r; break; }
+    case FMS: { const V &C = gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) - spf(C.f(i)))); gpr[(x >> 21) & 0x7f] = r; break; }
+    case FNMS: { const V &C = gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(C.f(i)) - spr(spf(va.f(i)) * spf(vb.f(i))))); gpr[(x >> 21) & 0x7f] = r; break; }
     // frest/frsqest return the exact value; fi then passes it through.
-    case FREST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / spf(va.f(i)))); t.gpr[rt] = r; break;
-    case FRSQEST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / std::sqrt(std::fabs(spf(va.f(i)))))); t.gpr[rt] = r; break;
-    case FI: t.gpr[rt] = vb; break;
-    case FCEQ: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) == ftz(vb.f(i)) ? ~0u : 0; t.gpr[rt] = r; break;
-    case FCMEQ: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) == std::fabs(ftz(vb.f(i))) ? ~0u : 0; t.gpr[rt] = r; break;
-    case FCGT: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) > ftz(vb.f(i)) ? ~0u : 0; t.gpr[rt] = r; break;
-    case FCMGT: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) > std::fabs(ftz(vb.f(i))) ? ~0u : 0; t.gpr[rt] = r; break;
-    case CSFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)(int32_t)va.w[i] * pow2(-sc))); t.gpr[rt] = r; break; }
-    case CUFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)va.w[i] * pow2(-sc))); t.gpr[rt] = r; break; }
-    case CFLTS: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)sat_s32((double)va.f(i) * pow2(sc)); t.gpr[rt] = r; break; }
-    case CFLTU: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = sat_u32((double)va.f(i) * pow2(sc)); t.gpr[rt] = r; break; }
-    case FSCRRD: t.gpr[rt] = V{}; break;
+    case FREST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / spf(va.f(i)))); gpr[rt] = r; break;
+    case FRSQEST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / std::sqrt(std::fabs(spf(va.f(i)))))); gpr[rt] = r; break;
+    case FI: gpr[rt] = vb; break;
+    case FCEQ: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) == ftz(vb.f(i)) ? ~0u : 0; gpr[rt] = r; break;
+    case FCMEQ: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) == std::fabs(ftz(vb.f(i))) ? ~0u : 0; gpr[rt] = r; break;
+    case FCGT: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) > ftz(vb.f(i)) ? ~0u : 0; gpr[rt] = r; break;
+    case FCMGT: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) > std::fabs(ftz(vb.f(i))) ? ~0u : 0; gpr[rt] = r; break;
+    case CSFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)(int32_t)va.w[i] * pow2(-sc))); gpr[rt] = r; break; }
+    case CUFLT: { int sc = 155 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.set_f(i, (float)((double)va.w[i] * pow2(-sc))); gpr[rt] = r; break; }
+    case CFLTS: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)sat_s32((double)va.f(i) * pow2(sc)); gpr[rt] = r; break; }
+    case CFLTU: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = sat_u32((double)va.f(i) * pow2(sc)); gpr[rt] = r; break; }
+    case FSCRRD: gpr[rt] = V{}; break;
     case FSCRWR: break;
 
     /* ---------- double precision ---------- */
-    case FESD: for (int i = 0; i < 2; i++) r.set_df(i, (double)va.f(2 * i)); t.gpr[rt] = r; break;
-    case FRDS: for (int i = 0; i < 2; i++) r.set_f(2 * i, (float)va.df(i)); t.gpr[rt] = r; break;
-    case DFA: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) + vb.df(i)); t.gpr[rt] = r; break;
-    case DFS: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) - vb.df(i)); t.gpr[rt] = r; break;
-    case DFM: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) * vb.df(i)); t.gpr[rt] = r; break;
-    case DFMA: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) * vb.df(i) + t.gpr[rt].df(i)); t.gpr[rt] = r; break;
-    case DFMS: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) * vb.df(i) - t.gpr[rt].df(i)); t.gpr[rt] = r; break;
-    case DFNMS: for (int i = 0; i < 2; i++) r.set_df(i, t.gpr[rt].df(i) - va.df(i) * vb.df(i)); t.gpr[rt] = r; break;
-    case DFNMA: for (int i = 0; i < 2; i++) r.set_df(i, -(va.df(i) * vb.df(i) + t.gpr[rt].df(i))); t.gpr[rt] = r; break;
-    case DFCEQ: for (int i = 0; i < 2; i++) r.set_d(i, va.df(i) == vb.df(i) ? ~0ull : 0); t.gpr[rt] = r; break;
-    case DFCMEQ: for (int i = 0; i < 2; i++) r.set_d(i, std::fabs(va.df(i)) == std::fabs(vb.df(i)) ? ~0ull : 0); t.gpr[rt] = r; break;
-    case DFCGT: for (int i = 0; i < 2; i++) r.set_d(i, va.df(i) > vb.df(i) ? ~0ull : 0); t.gpr[rt] = r; break;
-    case DFCMGT: for (int i = 0; i < 2; i++) r.set_d(i, std::fabs(va.df(i)) > std::fabs(vb.df(i)) ? ~0ull : 0); t.gpr[rt] = r; break;
-    case DFTSV: t.gpr[rt] = V{}; break;
+    case FESD: for (int i = 0; i < 2; i++) r.set_df(i, (double)va.f(2 * i)); gpr[rt] = r; break;
+    case FRDS: for (int i = 0; i < 2; i++) r.set_f(2 * i, (float)va.df(i)); gpr[rt] = r; break;
+    case DFA: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) + vb.df(i)); gpr[rt] = r; break;
+    case DFS: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) - vb.df(i)); gpr[rt] = r; break;
+    case DFM: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) * vb.df(i)); gpr[rt] = r; break;
+    case DFMA: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) * vb.df(i) + gpr[rt].df(i)); gpr[rt] = r; break;
+    case DFMS: for (int i = 0; i < 2; i++) r.set_df(i, va.df(i) * vb.df(i) - gpr[rt].df(i)); gpr[rt] = r; break;
+    case DFNMS: for (int i = 0; i < 2; i++) r.set_df(i, gpr[rt].df(i) - va.df(i) * vb.df(i)); gpr[rt] = r; break;
+    case DFNMA: for (int i = 0; i < 2; i++) r.set_df(i, -(va.df(i) * vb.df(i) + gpr[rt].df(i))); gpr[rt] = r; break;
+    case DFCEQ: for (int i = 0; i < 2; i++) r.set_d(i, va.df(i) == vb.df(i) ? ~0ull : 0); gpr[rt] = r; break;
+    case DFCMEQ: for (int i = 0; i < 2; i++) r.set_d(i, std::fabs(va.df(i)) == std::fabs(vb.df(i)) ? ~0ull : 0); gpr[rt] = r; break;
+    case DFCGT: for (int i = 0; i < 2; i++) r.set_d(i, va.df(i) > vb.df(i) ? ~0ull : 0); gpr[rt] = r; break;
+    case DFCMGT: for (int i = 0; i < 2; i++) r.set_d(i, std::fabs(va.df(i)) > std::fabs(vb.df(i)) ? ~0ull : 0); gpr[rt] = r; break;
+    case DFTSV: gpr[rt] = V{}; break;
 
     /* ---------- channels and control ---------- */
-    case RDCH: t.gpr[rt] = V{{t.read_channel(ra), 0, 0, 0}}; break;
-    case RCHCNT: t.gpr[rt] = V{{t.channel_count(ra), 0, 0, 0}}; break;
-    case WRCH: t.write_channel(ra, t.gpr[rt].w[0]); break;
-    case MFSPR: t.gpr[rt] = V{}; break;
+    case RDCH: gpr[rt] = V{{t.read_channel(ra), 0, 0, 0}}; break;
+    case RCHCNT: gpr[rt] = V{{t.channel_count(ra), 0, 0, 0}}; break;
+    case WRCH: t.write_channel(ra, gpr[rt].w[0]); break;
+    case MFSPR: gpr[rt] = V{}; break;
     case MTSPR: break;
     case STOP: case STOPD:
         t.pc = next;
@@ -594,5 +597,7 @@ template <Op OP> SPU_INLINE uint32_t step(SpuThread &t, uint32_t x, uint32_t pc)
     }
     return next;
 }
+
+template <Op OP> SPU_INLINE uint32_t step(SpuThread &t, uint32_t x, uint32_t pc) { return step_r<OP>(t, t.gpr, x, pc); }
 
 } // namespace spu
