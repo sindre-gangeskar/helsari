@@ -83,11 +83,13 @@ int g_step_dumps;   // per-draw dumps taken in the current capture
 ID3D11VertexShader *g_present_vs;
 ID3D11PixelShader *g_present_ps;
 ID3D11PixelShader *g_depth_color_ps;    // depth -> RSX D24S8 bytes as A8R8G8B8
+ID3D11PixelShader *g_depth_copy_ps;     // depth texture -> SV_Depth (proxy copies)
+ID3D11DepthStencilState *g_ds_always;   // depth test always, write on
 ID3D11PixelShader *g_reinterpret_ps;    // A8R8G8B8 texels -> another 32-bit texture format
 ID3D11Buffer *g_cb_pass;                // mode constant for the conversion passes
 ID3D11Buffer *g_cb_unit_uv;             // uvscale (1, 1) for g_present_vs in run_pass
 std::unordered_map<uint64_t, ID3D11VertexShader *> g_vs;
-struct PsEntry { ID3D11PixelShader *ps; std::vector<uint32_t> consts; };
+struct PsEntry { ID3D11PixelShader *ps; std::vector<uint32_t> consts; std::string hlsl; uint32_t control; bool dumped; };
 std::unordered_map<uint64_t, PsEntry> g_ps;
 
 ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
@@ -242,6 +244,11 @@ struct Surface {
     ID3D11Texture2D *view = nullptr;
     ID3D11RenderTargetView *view_rtv = nullptr;
     ID3D11ShaderResourceView *view_srv = nullptr;
+    // A draw may bind targets of different sizes (RSX: memory with a pitch, the draw
+    // covers the top-left of each); D3D11 binds none of them then. The draw renders
+    // into a draw-sized stand-in instead, see bind_surfaces().
+    struct Surface *proxy = nullptr;
+    uint8_t newer = 0;                          // with a proxy: 1 this surface newer, 2 the proxy newer
 };
 
 // The RSX lets a shader sample the surface it is rendering to; D3D11 does
@@ -278,16 +285,32 @@ DXGI_FORMAT color_format(uint32_t f) {
     }
 }
 
+void free_surface(Surface &s) {
+    release(s.rtv); release(s.dsv); release(s.srv); release(s.tex); release(s.copy_srv); release(s.copy); release(s.staging);
+    release(s.as_color_srv); release(s.as_color_rtv); release(s.as_color);
+    release(s.view_srv); release(s.view_rtv); release(s.view);
+    if (s.proxy) { free_surface(*s.proxy); delete s.proxy; }
+    s = Surface{};
+}
+
+void create_surface_tex(Surface &s, uint32_t nw, uint32_t nh);
+
 Surface *get_surface(uint32_t ea, uint32_t fmt, uint32_t w, uint32_t h, bool depth) {
     if (!w || !h) return nullptr;
     Surface &s = (depth ? g_depth_surfaces : g_surfaces)[ea];
     if (s.tex && s.fmt == fmt && s.depth == depth && s.w >= w && s.h >= h) { s.last_frame = g_frame; return &s; }
     uint32_t nw = std::max(w, s.fmt == fmt ? s.w : 0), nh = std::max(h, s.fmt == fmt ? s.h : 0);
-    release(s.rtv); release(s.dsv); release(s.srv); release(s.tex); release(s.copy_srv); release(s.copy); release(s.staging);
-    release(s.as_color_srv); release(s.as_color_rtv); release(s.as_color);
-    release(s.view_srv); release(s.view_rtv); release(s.view);
-    s = Surface{};
-    s.ea = ea, s.fmt = fmt, s.w = nw, s.h = nh, s.depth = depth, s.last_frame = g_frame;
+    free_surface(s);
+    s.ea = ea, s.fmt = fmt, s.depth = depth, s.last_frame = g_frame;
+    create_surface_tex(s, nw, nh);
+    LOG("rsx", "new %s surface at 0x%08x fmt %u %ux%u", depth ? "depth" : "color", ea, fmt, nw, nh);
+    return &s;
+}
+
+void create_surface_tex(Surface &s, uint32_t nw, uint32_t nh) {
+    bool depth = s.depth;
+    uint32_t fmt = s.fmt;
+    s.w = nw, s.h = nh;
     D3D11_TEXTURE2D_DESC d{};
     d.Width = nw, d.Height = nh, d.MipLevels = 1, d.ArraySize = 1, d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT;
@@ -312,8 +335,47 @@ Surface *get_surface(uint32_t ea, uint32_t fmt, uint32_t w, uint32_t h, bool dep
         g_dev->CreateRenderTargetView(s.tex, nullptr, &s.rtv);
         g_dev->CreateShaderResourceView(s.tex, nullptr, &s.srv);
     }
-    LOG("rsx", "new %s surface at 0x%08x fmt %u %ux%u", depth ? "depth" : "color", ea, fmt, nw, nh);
-    return &s;
+}
+
+// Copy the top-left w x h of one surface into another of the same format.
+// Depth cannot be copied by region in D3D11: a pass writes it (stencil is lost).
+void copy_depth_region(Surface &dst, Surface &src, uint32_t w, uint32_t h);
+void copy_region(Surface &dst, Surface &src, uint32_t w, uint32_t h) {
+    w = std::min({w, dst.w, src.w}), h = std::min({h, dst.h, src.h});
+    if (dst.depth) { copy_depth_region(dst, src, w, h); return; }
+    D3D11_BOX box{0, 0, 0, w, h, 1};
+    g_ctx->CopySubresourceRegion(dst.tex, 0, 0, 0, 0, src.tex, 0, &box);
+}
+
+// Bring a surface up to date with what was drawn into its proxy.
+void sync_primary(Surface &s) {
+    if (s.proxy && s.newer == 2) copy_region(s, *s.proxy, s.proxy->w, s.proxy->h), s.newer = 0;
+}
+
+// The w x h stand-in for s, holding s's current top-left contents.
+Surface *use_proxy(Surface &s, uint32_t w, uint32_t h) {
+    if (s.proxy && (s.proxy->w != w || s.proxy->h != h)) {
+        sync_primary(s);
+        free_surface(*s.proxy);
+        delete s.proxy, s.proxy = nullptr;
+    }
+    if (!s.proxy) {
+        s.proxy = new Surface{};
+        s.proxy->ea = s.ea, s.proxy->fmt = s.fmt, s.proxy->depth = s.depth;
+        create_surface_tex(*s.proxy, w, h);
+        s.newer = 1;
+        static int logs;
+        if (logs++ < 20)
+            LOG("rsx", "proxy %ux%u for %s surface 0x%08x (%ux%u)", w, h, s.depth ? "depth" : "color", s.ea, s.w, s.h);
+    }
+    if (s.newer == 1) copy_region(*s.proxy, s, w, h), s.newer = 0;
+    return s.proxy;
+}
+
+// After rendering to s (directly or through its proxy).
+void mark_drawn(Surface &s, bool via_proxy) {
+    s.dirty = true;
+    if (s.proxy) s.newer = via_proxy ? 2 : 1;
 }
 
 uint32_t dma_location(uint32_t ctx) { return (ctx & 0xf) == 1 ? 1 : 0; }  // 0xfeed0000 local, 0xfeed0001 main
@@ -322,6 +384,9 @@ struct Bound {
     Surface *color[4] = {};
     Surface *depth = nullptr;
     uint32_t w = 0, h = 0;
+    ID3D11RenderTargetView *rtv[4] = {};   // the views bound (a proxy's when proxied)
+    ID3D11DepthStencilView *dsv = nullptr;
+    bool proxied[5] = {};                  // colour 0-3, depth
 };
 
 Bound bind_surfaces() {
@@ -346,23 +411,37 @@ Bound bind_surfaces() {
     case 0x17: mask = 7; break;
     case 0x1f: mask = 15; break;
     }
-    ID3D11RenderTargetView *rtv[4] = {};
     for (int i = 0; i < 4; i++) {
         if (!(mask & (1 << i))) continue;
         uint32_t ea = ea_for(dma_location(reg(dma_m[i])), reg(off_m[i]));
         b.color[i] = get_surface(ea, cfmt, sw, shh, false);
-        if (b.color[i]) rtv[i] = b.color[i]->rtv, b.color[i]->pitch = reg(pitch_m[i]);
+        if (b.color[i]) b.color[i]->pitch = reg(pitch_m[i]);
     }
-    ID3D11DepthStencilView *dsv = nullptr;
     if (zfmt) {
         uint32_t ea = ea_for(dma_location(reg(0x0198)), reg(0x0214));          // CONTEXT_DMA_ZETA
         b.depth = get_surface(ea, zfmt, sw, shh, true);
-        if (b.depth) dsv = b.depth->dsv, b.depth->pitch = reg(0x022c);           // SURFACE_PITCH_Z
+        if (b.depth) b.depth->pitch = reg(0x022c);                               // SURFACE_PITCH_Z
     }
-    // A bound surface must not also be bound as a texture.
+    // Surfaces keep their largest size, so one address reused for a smaller buffer
+    // (Killzone 2: the 1024x1024 shadow map as the 640x360 depth for depth of field,
+    // next to a 2560x720 G-buffer target) gives views of different sizes, which
+    // D3D11 refuses to bind together. Those surfaces render through sw x shh proxies.
+    Surface *all[5] = {b.color[0], b.color[1], b.color[2], b.color[3], b.depth};
+    bool mismatch = false;
+    Surface *first = nullptr;
+    for (auto *x : all)
+        if (x) { if (!first) first = x; else if (x->w != first->w || x->h != first->h) mismatch = true; }
     ID3D11ShaderResourceView *none[16] = {};
-    g_ctx->PSSetShaderResources(0, 16, none);
-    g_ctx->OMSetRenderTargets(4, rtv, dsv);
+    g_ctx->PSSetShaderResources(0, 16, none);   // a bound surface must not also be bound as a texture
+    for (int i = 0; i < 5; i++) {
+        Surface *x = all[i];
+        if (!x) continue;
+        Surface *v = x;
+        if (mismatch && (x->w != sw || x->h != shh)) v = use_proxy(*x, sw, shh), b.proxied[i] = true;
+        else sync_primary(*x);
+        if (i < 4) b.rtv[i] = v->rtv; else b.dsv = v->dsv;
+    }
+    g_ctx->OMSetRenderTargets(4, b.rtv, b.dsv);
     D3D11_VIEWPORT vp{0, 0, (float)sw, (float)shh, 0, 1};
     g_ctx->RSSetViewports(1, &vp);
     return b;
@@ -484,6 +563,7 @@ uint32_t image_size(uint32_t fmt, uint32_t w, uint32_t h, uint32_t pitch) {
 // Copy a colour surface rendered since it was last written back to guest
 // memory, in RSX layout (see write_back).
 void write_back_surface(uint32_t ea, Surface &s) {
+    sync_primary(s);
     if (!s.dirty || !s.pitch) return;
     s.dirty = false;
     ScopedUs timer{g_wbs_us};
@@ -578,6 +658,38 @@ void run_pass(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, uint32
     release(dsv);
 }
 
+// Depth copy for proxies (see copy_region): a full-screen pass over the top-left
+// w x h of dst writes the source depth. Bound targets and viewport are restored.
+void copy_depth_region(Surface &dst, Surface &src, uint32_t w, uint32_t h) {
+    ID3D11RenderTargetView *rtv[4];
+    ID3D11DepthStencilView *dsv;
+    g_ctx->OMGetRenderTargets(4, rtv, &dsv);
+    UINT nvp = 1;
+    D3D11_VIEWPORT vp;
+    g_ctx->RSGetViewports(&nvp, &vp);
+
+    ID3D11ShaderResourceView *none[16] = {};
+    g_ctx->PSSetShaderResources(0, 16, none);
+    g_ctx->OMSetRenderTargets(0, nullptr, dst.dsv);
+    D3D11_VIEWPORT cv{0, 0, (float)w, (float)h, 0, 1};
+    g_ctx->RSSetViewports(1, &cv);
+    g_ctx->RSSetState(nullptr);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    g_ctx->OMSetDepthStencilState(g_ds_always, 0);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->VSSetShader(g_present_vs, nullptr, 0);
+    g_ctx->VSSetConstantBuffers(0, 1, &g_cb_unit_uv);
+    g_ctx->PSSetShader(g_depth_copy_ps, nullptr, 0);
+    g_ctx->PSSetShaderResources(0, 1, &src.srv);
+    g_ctx->Draw(3, 0);
+    g_ctx->PSSetShaderResources(0, 16, none);
+
+    g_ctx->OMSetRenderTargets(4, rtv, dsv);
+    if (nvp) g_ctx->RSSetViewports(1, &vp);
+    for (auto *r : rtv) release(r);
+    release(dsv);
+}
+
 // A render target texture of w x h in format f, with views.
 bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, ID3D11Texture2D *&tex, ID3D11RenderTargetView *&rtv,
                  ID3D11ShaderResourceView *&srv) {
@@ -648,6 +760,7 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         uint32_t base = fmt & ~0x60u;
         bool depth_fmt = base >= 0x90 && base <= 0x93;
         auto ds = g_depth_surfaces.find(ea);
+        if (ds != g_depth_surfaces.end()) sync_primary(ds->second);
         bool ds_fits = ds != g_depth_surfaces.end() && ds->second.w == w && ds->second.h == h;
         if (depth_fmt && ds_fits) {
             if (reg(b + 8) >> 28) dim = (TexDim)(dim | TEX_SHADOW);           // compare function set
@@ -658,16 +771,25 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         // texture's size can stand in for it; otherwise read guest memory,
         // where the surface was written back.
         auto s = g_surfaces.find(ea);
+        if (s != g_surfaces.end()) sync_primary(s->second);
+        // Capture: which path serves a texture whose address also holds a depth surface.
+        auto trace = [&](const char *how) {
+            static int n;
+            if ((int)g_frame == g_log_frame && ds != g_depth_surfaces.end() && n++ < 40)
+                LOG("rsx", "   texture %08x fmt %02x %ux%u (depth surface %ux%u): %s", ea, base, w, h, ds->second.w,
+                    ds->second.h, how);
+        };
         if (s != g_surfaces.end()) {
             Surface &rt = s->second;
             if (rt.w == w && rt.h == h) {
-                if (same_layout(rt.fmt, base)) return rt.srv;
+                if (same_layout(rt.fmt, base)) { trace("COLOUR surface at the same address"); return rt.srv; }
                 if (color_format(rt.fmt) == DXGI_FORMAT_R8G8B8A8_UNORM && reinterpretable(base))
                     return reinterpret_view(rt, base);
             }
             write_back_surface(ea, rt);
         }
-        if (ds_fits && base == 0x85) return depth_as_color(ds->second);    // A8R8G8B8 view of D24S8
+        if (ds_fits && base == 0x85) { trace("depth_as_color"); return depth_as_color(ds->second); }   // A8R8G8B8 view of D24S8
+        trace(ds_fits ? "decoded from guest memory (format not handled)" : "decoded from guest memory (size mismatch)");
         if (ds != g_depth_surfaces.end()) write_back_surface(ea, ds->second);
     }
 
@@ -1004,7 +1126,7 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
     memcpy(key.remap, remap, 32);
     memcpy(key.gamma, gamma, 16);
     FpInfo fi = translate_fp(key);
-    PsEntry e{nullptr, sc.consts};
+    PsEntry e{nullptr, sc.consts, fi.hlsl, control, false};
     if (ID3DBlob *b = compile(fi.hlsl, "ps_5_0", h)) {
         g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &e.ps);
         b->Release();
@@ -1014,6 +1136,7 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
 
 // Debug: write a RGBA8 / RGBA16F colour surface to <name>_f<fmt>.bmp (half floats clamped to 0..1).
 void dump_surface(Surface &s, const char *name, bool alpha = false) {
+    sync_primary(s);
     DXGI_FORMAT df = color_format(s.fmt);
     bool half = df == DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (df != DXGI_FORMAT_R8G8B8A8_UNORM && !half) return;
@@ -1292,9 +1415,17 @@ void draw() {
         memcpy(f, px.fc, 32);
         uint64_t psh = 0;
         for (auto &[k, v] : g_ps) if (&v == ps) psh = k;
+        if (!ps->dumped) {   // the translated program, for reading next to the log
+            ps->dumped = true;
+            std::filesystem::create_directories("shaders");
+            char path[64];
+            snprintf(path, sizeof path, "shaders/cap_ps_%016llx.hlsl", (unsigned long long)psh);
+            if (FILE *f = fopen(path, "w")) { fwrite(ps->hlsl.data(), 1, ps->hlsl.size(), f); fclose(f); }
+        }
         LOG("draw", "#%d rt=%x tex0=%x ps=%016llx cmask=%08x blend=%x/%x/%x fc0=(%g %g %g %g) fc1=(%g %g %g %g) n=%zu",
             g_draws_this_frame, b.color[0] ? b.color[0]->ea : 0, srv[0] ? ea_for((reg(0x1a04) & 3) == 2, reg(0x1a00)) : 0,
             (unsigned long long)psh, reg(0x324), reg(0x310), reg(0x314), reg(0x318), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], list.size());
+        LOG("draw", "   fp control %08x (register now %08x)", ps->control, reg(0x1d60));
         LOG("draw", "   depth test %u func %x write %u, stencil %u func %x ref %x mask %x/%x ops %x/%x/%x two-sided %u, "
             "depth bounds %u [%g, %g]", reg(0x0a74) & 1, reg(0x0a6c), reg(0x0a70) & 1, reg(0x0328) & 1, reg(0x0330),
             reg(0x0334), reg(0x0338), reg(0x032c), reg(0x033c), reg(0x0340), reg(0x0344), reg(0x0348) & 1,
@@ -1441,9 +1572,9 @@ void draw() {
             }
     // Only what the RSX would write is dirty: a zeta buffer stays bound while depth
     // and stencil are off, and depth-only passes mask colour writes.
-    if (reg(0x0324)) for (auto *c : b.color) if (c) c->dirty = true;
+    if (reg(0x0324)) for (int i = 0; i < 4; i++) if (b.color[i]) mark_drawn(*b.color[i], b.proxied[i]);
     bool zwrite = ((reg(0x0a74) & 1) && (reg(0x0a70) & 1)) || (reg(0x0328) & 1);
-    if (b.depth && zwrite) b.depth->dirty = true;
+    if (b.depth && zwrite) mark_drawn(*b.depth, b.proxied[4]);
     // Capture: after each small draw (post-processing quads), save its target.
     // (Square targets are shadow maps: skipped.)
     // KZ2_STEP_EVERY=n with KZ2_STEP_RT=<ea>: also snapshot that target after every nth draw into it.
@@ -1566,6 +1697,19 @@ bool create_device() {
         g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_depth_color_ps);
         code->Release();
     }
+    static const char DEPTH_COPY_HLSL[] =
+        "Texture2D<float> d : register(t0);\n"
+        "float ps(float4 p : SV_Position) : SV_Depth { return d.Load(int3(p.xy, 0)); }\n";
+    if (FAILED(D3DCompile(DEPTH_COPY_HLSL, sizeof DEPTH_COPY_HLSL - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0,
+                          &code, &err))) {
+        LOG("rsx", "depth copy shader: %s", err ? (const char *)err->GetBufferPointer() : "?");
+    } else {
+        g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_depth_copy_ps);
+        code->Release();
+    }
+    D3D11_DEPTH_STENCIL_DESC dsd{};
+    dsd.DepthEnable = TRUE, dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL, dsd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    g_dev->CreateDepthStencilState(&dsd, &g_ds_always);
     D3D11_SAMPLER_DESC smp{};
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -1604,14 +1748,15 @@ void clear(uint32_t mask) {
     if (mask & 0xf0) {
         uint32_t c = reg(0x1d90);
         float f[4] = {((c >> 16) & 255) / 255.f, ((c >> 8) & 255) / 255.f, (c & 255) / 255.f, (c >> 24) / 255.f};
-        for (auto *s : b.color) if (s) g_ctx->ClearRenderTargetView(s->rtv, f), s->dirty = true;
+        for (int i = 0; i < 4; i++)
+            if (b.color[i]) g_ctx->ClearRenderTargetView(b.rtv[i], f), mark_drawn(*b.color[i], b.proxied[i]);
     }
     if ((mask & 3) && b.depth) {
         uint32_t z = reg(0x1d8c);
         UINT fl = (mask & 1 ? D3D11_CLEAR_DEPTH : 0) | (mask & 2 ? D3D11_CLEAR_STENCIL : 0);
         float depth = b.depth->fmt == 1 ? (z & 0xffff) / 65535.f : (z >> 8) / 16777215.f;
-        g_ctx->ClearDepthStencilView(b.depth->dsv, fl, depth, (UINT8)(z & 0xff));
-        b.depth->dirty = true;
+        g_ctx->ClearDepthStencilView(b.dsv, fl, depth, (UINT8)(z & 0xff));
+        mark_drawn(*b.depth, b.proxied[4]);
     }
 }
 
@@ -1798,6 +1943,14 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     if ((int)g_frame == g_dump_frame) dump_surfaces();
     if (g_capture_req.exchange(false)) {
         g_log_frame = (int)g_frame, g_dump_frame = (int)g_frame + 1, g_step_dumps = 0, g_pass_dumps = 0;
+        // Each capture replaces the last: delete the previous images (one capture
+        // writes hundreds of MB) and translated shaders, so only this frame's remain.
+        std::error_code ec;
+        for (auto &e : std::filesystem::directory_iterator(".", ec))
+            if (e.path().extension() == ".bmp") std::filesystem::remove(e.path(), ec);
+        for (auto &e : std::filesystem::directory_iterator("shaders", ec))
+            if (e.path().filename().string().rfind("cap_ps_", 0) == 0) std::filesystem::remove(e.path(), ec);
+        for (auto &[k, v] : g_ps) v.dumped = false;
         LOG("rsx", "capture: logging draws of frame %u, dumping its surfaces at the end", g_frame);
     }
     if (getenv("KZ2_TRACE_DRAWS") && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
@@ -1839,6 +1992,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     float uv[4] = {1, 1, 0, 0};
     auto it = g_surfaces.find(ea);
     if (it != g_surfaces.end() && !it->second.depth) {
+        sync_primary(it->second);
         src = it->second.srv;
         uv[0] = (float)width / it->second.w, uv[1] = (float)height / it->second.h;
     } else if (width && height) {

@@ -241,6 +241,10 @@ FpInfo translate_fp(const FpKey &key) {
     // R and H registers alias on hardware (R0 = H0:H1). Export from whichever
     // view the program actually wrote; the control bit decides only when both are.
     bool fp32 = (wrote_r & 1) && !(wrote_h & 1) ? true : (wrote_h & 1) && !(wrote_r & 1) ? false : (key.control & 0x40) != 0;
+    // Depth export (SHADER_CONTROL bits 1-3): the program's R1.z (H2.z in half
+    // precision) replaces the fragment depth. Killzone 2 writes its quarter-size
+    // depth buffer for depth of field this way.
+    bool depth_export = (key.control & 0xe) != 0;
     std::string h = w;
     for (int t = 0; t < 16; t++) {
         if (!used_tex[t]) continue;
@@ -274,7 +278,8 @@ FpInfo translate_fp(const FpKey &key) {
          "struct PIn { float4 pos : SV_Position;\n";
     for (int k = 1; k < 16; k++) h += "  float4 o" + std::to_string(k) + " : TEXCOORD" + std::to_string(k) + ";\n";
     h += "  bool front : SV_IsFrontFace; };\n"
-         "struct POut { float4 c0 : SV_Target0; float4 c1 : SV_Target1; float4 c2 : SV_Target2; float4 c3 : SV_Target3; };\n"
+         "struct POut { float4 c0 : SV_Target0; float4 c1 : SV_Target1; float4 c2 : SV_Target2; float4 c3 : SV_Target3;" +
+         std::string(depth_export ? " float z : SV_Depth;" : "") + " };\n"
          "POut main(PIn i) {\n"
          "  float4 r[64]; [unroll] for (int k = 0; k < 64; k++) r[k] = 0;\n"
          "  float4 h[64]; [unroll] for (int k = 0; k < 64; k++) h[k] = 0;\n"
@@ -286,6 +291,7 @@ FpInfo translate_fp(const FpKey &key) {
          body + "  POut o;\n";
     if (fp32) h += "  o.c0 = r[0]; o.c1 = r[2]; o.c2 = r[3]; o.c3 = r[4];\n";
     else h += "  o.c0 = h[0]; o.c1 = h[4]; o.c2 = h[6]; o.c3 = h[8];\n";
+    if (depth_export) h += fp32 ? "  o.z = saturate(r[1].z);\n" : "  o.z = saturate(h[2].z);\n";
     if (key.alpha_func) {
         static const char *ops[] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
         uint32_t f = key.alpha_func - 0x200;
