@@ -47,11 +47,12 @@ void host_sleep_us(uint32_t us) {
     WaitForSingleObject(timer, INFINITE);
 }
 
-// KZ2_FAST_WAKE=1 (experiment): no sleeps longer than 50 us in wait loops, and the
+// Fast wake (default; KZ2_FAST_WAKE=0 off): no sleeps longer than 50 us in wait loops, and the
 // SPURS ready monitor polls every 100 us - tests whether frames are bound by how
 // quickly waiting threads notice work, rather than by the work itself.
 bool fast_wake() {
-    static const bool on = getenv("KZ2_FAST_WAKE") && atoi(getenv("KZ2_FAST_WAKE"));
+    // Default on: frames are latency-bound by SPU/PPU hand-offs (KZ2_FAST_WAKE=0: off).
+    static const bool on = !getenv("KZ2_FAST_WAKE") || atoi(getenv("KZ2_FAST_WAKE"));
     return on;
 }
 

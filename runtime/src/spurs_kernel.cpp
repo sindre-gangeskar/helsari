@@ -351,7 +351,11 @@ HLE(cellSpursAddWorkloadWithAttribute) {
         }
         g_line_notify[line_index(line)] = 1;
     }
-    if (const char *e = getenv("KZ2_SPURS_BOOST"))
+    // Default: jm_anim (animation, which the main thread waits for) on up to 4 instances;
+    // KZ2_SPURS_BOOST="" disables, or lists other "name:n" pairs.
+    const char *boost_env = getenv("KZ2_SPURS_BOOST");
+    if (!boost_env) boost_env = "jm_anim:4";
+    if (const char *e = boost_env)
         for (const char *q = e; *q;) {
             const char *c = strchr(q, ':'), *end = strchr(q, ',');
             if (!end) end = q + strlen(q);
