@@ -1,8 +1,11 @@
 // SPURS custom workloads: the game registers its own SPU policy modules
 // (e.g. the Job Manager) with cellSpursAddWorkloadWithAttribute and wakes
-// them with cellSpursReadyCountStore. Each workload gets a host thread with
-// its own SpuThread that runs the policy module the way the SPURS kernel
-// does: module at LS 0xA00, kernel context at LS 0x100, r3 = context,
+// them with cellSpursReadyCountStore. Like SPURS, which runs a workload on as
+// many SPUs as its ready count and maximum contention allow, each workload gets
+// several SPU instances (host thread + SpuThread each); instance k runs while the
+// ready count is above k. Job chains are built for this: their policy modules
+// take jobs from shared queues with atomic DMA. Each instance runs the module
+// the way the SPURS kernel does: module at LS 0xA00, kernel context at LS 0x100, r3 = context,
 // r4 = workload argument. The kernel's "select workload" and "exit" entry
 // points are trapped and serviced natively.
 #include "kernel.h"
@@ -16,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #define REG(n) hle_register(#n, hle_##n)
 
@@ -41,11 +45,24 @@ struct Workload {
     uint8_t *ready_byte() const { return (uint8_t *)mem::ptr(spurs + 0x00 + id); }
     uint8_t *contention_byte() const { return (uint8_t *)mem::ptr(spurs + 0x10 + id); }
     uint8_t ready() const { return __atomic_load_n(ready_byte(), __ATOMIC_SEQ_CST); }
-    std::atomic<bool> running{false}, shutdown{false};
+    std::atomic<int> running{0};          // instances inside the policy module
+    std::atomic<bool> shutdown{false};
     std::mutex m;
     std::condition_variable cv;
-    std::unique_ptr<spu::SpuThread> spu;
+    std::vector<std::unique_ptr<spu::SpuThread>> spus;   // one per instance
 };
+
+// SPU instances per workload: the game's SPURS instance has 5 SPUs (KZ2_SPURS_SPUS
+// overrides; 1 = the old single-instance behaviour), capped by maxContention.
+int instances_for(uint32_t max_contention) {
+    static const int n = [] {
+        const char *e = getenv("KZ2_SPURS_SPUS");
+        int v = e ? atoi(e) : 5;
+        return v < 1 ? 1 : v > 8 ? 8 : v;
+    }();
+    int m = max_contention ? (int)max_contention : n;
+    return std::min(n, m);
+}
 
 std::mutex g_lock;
 std::map<uint32_t, std::unique_ptr<Workload>> g_workloads;
@@ -57,12 +74,12 @@ Workload *find(uint32_t wid) {
     return it == g_workloads.end() ? nullptr : it->second.get();
 }
 
-void init_context(Workload &w, spu::SpuThread &s) {
+void init_context(Workload &w, spu::SpuThread &s, uint32_t spu_num) {
     // SpursKernelContext fields the policy module reads.
     s.ls_written(CTX_ADDR, 0x100);
     memset(s.ls + CTX_ADDR, 0, 0x100);
     s.set_ls32(CTX_ADDR + 0xc0, 0), s.set_ls32(CTX_ADDR + 0xc4, w.spurs);    // 0x1C0: spurs (u64)
-    s.set_ls32(CTX_ADDR + 0xc8, 0);                                           // 0x1C8: spuNum
+    s.set_ls32(CTX_ADDR + 0xc8, spu_num);                                     // 0x1C8: spuNum
     s.set_ls32(CTX_ADDR + 0xcc, 31);                                          // 0x1CC: dmaTagId
     s.set_ls32(CTX_ADDR + 0xd0, 0), s.set_ls32(CTX_ADDR + 0xd4, w.pm);       // 0x1D0: wklCurrentAddr
     s.set_ls32(CTX_ADDR + 0xd8, w.size);                                      // 0x1D8: wklCurrentUniqueId / size
@@ -72,9 +89,9 @@ void init_context(Workload &w, spu::SpuThread &s) {
 }
 
 // Runs the policy module whenever the workload has work (ready count > 0).
-void workload_thread(Workload *w) {
-    auto &s = *w->spu;
-    s.name = "spurs:" + (w->name.empty() ? std::to_string(w->id) : w->name);
+void workload_thread(Workload *w, int k) {
+    auto &s = *w->spus[k];
+    s.name = "spurs:" + (w->name.empty() ? std::to_string(w->id) : w->name) + (k ? "#" + std::to_string(k) : "");
     name_host_thread(s.name);
     if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;   // exclude from tracing
@@ -82,8 +99,13 @@ void workload_thread(Workload *w) {
     s.code_loaded(PM_ADDR, w->pm, w->size);         // native code for the policy module, if compiled
     s.set_trap(SELECT_WORKLOAD_ADDR);
     s.set_trap(EXIT_ADDR);
-    s.on_trap = [w](spu::SpuThread &t) {
+    // Idle detection (see IdleBackoff): an idle job manager calls "select workload"
+    // in a tight loop, or exits and is restarted at once; quick repeats back off.
+    using clock = std::chrono::steady_clock;
+    auto trap_idle = std::make_shared<IdleBackoff>();
+    s.on_trap = [w, trap_idle](spu::SpuThread &t) {
         if (t.pc == EXIT_ADDR) return false;            // module returned to the kernel
+        trap_idle->poll(true);                           // idle only if called again at once
         // Select workload / poll status: keep running this workload unless it
         // has been shut down. Result in r3: non-zero asks the module to exit.
         t.gpr[3] = spu::V{{w->shutdown ? 1u : 0u, 0, 0, 0}};
@@ -96,17 +118,24 @@ void workload_thread(Workload *w) {
         return false;
     };
     spurs_connect_events(s, w->spurs);
-    LOG("spurs", "workload %u '%s': policy module 0x%x (%u bytes), arg 0x%llx", w->id, w->name.c_str(), w->pm,
-        w->size, (unsigned long long)w->data);
+    if (k == 0)
+        LOG("spurs", "workload %u '%s': policy module 0x%x (%u bytes), arg 0x%llx, %zu SPU instances", w->id,
+            w->name.c_str(), w->pm, w->size, (unsigned long long)w->data, w->spus.size());
     uint64_t runs = 0;
+    IdleBackoff exit_idle;
     while (!w->shutdown) {
         {
             std::unique_lock<std::mutex> lk(w->m);
-            w->cv.wait_for(lk, std::chrono::milliseconds(1), [w] { return w->ready() > 0 || w->shutdown; });
+            // Sleep until there is work for this instance. The ready count changes by SPU
+            // atomics, which notify no one, so ready_monitor() polls it for everyone (one
+            // thread instead of each instance polling: libc++'s wait_for rounds short
+            // timeouts down to 0 ms on Windows, so a 1 ms poll loop mostly spins).
+            w->cv.wait(lk, [w, k] { return w->ready() > k || w->shutdown; });
         }
         if (w->shutdown) break;
-        if (w->ready() == 0) continue;
-        init_context(*w, s);
+        if (w->ready() <= k) continue;
+        if (k && runs == 0) LOG("spurs", "%s: extra SPU instance running (ready %d)", s.name.c_str(), w->ready());
+        init_context(*w, s, k);
         for (auto &g : s.gpr) g = spu::V{};
         s.gpr[1] = spu::V{{0x3fff0, 0, 0, 0}};           // stack pointer at the top of LS
         s.gpr[3] = spu::V{{CTX_ADDR, 0, 0, 0}};
@@ -114,16 +143,18 @@ void workload_thread(Workload *w) {
         s.pc = PM_ADDR;
         s.interrupts = false, s.event_mask = 0, s.event_stat = 0, s.dec_armed = false, s.stall_stat = 0;
         for (auto &l : s.stalled) l.active = false;
-        w->running = true;
-        { mem::LineGuard g(w->spurs); __atomic_store_n(w->contention_byte(), 1, __ATOMIC_SEQ_CST); }
+        w->running++;
+        { mem::LineGuard g(w->spurs); __atomic_add_fetch(w->contention_byte(), 1, __ATOMIC_SEQ_CST); }
         // Log the first few runs of each workload, then every 1000th.
         bool log = runs < 5 || runs % 1000 == 0;
         if (log) LOG("spurs", "%s: run #%llu (ready %d)", s.name.c_str(), (unsigned long long)runs, w->ready());
+        auto t_run = clock::now();
         s.run();
         if (log) LOG("spurs", "%s: exited at 0x%x", s.name.c_str(), s.pc);
+        exit_idle.step(clock::now() - t_run < std::chrono::microseconds(30));   // found nothing to do
         runs++;
-        { mem::LineGuard g(w->spurs); __atomic_store_n(w->contention_byte(), 0, __ATOMIC_SEQ_CST); }
-        w->running = false;
+        { mem::LineGuard g(w->spurs); __atomic_sub_fetch(w->contention_byte(), 1, __ATOMIC_SEQ_CST); }
+        w->running--;
     }
 }
 
@@ -218,14 +249,29 @@ HLE(cellSpursWorkloadAttributeSetName) {
     st32(ARG32(0) + A_INSTANCE, ARG32(2));
     RET(0);
 }
+// Wakes SPU instances: one thread checks every workload each millisecond and
+// notifies those asking for more SPUs (ready count) than are running.
+void ready_monitor() {
+    name_host_thread("spurs ready monitor");
+    for (;;) {
+        host_sleep_us(1000);
+        std::lock_guard<std::mutex> lk(g_lock);
+        for (auto &[id, w] : g_workloads)
+            if (w->ready() > w->running) w->cv.notify_all();
+    }
+}
+
 HLE(cellSpursAddWorkloadWithAttribute) {
     // (spurs, u32 *wid, attr)
+    static std::once_flag monitor;
+    std::call_once(monitor, [] { std::thread(ready_monitor).detach(); });
     uint32_t a = ARG32(2);
     auto w = std::make_unique<Workload>();
     w->spurs = ARG32(0);
     w->pm = ld32(a + A_PM), w->size = ld32(a + A_SIZE), w->data = ld64(a + A_DATA);
     if (ld32(a + A_INSTANCE)) w->name = mem::cstr(ld32(a + A_INSTANCE));
-    w->spu = std::make_unique<spu::SpuThread>();
+    int n = instances_for(ld32(a + A_MAXC));
+    for (int k = 0; k < n; k++) w->spus.push_back(std::make_unique<spu::SpuThread>());
     Workload *p = w.get();
     {
         std::lock_guard<std::mutex> lk(g_lock);
@@ -233,7 +279,7 @@ HLE(cellSpursAddWorkloadWithAttribute) {
         g_workloads[p->id] = std::move(w);
     }
     st32(ARG32(1), p->id);
-    std::thread(workload_thread, p).detach();
+    for (int k = 0; k < n; k++) std::thread(workload_thread, p, k).detach();
     RET(0);
 }
 HLE(cellSpursReadyCountStore) {
@@ -265,7 +311,7 @@ HLE(cellSpursShutdownWorkload) {
 }
 HLE(cellSpursWaitForWorkloadShutdown) {
     if (Workload *w = find(ARG32(1)))
-        while (w->running) std::this_thread::yield();
+        for (uint32_t n = 0; w->running; n++) host_backoff(n);
     RET(0);
 }
 HLE(cellSpursRemoveWorkload) { RET(0); }
