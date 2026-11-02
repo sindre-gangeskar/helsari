@@ -87,8 +87,22 @@ void profiler(int secs) {
             LOG("profile", "CPU time per thread over %d s (100%% = one core):", secs);
             for (size_t i = 0; i < threads.size() && i < 25; i++)
                 LOG("profile", "  %6.1f%%  %s", threads[i].first / 1e5 / secs, names[threads[i].second].c_str());
-            // Where the busiest threads spend their time.
-            for (size_t i = 0; i < threads.size() && i < 3; i++) {
+            // Where the busiest threads spend their time, plus any thread whose name
+            // contains one of KZ2_PROFILE_THREADS="name,name".
+            static const char *want = getenv("KZ2_PROFILE_THREADS");
+            auto wanted = [](const std::string &name) {
+                if (!want) return false;
+                for (const char *p = want; *p;) {
+                    const char *e = strchr(p, ',');
+                    std::string part(p, e ? e - p : strlen(p));
+                    if (!part.empty() && name.find(part) != std::string::npos) return true;
+                    if (!e) break;
+                    p = e + 1;
+                }
+                return false;
+            };
+            for (size_t i = 0; i < threads.size(); i++) {
+                if (i >= 3 && !wanted(names[threads[i].second])) continue;
                 auto &th = hits[threads[i].second];
                 uint64_t n = 0;
                 std::vector<std::pair<uint32_t, uint64_t>> top;

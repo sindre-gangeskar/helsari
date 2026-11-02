@@ -27,6 +27,9 @@ float vp_consts[512 * 4];
 bool vp_consts_dirty = true;
 // Backend costs on the FIFO thread, reported with the fps (rsx::stats_line).
 uint64_t g_wb_us, g_wb_calls, g_draw_us, g_draw_calls, g_present_us;
+// Draws dropped before reaching the GPU, by reason (fps log): no vertex ranges, no render
+// target, index range too large, ring buffer full, no primitives, shader missing.
+uint64_t g_skip[6];
 uint64_t g_wbs_us, g_wbs_n, g_tex_us, g_tex_n, g_compile_us, g_compile_n;   // inside the above
 uint64_t g_fetch_us, g_fetch_verts, g_fetch_used, g_dcall_us, g_map_us;      // vertex fetch (of which Map+copy)
 struct ScopedUs {
@@ -1035,7 +1038,8 @@ void dump_surface(Surface &s, const char *name) {
 }
 
 void draw() {
-    if (!g_ok || g_ranges.empty()) return;
+    if (!g_ok) return;
+    if (g_ranges.empty()) { g_skip[0]++; return; }
     g_draws_this_frame++;
     if (leak_mode() >= 5) return;
     // debug: KZ2_SKIP_DRAWS=a,b,c skips those draw indices in every frame
@@ -1047,7 +1051,7 @@ void draw() {
     }();
     for (int k : skip) if (k == g_draws_this_frame) return;
     Bound b = bind_surfaces();
-    if (!b.w) return;
+    if (!b.w) { g_skip[1]++; return; }
 
     // vertices + indices
     std::vector<uint32_t> src_idx;
@@ -1070,7 +1074,7 @@ void draw() {
             for (uint32_t i = 0; i < r.count; i++) src_idx.push_back(r.first + i);
         }
     }
-    if (vmin > vmax || vmax - vmin > 4 * 1024 * 1024) return;
+    if (vmin > vmax || vmax - vmin > 4 * 1024 * 1024) { g_skip[2]++; return; }
     uint32_t nv = vmax - vmin + 1;
     UINT base_vertex = 0, start_index = 0;   // where this draw's data sits in the rings
     if (leak_mode() != 2) {
@@ -1084,7 +1088,7 @@ void draw() {
         for (uint32_t i = 0; i < nv; i++) fetch_vertex(scratch.data() + (size_t)i * 64, vmin + i);
         ScopedUs map_timer{g_map_us};
         void *vd = ring_map(g_vring, nv * 256, 256, D3D11_BIND_SHADER_RESOURCE, true, &base_vertex);
-        if (!vd) return;
+        if (!vd) { g_skip[3]++; return; }
         memcpy(vd, scratch.data(), (size_t)nv * 256);
         g_ctx->Unmap(g_vring.buf, 0);
     }
@@ -1106,10 +1110,10 @@ void draw() {
         }
         flush_run();
     }
-    if (list.empty()) return;
+    if (list.empty()) { g_skip[4]++; return; }
     if (leak_mode() != 2) {
         uint32_t *id = (uint32_t *)ring_map(g_iring, (UINT)list.size() * 4, 4, D3D11_BIND_INDEX_BUFFER, false, &start_index);
-        if (!id) return;
+        if (!id) { g_skip[3]++; return; }
         memcpy(id, list.data(), list.size() * 4);
         g_ctx->Unmap(g_iring.buf, 0);
     }
@@ -1136,7 +1140,7 @@ void draw() {
     uint16_t remap[16];
     for (int t = 0; t < 16; t++) remap[t] = (reg(0x1a0c + t * 32) & 0x80000000) ? reg(0x1a10 + t * 32) & 0xffff : 0xaae4;
     PsEntry *ps = pixel_shader(fp_ea, texdim, remap);
-    if (!vs || !ps->ps) return;
+    if (!vs || !ps->ps) { g_skip[5]++; return; }
 
     // constants
     static CbSlice s_vc, s_vx, s_px;   // static: a skipped upload (leak_mode 3) keeps the last binding
@@ -1537,7 +1541,13 @@ std::string stats_line(uint32_t frames) {
     g_wb_us = g_wb_calls = g_draw_us = g_draw_calls = g_present_us = 0;
     g_wbs_us = g_wbs_n = g_tex_us = g_tex_n = g_compile_us = g_compile_n = 0;
     g_fetch_us = g_fetch_verts = g_fetch_used = g_dcall_us = g_map_us = 0;
-    return b;
+    char sk[200];
+    snprintf(sk, sizeof sk,
+             "; draws skipped per frame: no ranges %.0f, no target %.0f, bad range %.0f, ring full %.0f, no primitives "
+             "%.0f, no shader %.0f",
+             g_skip[0] / f, g_skip[1] / f, g_skip[2] / f, g_skip[3] / f, g_skip[4] / f, g_skip[5] / f);
+    memset(g_skip, 0, sizeof g_skip);
+    return std::string(b) + sk;
 }
 
 // Debug: KZ2_SCREENSHOT=<sec> writes the presented frame, half size, to
