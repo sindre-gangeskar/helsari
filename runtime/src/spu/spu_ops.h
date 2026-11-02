@@ -6,6 +6,7 @@
 #include "spu.h"
 #include "runtime.h"
 
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 
@@ -251,6 +252,13 @@ inline int32_t sext(uint32_t v, int bits) { return (int32_t)(v << (32 - bits)) >
 
 // Flush single-precision denormals to zero, as the SPU does.
 inline float ftz(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f; }
+// SPU single precision has no infinities or NaNs: exponent 255 is an ordinary (huge)
+// number, and results saturate at the largest magnitude instead of overflowing. Code
+// relies on it - e.g. 1/0 followed by huge * 0 = 0 - where IEEE gives inf * 0 = NaN,
+// which the final float->int conversion turned into 0 (Killzone 2's per-object
+// lighting probes came out black). spf: an operand; spr: a result.
+inline float spf(float f) { return std::isfinite(f) ? ftz(f) : std::copysign(FLT_MAX, f); }
+inline float spr(float f) { return std::isfinite(f) ? ftz(f) : std::isnan(f) ? 0.0f : std::copysign(FLT_MAX, f); }
 
 inline V splat(uint32_t v) { return V{{v, v, v, v}}; }
 
@@ -530,15 +538,15 @@ template <Op OP> SPU_INLINE uint32_t step(SpuThread &t, uint32_t x, uint32_t pc)
     case HBR: case HBRA: case HBRR: case NOP: case LNOP: case SYNC: case DSYNC: break;
 
     /* ---------- single precision ---------- */
-    case FA: for (int i = 0; i < 4; i++) r.set_f(i, ftz(ftz(va.f(i)) + ftz(vb.f(i)))); t.gpr[rt] = r; break;
-    case FS: for (int i = 0; i < 4; i++) r.set_f(i, ftz(ftz(va.f(i)) - ftz(vb.f(i)))); t.gpr[rt] = r; break;
-    case FM: for (int i = 0; i < 4; i++) r.set_f(i, ftz(ftz(va.f(i)) * ftz(vb.f(i)))); t.gpr[rt] = r; break;
-    case FMA: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, ftz(ftz(va.f(i)) * ftz(vb.f(i)) + ftz(C.f(i)))); t.gpr[(x >> 21) & 0x7f] = r; break; }
-    case FMS: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, ftz(ftz(va.f(i)) * ftz(vb.f(i)) - ftz(C.f(i)))); t.gpr[(x >> 21) & 0x7f] = r; break; }
-    case FNMS: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, ftz(ftz(C.f(i)) - ftz(va.f(i)) * ftz(vb.f(i)))); t.gpr[(x >> 21) & 0x7f] = r; break; }
+    case FA: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) + spf(vb.f(i)))); t.gpr[rt] = r; break;
+    case FS: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) - spf(vb.f(i)))); t.gpr[rt] = r; break;
+    case FM: for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(va.f(i)) * spf(vb.f(i)))); t.gpr[rt] = r; break;
+    case FMA: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) + spf(C.f(i)))); t.gpr[(x >> 21) & 0x7f] = r; break; }
+    case FMS: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spr(spf(va.f(i)) * spf(vb.f(i))) - spf(C.f(i)))); t.gpr[(x >> 21) & 0x7f] = r; break; }
+    case FNMS: { const V &C = t.gpr[rt]; for (int i = 0; i < 4; i++) r.set_f(i, spr(spf(C.f(i)) - spr(spf(va.f(i)) * spf(vb.f(i))))); t.gpr[(x >> 21) & 0x7f] = r; break; }
     // frest/frsqest return the exact value; fi then passes it through.
-    case FREST: for (int i = 0; i < 4; i++) r.set_f(i, ftz(1.0f / ftz(va.f(i)))); t.gpr[rt] = r; break;
-    case FRSQEST: for (int i = 0; i < 4; i++) r.set_f(i, ftz(1.0f / std::sqrt(std::fabs(ftz(va.f(i)))))); t.gpr[rt] = r; break;
+    case FREST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / spf(va.f(i)))); t.gpr[rt] = r; break;
+    case FRSQEST: for (int i = 0; i < 4; i++) r.set_f(i, spr(1.0f / std::sqrt(std::fabs(spf(va.f(i)))))); t.gpr[rt] = r; break;
     case FI: t.gpr[rt] = vb; break;
     case FCEQ: for (int i = 0; i < 4; i++) r.w[i] = ftz(va.f(i)) == ftz(vb.f(i)) ? ~0u : 0; t.gpr[rt] = r; break;
     case FCMEQ: for (int i = 0; i < 4; i++) r.w[i] = std::fabs(ftz(va.f(i))) == std::fabs(ftz(vb.f(i))) ? ~0u : 0; t.gpr[rt] = r; break;
