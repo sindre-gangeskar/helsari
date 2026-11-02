@@ -103,6 +103,10 @@ void SpuThread::mfc_command(uint32_t cmd) {
         run_list(cmd, mfc_tag & 31, lsa, ea & (LS_SIZE - 8), 0, size / 8);
         break;
     case 0xd0: {                                    // GETLLAR
+        // The same line read again at once with the same contents: the SPU is polling
+        // (an idle job queue, a held lock). Back off so a waiting SPU does not occupy a
+        // host core. Re-reads with work in between are normal and never slowed.
+        llar_idle.poll(raddr == (ea & ~127u) && !memcmp(rdata, ea_ptr(raddr), 128));
         raddr = ea & ~127u;
         memcpy(rdata, ea_ptr(raddr), 128);
         ls_written(lsa & ~127u, 128);
@@ -191,7 +195,8 @@ uint32_t SpuThread::read_channel(int ch) {
         {
             auto t0 = std::chrono::steady_clock::now();
             uint32_t e;
-            while (!(e = pending_events()) && event_mask) std::this_thread::yield();
+            // yield() returns at once when no other thread is ready: back off to real sleeps.
+            for (uint32_t n = 0; !(e = pending_events()) && event_mask; n++) host_backoff(n);
             g_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
             return e;
         }

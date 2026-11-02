@@ -72,6 +72,11 @@ void log_msg(const char *chan, const char *fmt, ...);
 [[noreturn]] void fatal(const char *fmt, ...);
 /* Name the calling host thread (shown by the profiler and debuggers). */
 void name_host_thread(const std::string &name);
+/* Sleep about `us` microseconds without occupying the core (high-resolution
+   waitable timer; plain Sleep() rounds up to a whole timer tick). */
+void host_sleep_us(uint32_t us);
+/* host_backoff (wait-loop step) and IdleBackoff (guest polling-loop detector). */
+#include "idle_backoff.h"
 
 /* ---- HLE ---- */
 #define ARG(n) (ctx->r[3 + (n)])

@@ -201,15 +201,20 @@ void fifo_thread() {
     while (!g_hwnd) Sleep(1);
     rsx::init(g_hwnd);
     int trace = getenv("KZ2_TRACE_RSX") ? 400 : 0;
-    uint32_t last_put = 0;
+    uint32_t last_put = 0, idle = 0;
     for (;;) {
         uint32_t get = ld32(CTRL_ADDR + 4), put = ld32(CTRL_ADDR);
-        if (get == put) {
+        // Nothing to do: the buffer is empty, or the game parked the RSX on a jump to
+        // itself (it rewrites that word from its user-command handler to release it).
+        uint32_t ea0 = get != put ? io_ea(get) : 0;
+        bool parked = ea0 && ld32(ea0) == (0x20000000 | get) || ea0 && ld32(ea0) == (get | 1);
+        if (get == put || parked) {
             auto t0 = std::chrono::steady_clock::now();
-            Sleep(0);
+            host_backoff(idle++);
             g_fifo_idle_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
             continue;
         }
+        idle = 0;
         if (trace && put != last_put) { LOG("rsx", "put=0x%x get=0x%x", put, get); last_put = put; }
         uint32_t ea = io_ea(get);
         if (!ea) { LOG("rsx", "FIFO get 0x%x is not io-mapped (put 0x%x); stalling", get, put); Sleep(1000); continue; }

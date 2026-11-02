@@ -29,6 +29,29 @@ void log_msg(const char *chan, const char *fmt, ...) {
     if (g_log_file) { fprintf(g_log_file, "[%s] t%u: %s\n", chan, tid, buf); fflush(g_log_file); }
 }
 
+uint64_t host_now_ns() {
+    static const uint64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (uint64_t)f.QuadPart; }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((unsigned __int128)c.QuadPart * 1000000000u / freq);
+}
+
+void host_sleep_us(uint32_t us) {
+    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                       TIMER_ALL_ACCESS);
+    if (!timer) { Sleep(us >= 1000 ? us / 1000 : 0); return; }
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)us * 10;   // relative, in 100 ns units
+    SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+    WaitForSingleObject(timer, INFINITE);
+}
+
+void host_backoff(uint32_t n) {
+    if (n < 64) YieldProcessor();          // a few hundred ns: the other side is about to answer
+    else if (n < 256) SwitchToThread();    // give the core to a ready thread, if any
+    else host_sleep_us(n < 1024 ? 50 : n < 2048 ? 200 : 1000);   // long idle (~0.25 s): fewer wake-ups
+}
+
 void fatal(const char *fmt, ...) {
     char buf[2048];
     va_list ap;

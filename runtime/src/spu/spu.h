@@ -3,6 +3,8 @@
 // spu_mfc.cpp. Hosts (e.g. the SPURS kernel in spurs_kernel.cpp) drive a
 // SpuThread and may trap LS addresses to run native code instead.
 #pragma once
+#include "idle_backoff.h"
+
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
@@ -178,6 +180,7 @@ struct SpuThread {
     struct Capture { uint32_t lo, hi; bool valid; std::vector<uint8_t> image; uint64_t last_use; };
     Capture caps[4] = {};
     bool cap_any = false;
+    IdleBackoff llar_idle;                 // GETLLAR re-reading an unchanged line at once (spu_mfc.cpp)
     uint64_t cap_clock = 0;
     void loaded_from(uint32_t lsa, uint32_t ea, uint32_t size) {
         for (uint32_t l = lsa >> 7, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 7; l <= e && size; l++) src_delta[l] = ea - lsa;
