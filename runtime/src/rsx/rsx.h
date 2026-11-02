@@ -36,6 +36,7 @@ struct FpKey {
     uint8_t texdim[16];
     uint32_t alpha_func;    // 0 = alpha test off, else GL compare func
     uint16_t remap[16];     // TEXTURE_CONTROL1 channel remap per unit (0xaae4 = identity)
+    uint8_t gamma[16];      // TEXTURE_ADDRESS bits 20-23: sRGB-decode channels R=1 G=2 B=4 A=8
 };
 struct FpInfo { std::string hlsl; uint64_t hash; int mrt_count; };
 FpInfo translate_fp(const FpKey &key);

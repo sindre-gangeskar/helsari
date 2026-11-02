@@ -992,16 +992,17 @@ ID3D11VertexShader *vertex_shader() {
     return vs;
 }
 
-PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t remap[16]) {
+PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t remap[16], const uint8_t gamma[16]) {
     FpScan sc = scan_fp(fp_ea);
     uint32_t control = reg(0x1d60);
     uint32_t alpha = (reg(0x0304) & 1) ? reg(0x0308) : 0;
-    uint64_t h = fnv(remap, 32, fnv(texdim, 16, fnv(&control, 4, fnv(&alpha, 4, sc.hash))));
+    uint64_t h = fnv(gamma, 16, fnv(remap, 32, fnv(texdim, 16, fnv(&control, 4, fnv(&alpha, 4, sc.hash)))));
     auto it = g_ps.find(h);
     if (it != g_ps.end()) return &it->second;
-    FpKey key{fp_ea, control, {}, alpha, {}};
+    FpKey key{fp_ea, control, {}, alpha, {}, {}};
     memcpy(key.texdim, texdim, 16);
     memcpy(key.remap, remap, 32);
+    memcpy(key.gamma, gamma, 16);
     FpInfo fi = translate_fp(key);
     PsEntry e{nullptr, sc.consts};
     if (ID3DBlob *b = compile(fi.hlsl, "ps_5_0", h)) {
@@ -1234,7 +1235,11 @@ void draw() {
     }
     uint16_t remap[16];
     for (int t = 0; t < 16; t++) remap[t] = (reg(0x1a0c + t * 32) & 0x80000000) ? reg(0x1a10 + t * 32) & 0xffff : 0xaae4;
-    PsEntry *ps = pixel_shader(fp_ea, texdim, remap);
+    uint8_t gamma[16];   // per-channel sRGB decode (TEXTURE_ADDRESS bits 20-23); KZ2_NO_TEX_GAMMA=1 ignores it
+    static const bool no_gamma = getenv("KZ2_NO_TEX_GAMMA") != nullptr;
+    for (int t = 0; t < 16; t++)
+        gamma[t] = (!no_gamma && (reg(0x1a0c + t * 32) & 0x80000000)) ? (reg(0x1a08 + t * 32) >> 20) & 0xf : 0;
+    PsEntry *ps = pixel_shader(fp_ea, texdim, remap, gamma);
     if (!vs || !ps->ps) { g_skip[5]++; return; }
 
     // constants

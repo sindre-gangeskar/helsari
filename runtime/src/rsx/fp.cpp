@@ -124,6 +124,10 @@ FpInfo translate_fp(const FpKey &key) {
             uint16_t rm = key.remap[tex];
             if (rm && rm != 0xaae4)
                 e = "remap(" + e + ", uint4(" + std::to_string(rm & 0xff) + ", " + std::to_string(rm >> 8) + ", 0, 0))";
+            // Texture gamma: the flagged channels hold sRGB values; the RSX converts them to linear.
+            if (uint8_t g = key.gamma[tex] & 0xf)
+                e = "srgb(" + e + ", uint4(" + std::to_string(g & 1) + ", " + std::to_string((g >> 1) & 1) + ", " +
+                    std::to_string((g >> 2) & 1) + ", " + std::to_string((g >> 3) & 1) + "))";
             return e;
         };
         std::string e;
@@ -263,6 +267,9 @@ FpInfo translate_fp(const FpKey &key) {
          "  return k == 2 ? (s == 0 ? t.a : s == 1 ? t.r : s == 2 ? t.g : t.b) : k == 1 ? 1 : 0; }\n"
          "float3 cubeflip(float3 d) { float3 a = abs(d), r = -d; if (a.x >= a.y && a.x >= a.z) r.x = d.x; "
          "else if (a.y >= a.z) r.y = d.y; else r.z = d.z; return r; }\n"
+         "float srgb1(float c) { return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4); }\n"
+         "float4 srgb(float4 t, uint4 m) { return float4(m.x ? srgb1(t.x) : t.x, m.y ? srgb1(t.y) : t.y, "
+         "m.z ? srgb1(t.z) : t.z, m.w ? srgb1(t.w) : t.w); }\n"
          "float4 remap(float4 t, uint4 m) { return float4(rmc(t, m.xy, 1), rmc(t, m.xy, 2), rmc(t, m.xy, 3), rmc(t, m.xy, 0)); }\n"
          "struct PIn { float4 pos : SV_Position;\n";
     for (int k = 1; k < 16; k++) h += "  float4 o" + std::to_string(k) + " : TEXCOORD" + std::to_string(k) + ";\n";
