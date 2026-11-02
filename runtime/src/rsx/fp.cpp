@@ -151,7 +151,7 @@ FpInfo translate_fp(const FpKey &key) {
         case 0x13: e = "pk4s(" + s0 + ")"; break;  // PK4: four signed normalised bytes
         case 0x14: e = "up4s(" + s0 + ")"; break;
         case 0x15: e = "ddx(" + s0 + ")"; break;
-        case 0x16: e = "ddy(" + s0 + ")"; break;
+        case 0x16: e = "(-ddy(" + s0 + "))"; break;   // vertically mirrored raster: flip the sign
         case 0x17: e = sample(s0); break;
         case 0x18: e = sample("(" + s0 + ") / (" + s0 + ").w"); break;
         case 0x19: e = sample(s0, "SampleGrad", ", (" + s1 + ").xy, (" + s2 + ").xy"); break;

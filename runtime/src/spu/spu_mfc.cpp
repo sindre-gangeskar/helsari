@@ -44,9 +44,33 @@ void watch(const SpuThread &t, const char *what, uint32_t cmd, uint32_t ea, uint
     if (only_capture && !rsx::capturing()) return;
     const int limit = only_capture ? 300000 : 20000;
     for (auto &w : watch_ranges())
-        if (ea < w.ea + w.len && w.ea < ea + size && logs++ < limit)
-            LOG("spu", "watch: %s %s cmd 0x%x ea 0x%x size 0x%x lsa 0x%x pc 0x%x", t.name.c_str(), what, cmd, ea, size, lsa,
-                t.pc);
+        if (ea < w.ea + w.len && w.ea < ea + size && logs++ < limit) {
+            // Puts also show the first 32 bytes they carry (big-endian words), and whether
+            // the whole transfer is zero.
+            std::string data;
+            if (what[0] == 'g' && size <= 0x4000) {   // gets: what main memory holds right now
+                bool zero = true;
+                const uint8_t *src = (const uint8_t *)mem::ptr(ea);
+                for (uint32_t k = 0; k < size; k++) zero &= src[k] == 0;
+                data = zero ? " data ALL ZERO:" : " data:";
+                for (uint32_t k = 0; k < 48 && k < size; k += 4) {
+                    char s[12];
+                    snprintf(s, sizeof s, " %08x", ld32(ea + k));
+                    data += s;
+                }
+            } else if (what[0] == 'p' && size <= 0x4000) {
+                bool zero = true;
+                for (uint32_t k = 0; k < size; k++) zero &= t.ls[(lsa + k) & (LS_SIZE - 1)] == 0;
+                data = zero ? " data ALL ZERO:" : " data:";
+                for (uint32_t k = 0; k < 32 && k < size; k += 4) {
+                    char s[12];
+                    snprintf(s, sizeof s, " %08x", t.ls32((lsa + k) & (LS_SIZE - 4)));
+                    data += s;
+                }
+            }
+            LOG("spu", "watch: %s %s cmd 0x%x ea 0x%x size 0x%x lsa 0x%x pc 0x%x%s", t.name.c_str(), what, cmd, ea, size, lsa,
+                t.pc, data.c_str());
+        }
 }
 
 // Decrementer ticks at the 79.8 MHz timebase.

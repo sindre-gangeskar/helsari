@@ -871,13 +871,20 @@ void apply_state() {
     }
     g_ctx->OMSetDepthStencilState(ds, reg(0x0334) & 0xff);
 
-    // rasterizer: culling off for now (window-origin flips change winding), scissor on
-    uint32_t sc = 1;
+    // rasterizer: culling off for now, scissor on. Front face (SV_IsFrontFace, used by
+    // two-sided materials to flip normals): we rasterise vertically mirrored relative to
+    // the RSX (see origin_bottom), which reverses winding - an RSX counter-clockwise
+    // front face (0x1834 = 0x901) appears clockwise here, and vice versa.
+    static const bool ff_raw = getenv("KZ2_FRONT_FACE_RAW") != nullptr;   // experiment: no mirror correction
+    bool rsx_ccw = reg(0x1834) != 0x0900;
+    bool front_ccw = ff_raw ? rsx_ccw : !rsx_ccw;
+    uint32_t sc = front_ccw ? 3 : 1;
     auto &rs = g_raster[sc];
     if (!rs) {
         D3D11_RASTERIZER_DESC d{};
         d.FillMode = D3D11_FILL_SOLID;
         d.CullMode = D3D11_CULL_NONE;
+        d.FrontCounterClockwise = front_ccw;
         d.DepthClipEnable = TRUE;
         d.ScissorEnable = TRUE;
         g_dev->CreateRasterizerState(&d, &rs);
@@ -1262,7 +1269,10 @@ void draw() {
     float arf;
     if (ar <= 255) arf = ar / 255.f; else memcpy(&arf, &ar, 4);
     px.alpha_ref[0] = arf;
-    px.wpos[0] = origin_bottom ? 1.f : 0.f;
+    // KZ2_WPOS_FLIP=1 (experiment): report WPOS with the opposite vertical origin from the
+    // one used for rasterisation - tests position-based G-buffer lookups (light volumes).
+    static const bool wpos_flip = !getenv("KZ2_WPOS_FLIP") || atoi(getenv("KZ2_WPOS_FLIP"));   // default on
+    px.wpos[0] = (origin_bottom != wpos_flip) ? 1.f : 0.f;
     px.wpos[1] = (float)(reg(0x1d88) & 0xfff);
     px.wpos[2] = (float)g_aa_sx, px.wpos[3] = (float)g_aa_sy;
     for (size_t k = 0; k < ps->consts.size(); k++)
