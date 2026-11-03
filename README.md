@@ -19,7 +19,7 @@ generated on your machine from your own **legally** obtained copy.
 | RSX (GPU) | Translated to Direct3D 11: shaders to HLSL (cached on disk), render-target cache, vertex decoding on the GPU                |
 | OS        | Threads, synchronisation primitives, memory, file system (`/dev_bdvd` mapped onto your dump), save data                     |
 | Input     | XInput controller mapped to a DualShock 3                                                                                   |
-| Audio     | Not yet: timing works, no sound output                                                                                      |
+| Audio     | cellAudio ports mixed to 7.1 and played through WASAPI                                                                      |
 
 ## Building
 
