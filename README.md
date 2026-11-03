@@ -4,16 +4,9 @@
 <p align="center" width="100%">
       <img src=".github/assets/images/helsari_message_board.webp" alt="Helsari Message Board"/>
 </p>
-
-<span style="display: block; text-align: center;">
-</span>
-
-
-## Note
-
-**This repository contains no game code or data.** Everything game-derived is
-generated on your machine from your own **legally** obtained copy.
-
+<p align="center" width="100%">
+      <img src=".github/assets/images/helsari_note.webp" alt="Helsari Note"/>
+</p>
 
 ## Components
 
