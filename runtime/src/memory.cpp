@@ -11,6 +11,7 @@
 
 #include <map>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -19,6 +20,23 @@
 uint8_t *g_mem;
 uint32_t g_line_locks[LINE_LOCKS];
 uint8_t g_line_notify[LINE_LOCKS];
+uint32_t g_line_waiters[LINE_LOCKS];
+
+// Waiting on a line: the commit count (g_line_seq) is the wait address; line_unlock calls
+// line_notify for flagged lines after every commit, which wakes the waiters here.
+void line_wait(uint64_t ea, const void *seen, uint32_t timeout_us) {
+    uint32_t i = line_index(ea);
+    g_line_notify[i] = 1;                                   // stays set: one byte check per commit
+    __atomic_fetch_add(&g_line_waiters[i], 1, __ATOMIC_SEQ_CST);
+    uint32_t seq = line_seq(ea);
+    if (!memcmp(seen, g_mem + ((uint32_t)ea & ~127u), 128))   // a commit after this changes seq: no lost wake
+        WaitOnAddress(&g_line_seq[i], &seq, 4, timeout_us >= 1000 ? timeout_us / 1000 : 1);
+    __atomic_fetch_sub(&g_line_waiters[i], 1, __ATOMIC_SEQ_CST);
+}
+void line_wake(uint64_t ea) {
+    uint32_t i = line_index(ea);
+    if (__atomic_load_n(&g_line_waiters[i], __ATOMIC_SEQ_CST)) WakeByAddressAll(&g_line_seq[i]);
+}
 uint32_t g_line_seq[LINE_LOCKS];
 
 namespace mem {

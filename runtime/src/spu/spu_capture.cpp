@@ -13,6 +13,7 @@
 #include "runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
@@ -48,10 +49,19 @@ uint64_t image_hash(uint32_t ls_base, const uint8_t *p, size_t n) {
     return h;
 }
 
+// Mask bytes: 0x10 | one bit per executed word of the quadword. Older files hold 1 for
+// "executed" (the whole quadword). Comparing per word matters: programs keep data
+// words next to their code (a variable after a branch) that differ between loads.
+uint32_t word_bits(uint8_t v) { return !v ? 0 : (v & 0x10) ? (v & 0xf) : 0xf; }
+bool same_words(const uint8_t *a, const uint8_t *b, uint32_t bits, size_t avail) {
+    for (uint32_t w = 0; w < 4 && w * 4 < avail; w++)
+        if ((bits >> w & 1) && memcmp(a + w * 4, b + w * 4, 4)) return false;
+    return true;
+}
 bool same_code(const Entry &e, const std::vector<uint8_t> &image, const std::vector<uint8_t> &mask) {
     for (size_t q = 0; q < mask.size(); q++)
-        if ((mask[q] || e.mask[q]) && memcmp(&e.image[q * 16], &image[q * 16], std::min<size_t>(16, image.size() - q * 16)))
-            return false;
+        if (uint32_t bits = word_bits(mask[q]) | word_bits(e.mask[q]))
+            if (!same_words(&e.image[q * 16], &image[q * 16], bits, image.size() - q * 16)) return false;
     return true;
 }
 
@@ -95,11 +105,13 @@ void save(uint32_t ls_base, const std::vector<uint8_t> &image, const std::vector
         g_cache.push_back({ls_base, image, std::vector<uint8_t>(mask.size()), path});
         e = &g_cache.back();
     }
-    for (size_t q = 0; q < mask.size(); q++)
-        if (mask[q] && !e->mask[q]) {
-            e->mask[q] = 1, grew = true;
-            memcpy(&e->image[q * 16], &image[q * 16], std::min<size_t>(16, image.size() - q * 16));
-        }
+    for (size_t q = 0; q < mask.size(); q++) {
+        uint32_t had = word_bits(e->mask[q]), add = word_bits(mask[q]) & ~had;
+        if (!add) continue;
+        e->mask[q] = (uint8_t)(0x10 | had | add), grew = true;
+        for (uint32_t w = 0; w < 4 && q * 16 + w * 4 < image.size(); w++)
+            if (add >> w & 1) memcpy(&e->image[q * 16 + w * 4], &image[q * 16 + w * 4], 4);
+    }
     if (!grew) return;
     std::filesystem::create_directories(CACHE_DIR);
     // Written to a temporary name and renamed: a killed process never leaves a partial file.
@@ -116,9 +128,9 @@ void save(uint32_t ls_base, const std::vector<uint8_t> &image, const std::vector
     static int logs;
     if (logs++ < 30) {
         size_t qws = 0;
-        for (uint8_t b : e->mask) qws += b;
+        for (uint8_t b : e->mask) qws += __builtin_popcount(word_bits(b));
         LOG("spu", "capture: %s (%u bytes at LS 0x%x, %zu instructions)", e->path.c_str(), (unsigned)image.size(), ls_base,
-            qws * 4);
+            qws);
     }
 }
 } // namespace
@@ -139,15 +151,23 @@ void SpuThread::begin_capture(uint32_t pc) {
     uint32_t l = pc >> 7, d = src_delta[l];
     slot->last_use = ++cap_clock;
     slot->lo = l << 7, slot->hi = slot->lo + 128, slot->valid = false;   // nothing to capture: remember the line
-    if (!g_capture_on || !d || line_mapped(*this, l)) return;
+    if (!g_capture_on || !d || line_mapped(*this, l)) {
+        static std::atomic<int> logs{0};
+        if (g_capture_on && pc >= 0x5000 && pc < 0x3f000 && logs++ < 30) LOG("spu", "%s: no capture at pc 0x%x (delta 0x%x, mapped %d)", name.c_str(), pc, d, (int)line_mapped(*this, l));
+        return;
+    }
     uint32_t lo = l, hi = l + 1;
     while (lo > 0 && src_delta[lo - 1] == d && !line_mapped(*this, lo - 1)) lo--;
     while (hi < LS_SIZE / 128 && src_delta[hi] == d && !line_mapped(*this, hi)) hi++;
-    if ((hi - lo) * 128 > MAX_IMAGE) return;
+    if ((hi - lo) * 128 > MAX_IMAGE) {
+        static std::atomic<int> logs{0};
+        if (logs++ < 20) LOG("spu", "%s: no capture at pc 0x%x: image 0x%x-0x%x too large", name.c_str(), pc, lo << 7, hi << 7);
+        return;
+    }
     slot->lo = lo << 7, slot->hi = hi << 7, slot->valid = true;
     slot->image.assign(ls + slot->lo, ls + slot->hi);
     memset(exec_q + lo * 8, 0, (hi - lo) * 8);
-    exec_q[pc >> 4] = 1;
+    exec_q[pc >> 4] = 0x10 | (1 << ((pc >> 2) & 3));
 }
 
 void SpuThread::flush_capture(Capture &c) {

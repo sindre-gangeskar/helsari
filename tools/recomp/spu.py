@@ -325,7 +325,7 @@ def module_table(table, symbol):
             out.append(f'static const uint8_t {tag}_image[] = {{\n{byte_array(m.code)}}};')
             image = f'{tag}_image'
         if m.protect is not None:
-            out.append(f'static const uint8_t {tag}_protect[] = {{{",".join("1" if b else "0" for b in m.protect)}}};')
+            out.append(f'static const uint8_t {tag}_protect[] = {{{",".join(str(15 if b is True else int(b)) for b in m.protect)}}};')
             protect = f'{tag}_protect'
         rows.append(f'    {{"{m.name}", 0x{m.src_ea:x}, 0x{m.ls_base:x}, 0x{len(m.code):x}, {tag}_entries, '
                     f'{len(entries)}, {image}, {protect}}},')
@@ -396,8 +396,13 @@ def read_cache_files(cache_dir):
         nmask = (size + grain - 1) // grain if grain else 0
         if not grain or len(d) < 12 + nmask + size:
             continue
-        mask = [d[12 + q * 16 // grain] != 0 for q in range((size + 15) // 16)]
+        # per quadword: a bit per executed word (0x10 | bits); older files: nonzero = all four
+        mask = [word_bits(d[12 + q * 16 // grain]) for q in range((size + 15) // 16)]
         yield path, ls_base, mask, d[12 + nmask:12 + nmask + size]
+
+
+def word_bits(v):
+    return 0 if not v else (v & 0xf) if v & 0x10 else 0xf
 
 
 def capture_hash(ls_base, image):
@@ -411,7 +416,7 @@ def capture_hash(ls_base, image):
 def write_capture(cache_dir, ls_base, mask, image):
     path = os.path.join(cache_dir, f'{ls_base:05x}_{capture_hash(ls_base, image):016x}.bin')
     with open(path, 'wb') as f:
-        f.write(struct.pack('<4sII', b'SPC2', ls_base, len(image)) + bytes(1 if b else 0 for b in mask) + image)
+        f.write(struct.pack('<4sII', b'SPC2', ls_base, len(image)) + bytes(0x10 | b if b else 0 for b in mask) + image)
 
 
 def read_cache(cache_dir):
@@ -442,6 +447,6 @@ def generate_cache(cache_dir, out, log):
     lines, n = module_table(table, 'g_rt_modules')
     lines += [f'extern const int g_rt_module_count = {n};', '', '} // namespace spu', '']
     write_if_changed(files[-1], '\n'.join(lines))
-    compiled = sum(sum(m.protect) for m, _, _, _ in table) * 4
+    compiled = sum(sum(bin(b).count('1') for b in m.protect) for m, _, _, _ in table)
     log(f'SPU cache: {n} captured images, {compiled} instructions compiled')
     return files

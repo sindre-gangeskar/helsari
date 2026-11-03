@@ -183,6 +183,14 @@ void SpuThread::run() {
     } flush{executed, started};
     while (running) {
         if (!(++executed & 1023) && g_hot_on) hot_sample(*this);
+        // Long-lived programs (resident job code, e.g. the MP3 decoder) are never replaced,
+        // so their captures were never saved and never compiled: checkpoint them every 10 s
+        // of interpretation.
+        if (!(executed & ((1u << 22) - 1)) && cap_any) {
+            static thread_local auto last = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (now - last > std::chrono::seconds(10)) last = now, checkpoint_captures();
+        }
         // External interrupt: an enabled event is pending while interrupts are on. Checked
         // every 64 instructions: the check (lock-line compare, clock read) costs far more than
         // an instruction, and hardware delivers events asynchronously anyway.
@@ -201,7 +209,9 @@ void SpuThread::run() {
                     pc = f(*this, pc);
                     continue;
                 }
-            if (code_dirty && map_at(pc)) continue;
+            // KZ2_SPU_MAP_LINES=0: the old rule (look once after any LS write) for comparison.
+            static const bool map_lines = !getenv("KZ2_SPU_MAP_LINES") || atoi(getenv("KZ2_SPU_MAP_LINES"));
+            if ((map_lines ? !line_seen[pc >> 7] : code_dirty) && map_at(pc)) continue;
         }
         interp_once = false;
         note_interpreted(pc);

@@ -55,11 +55,18 @@ bool is_code(const NativeModule *m, uint32_t q) {   // q: quadword index from ls
 // those are all that was compiled, and the rest is data the program may have changed.
 bool image_matches(const uint8_t *ls, const NativeModule *m) {
     if (!m->image) return !memcmp(ls + m->ls_base, mem::ptr(m->src_ea), m->size);
-    // Compare each run of consecutive code quadwords with one memcmp.
+    // protect: per quadword, a bit per executed word (spu_capture.cpp); runs of whole
+    // quadwords are compared with one memcmp, partial ones word by word.
     for (uint32_t off = 0; off < m->size;) {
-        if (!is_code(m, off >> 4)) { off += 16; continue; }
+        uint8_t bits = m->protect[off >> 4] & 0xf;
+        if (bits != 0xf) {
+            for (uint32_t w = 0; w < 4 && off + w * 4 < m->size; w++)
+                if ((bits >> w & 1) && memcmp(ls + m->ls_base + off + w * 4, m->image + off + w * 4, 4)) return false;
+            off += 16;
+            continue;
+        }
         uint32_t end = off;
-        while (end < m->size && is_code(m, end >> 4)) end += 16;
+        while (end < m->size && (m->protect[end >> 4] & 0xf) == 0xf) end += 16;
         end = std::min(end, m->size);
         if (memcmp(ls + m->ls_base + off, m->image + off, end - off)) return false;
         off = end;
@@ -99,13 +106,41 @@ void SpuThread::code_loaded(uint32_t lsa, uint32_t ea, uint32_t size) {
 // code after LS was written, compare LS with every module covering pc.
 bool SpuThread::map_at(uint32_t pc) {
     code_dirty = false;
+    line_seen[pc >> 7] = 1;
     if (!g_enabled) return false;
     auto try_map = [&](const NativeModule *m) {
         if (pc < m->ls_base || pc >= m->ls_base + m->size || !is_code(m, (pc - m->ls_base) >> 4)) return false;
         for (auto &mp : mapped)
-            if (mp.m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size) return false;
+            if (mp.m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size) {
+                static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
+                static std::atomic<int> logs{0};
+                if (mlog && logs < 30 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos))
+                    logs++, LOG("spu", "%s: %s skipped at pc 0x%x: overlaps mapped %s (0x%x+0x%x)", name.c_str(), m->name, pc,
+                                mp.m->name, mp.m->ls_base, mp.m->size);
+                return false;
+            }
         g_match_tries++;
-        if (!image_matches(ls, m) || !map_module(m)) return false;
+        if (!image_matches(ls, m)) {
+            // Diagnostics (KZ2_SPU_MATCH_LOG=1): which compiled module was rejected, and the
+            // first code quadword where LS differs from the image it was compiled from.
+            // KZ2_SPU_MATCH_LOG=<text>: only threads whose name contains it ("1": all).
+            static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
+            static std::atomic<int> logs{0};
+            if (mlog && logs < 60 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos)) {
+                const uint8_t *img = m->image ? m->image : (const uint8_t *)mem::ptr(m->src_ea);
+                for (uint32_t off = 0; off < m->size; off += 16)
+                    if (is_code(m, off >> 4) && memcmp(ls + m->ls_base + off, img + off, std::min(16u, m->size - off)) &&
+                        (!m->image || !m->protect || (m->protect[off >> 4] & 0xf) == 0xf)) {
+                        logs++;
+                        const uint32_t *x = (const uint32_t *)(ls + m->ls_base + off), *y = (const uint32_t *)(img + off);
+                        LOG("spu", "%s: %s rejected at pc 0x%x: code quadword 0x%x differs (LS %08x %08x %08x %08x, image %08x %08x %08x %08x)",
+                            name.c_str(), m->name, pc, m->ls_base + off, x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]);
+                        break;
+                    }
+            }
+            return false;
+        }
+        if (!map_module(m)) return false;
         // move to the front of the recently used list
         int k = 0;
         while (k < 7 && recent[k] != m) k++;

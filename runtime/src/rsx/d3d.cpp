@@ -1458,8 +1458,80 @@ void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = f
 uint64_t g_seg_ns[8], g_seg_t;
 inline void lap(int i) { uint64_t n = host_now_ns(); g_seg_ns[i] += n - g_seg_t; g_seg_t = n; }
 
+/* ---------------- occlusion queries ----------------
+   ZPASS_PIXEL_CNT reports: CLEAR_REPORT_VALUE (0x17c8) starts a count, draws while
+   SET_ZPASS_PIXEL_COUNT_ENABLE (0x1d84) is on add the samples that pass depth/stencil,
+   GET_REPORT (0x1800) writes the count since the clear. Each enabled stretch is one
+   D3D11 occlusion query; a report's queries are resolved without stalling the GPU
+   (polled every draw, forced at the flip), and the value is written to the report
+   area when known. Killzone 2 fades light sprites (coronas) by these counts; answering
+   "always visible" drew them through walls. KZ2_REPORT_VISIBLE=1: the old answer. */
+std::vector<ID3D11Query *> g_occ_since_clear;   // ended stretches since the last clear
+ID3D11Query *g_occ_active = nullptr;            // current stretch, while counting is on
+bool g_occ_enabled = false;
+struct PendingReport { uint32_t ea; std::vector<ID3D11Query *> queries; uint64_t sum = 0; size_t done = 0; };
+std::vector<PendingReport> g_reports;
+std::vector<ID3D11Query *> g_query_pool;
+std::unordered_map<ID3D11Query *, int> g_query_refs;   // a query can serve several reports
+uint64_t g_occ_reports = 0, g_occ_visible = 0;         // per flip, for the log
+ID3D11Query *occ_new() {
+    ID3D11Query *q = nullptr;
+    if (!g_query_pool.empty()) q = g_query_pool.back(), g_query_pool.pop_back();
+    else {
+        D3D11_QUERY_DESC d{D3D11_QUERY_OCCLUSION, 0};
+        g_dev->CreateQuery(&d, &q);
+    }
+    return q;
+}
+void occ_unref(ID3D11Query *q) { if (--g_query_refs[q] <= 0) g_query_refs.erase(q), g_query_pool.push_back(q); }
+void occ_end_active() {
+    if (!g_occ_active) return;
+    g_ctx->End(g_occ_active);
+    g_query_refs[g_occ_active]++;
+    g_occ_since_clear.push_back(g_occ_active);
+    g_occ_active = nullptr;
+}
+void occ_begin() {
+    if (g_occ_active || !g_occ_enabled) return;
+    if ((g_occ_active = occ_new())) g_ctx->Begin(g_occ_active);
+}
+void occ_clear() {
+    occ_end_active();
+    for (ID3D11Query *q : g_occ_since_clear) occ_unref(q);
+    g_occ_since_clear.clear();
+    occ_begin();
+}
+void write_report(uint32_t ea, uint32_t value) {
+    uint64_t t = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch()).count();
+    st32(ea, (uint32_t)(t >> 32)), st32(ea + 4, (uint32_t)t), st32(ea + 8, value), st32(ea + 12, 0);
+}
+// Resolve finished reports; wait = true blocks until all are (flip, conditional render).
+void occ_poll(bool wait) {
+    for (size_t i = 0; i < g_reports.size();) {
+        PendingReport &r = g_reports[i];
+        while (r.done < r.queries.size()) {
+            UINT64 n = 0;
+            HRESULT hr;
+            while ((hr = g_ctx->GetData(r.queries[r.done], &n, sizeof n, wait ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE &&
+                   wait) {}
+            if (hr != S_OK) break;
+            r.sum += n, r.done++;
+        }
+        if (r.done < r.queries.size()) { i++; continue; }
+        write_report(r.ea, (uint32_t)std::min<uint64_t>(r.sum, 0xffffffffu));
+        g_occ_reports++, g_occ_visible += r.sum != 0;
+        for (ID3D11Query *q : r.queries) occ_unref(q);
+        g_reports[i] = std::move(g_reports.back());
+        g_reports.pop_back();
+    }
+}
+bool g_render_enabled = true;   // SET_RENDER_ENABLE (conditional rendering)
+
 void draw() {
     if (!g_ok) return;
+    if (!g_reports.empty()) occ_poll(false);
+    if (!g_render_enabled) { g_skip[0]++; return; }
     g_seg_t = host_now_ns();
     if (g_ranges.empty()) { g_skip[0]++; return; }
     g_draws_this_frame++;
@@ -1801,6 +1873,7 @@ void draw() {
         LOG("draw", "   surface fmt=%08x %ux%u target=%x color=%x/%x/%x/%x depth=%x pitch=%x", reg(0x0208), b.w, b.h,
             reg(0x0220), b.color[0] ? b.color[0]->ea : 0, b.color[1] ? b.color[1]->ea : 0, b.color[2] ? b.color[2]->ea : 0,
             b.color[3] ? b.color[3]->ea : 0, b.depth ? b.depth->ea : 0, reg(0x020c));
+        LOG("draw", "   zpitch %x, depth %s", reg(0x022c), b.proxied[4] ? "via proxy" : "direct");
         {   // geometry: primitive, index buffer, vertex range, and each enabled attribute as fmt@offset
             std::string attrs;
             for (int a = 0; a < 16; a++)
@@ -2198,6 +2271,11 @@ void clear(uint32_t mask) {
         g_ctx->ClearDepthStencilView(b.dsv, fl, depth, (UINT8)(z & 0xff));
         mark_drawn(*b.depth, b.proxied[4]);
     }
+    if ((int)g_frame == g_log_frame)
+        LOG("draw", "clear mask %x (after draw #%d): %ux%u color=%x depth=%x%s (surface %ux%u, zpitch %x) z=%08x color=%08x",
+            mask, g_draws_this_frame, b.w, b.h, b.color[0] ? b.color[0]->ea : 0, b.depth ? b.depth->ea : 0,
+            b.proxied[4] ? " via proxy" : "", b.depth ? b.depth->w : 0, b.depth ? b.depth->h : 0, reg(0x022c), reg(0x1d8c),
+            reg(0x1d90));
 }
 
 void begin_end(uint32_t prim) {
@@ -2508,6 +2586,13 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     g_ctx->Draw(3, 0);
     maybe_screenshot();
     auto t0 = std::chrono::steady_clock::now();
+    occ_poll(true);   // every occlusion report of the frame is written before the game sees the flip
+    {
+        static int n;
+        if (g_occ_reports && n++ < 10) LOG("rsx", "occlusion reports this frame: %llu (%llu visible)",
+                                            (unsigned long long)g_occ_reports, (unsigned long long)g_occ_visible);
+        g_occ_reports = g_occ_visible = 0;
+    }
     g_swap->Present(0, 0);
     g_present_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -2558,6 +2643,23 @@ void method(uint32_t m, uint32_t arg) {
         break;
     }
     case 0x1d94: clear(arg); break;
+    case 0x1d84:     // SET_ZPASS_PIXEL_COUNT_ENABLE
+        if (g_ok) { g_occ_enabled = arg != 0; if (g_occ_enabled) occ_begin(); else occ_end_active(); }
+        break;
+    case 0x17c8:     // CLEAR_REPORT_VALUE (1: ZPASS_PIXEL_CNT)
+        if (g_ok && arg == 1) occ_clear();
+        break;
+    case 0x1e98: {   // SET_RENDER_ENABLE: mode << 24 | report offset; 1: always draw, 2: only if the count != 0
+        uint32_t mode = arg >> 24, off = arg & 0xffffff, ctx = reg(0x01a8);
+        static int logs;
+        if (logs++ < 8) LOG("rsx", "SET_RENDER_ENABLE mode %u offset 0x%x", mode, off);
+        if (mode != 2) { g_render_enabled = true; break; }
+        uint32_t ea = ctx == 0x66626660 ? mem::LOCAL_BASE + 0x0e000000 + off : io_ea(off);
+        if (!ea) { g_render_enabled = true; break; }
+        occ_poll(true);   // the report this depends on must be known now
+        g_render_enabled = ld32(ea + 8) != 0;
+        break;
+    }
     case 0x1800: {   // GET_REPORT: arg = type << 24 | offset; writes {u64 timer, u32 value, u32 0}
         // Occlusion queries (type 1, ZPASS_PIXEL_CNT) are answered "visible" for now
         // (KZ2_REPORT_ZERO=1 answers 0 instead): unanswered, the game culled objects and
@@ -2569,6 +2671,16 @@ void method(uint32_t m, uint32_t arg) {
         if (logs++ < 24) LOG("rsx", "GET_REPORT type %u offset 0x%x (dma ctx 0x%08x) -> ea 0x%x", type, off, ctx, ea);
         if (!ea) break;
         static const bool zero = getenv("KZ2_REPORT_ZERO") != nullptr;
+        static const bool visible = getenv("KZ2_REPORT_VISIBLE") && atoi(getenv("KZ2_REPORT_VISIBLE"));
+        if (type == 1 && g_ok && !zero && !visible) {
+            occ_end_active();   // close the current stretch; counting continues in a new one
+            PendingReport r{ea, g_occ_since_clear};
+            for (ID3D11Query *q : r.queries) g_query_refs[q]++;
+            if (r.queries.empty()) write_report(ea, 0);
+            else g_reports.push_back(std::move(r));
+            occ_begin();
+            break;
+        }
         uint32_t value = type == 1 ? (zero ? 0 : 0x100000) : 0;
         uint64_t t = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now().time_since_epoch()).count();

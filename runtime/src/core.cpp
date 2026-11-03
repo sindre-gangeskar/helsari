@@ -59,10 +59,16 @@ bool fast_wake() {
 thread_local uint64_t t_backoff_ns;   // time this thread spent in host_backoff sleeps (workload stats)
 uint64_t take_backoff_ns() { uint64_t v = t_backoff_ns; t_backoff_ns = 0; return v; }
 
+// KZ2_SPIN=<n>: polls before sleeping (default 256: 128 pauses, then 128 yields). The
+// spin phases cost CPU (heat), but 64 dropped the frame rate from 30 to ~20.
 void host_backoff(uint32_t n) {
-    if (n < 64) YieldProcessor();          // a few hundred ns: the other side is about to answer
-    else if (n < 256) SwitchToThread();    // give the core to a ready thread, if any
-    else {
+    static const uint32_t spin = [] { const char *e = getenv("KZ2_SPIN"); return e ? (uint32_t)atoi(e) : 256u; }();
+    if (n < spin / 2) YieldProcessor();          // a few hundred ns: the other side is about to answer
+    else if (n < spin) {                         // give the core to a ready thread, if any
+        uint64_t t0 = host_now_ns();
+        SwitchToThread();
+        t_backoff_ns += host_now_ns() - t0;
+    } else {
         uint64_t t0 = host_now_ns();
         host_sleep_us(n < 1024 || fast_wake() ? 50 : n < 2048 ? 200 : 1000);   // long idle (~0.25 s): fewer wake-ups
         t_backoff_ns += host_now_ns() - t0;

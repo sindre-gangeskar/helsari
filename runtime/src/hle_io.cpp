@@ -272,23 +272,50 @@ bool wasapi_open(uint32_t nch, Wasapi &w) {
 void audio_thread() {
     Wasapi w;
     bool out = wasapi_open(OUT_CHANNELS, w);
-    const UINT32 target = 4 * AUDIO_BLOCK_SAMPLES;   // ~21 ms queued at the device
+    const UINT32 target = 8 * AUDIO_BLOCK_SAMPLES;   // ~43 ms queued at the device: rides out CPU spikes
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     LARGE_INTEGER f, t0, t;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
     std::vector<float> mix(OUT_CHANNELS * AUDIO_BLOCK_SAMPLES);
+    // Diagnostics, logged every ~5 s: device underruns (queue empty when we came back),
+    // stale blocks (a port block unchanged since it was last played: the game did not
+    // refill it in time), clipped samples (mix beyond full scale).
+    uint32_t st_under = 0, st_stale = 0, st_clip = 0, st_blocks = 0;
+    float st_peak = 0;
+    std::vector<uint64_t> played_hash(MAX_PORTS * 64, 0);
     for (;;) {
         uint64_t block = g_audio_block.load();
         if (out) {
             UINT32 pad = 0;
             if (FAILED(w.client->GetCurrentPadding(&pad))) out = false;
             else if (pad > target) { host_sleep_us(1000); continue; }
+            else if (pad == 0 && block > 16) st_under++;
         }
         if (!out) {   // no device: pace by the clock
             double due = (double)(block + 1) * AUDIO_BLOCK_SAMPLES / 48000.0;
             do { Sleep(1); QueryPerformanceCounter(&t); } while ((double)(t.QuadPart - t0.QuadPart) / f.QuadPart < due);
         }
         if (out) {
+            // Diagnostics: a port block unchanged since it was last played (counted only).
+            bool stale = false;
+            uint64_t hashes[MAX_PORTS] = {};
+            for (auto &p : g_ports) {
+                if (!p.open || !p.running || !p.nblock || !p.nchannel) continue;
+                const uint32_t n = p.nchannel;
+                const uint32_t *src = (const uint32_t *)mem::ptr(p.addr + (uint32_t)(block % p.nblock) * n * AUDIO_BLOCK_SAMPLES * 4);
+                uint64_t h = 1469598103934665603ull;
+                bool nz = false;
+                for (uint32_t i = 0; i < n * AUDIO_BLOCK_SAMPLES; i++) h = (h ^ src[i]) * 1099511628211ull, nz |= src[i] != 0;
+                hashes[&p - g_ports] = h;
+                if (nz && h == played_hash[(&p - g_ports) * 64 + (block % p.nblock) % 64]) stale = true;
+            }
+            // (Holding playback until a stale block was refilled broke audio: a port the game
+            // leaves idle keeps old non-silent samples, so every block looked stale.)
+            if (stale) st_stale++;
+            for (auto &p : g_ports)
+                if (p.open && p.running && p.nblock && p.nchannel)
+                    played_hash[(&p - g_ports) * 64 + (block % p.nblock) % 64] = hashes[&p - g_ports];
             std::fill(mix.begin(), mix.end(), 0.0f);
             bool any = false;
             for (auto &p : g_ports) {
@@ -304,6 +331,23 @@ void audio_thread() {
                         mix[i * OUT_CHANNELS + c] += v * lv;
                     }
                 any = true;
+            }
+            // Soft limiter: transparent below 0.8, then a smooth knee that never exceeds 1.0
+            // (hard clipping at the device is what made loud moments distort).
+            for (float &v : mix) {
+                float a = v < 0 ? -v : v;
+                if (a > 1.0f) st_clip++;
+                if (a > st_peak) st_peak = a;
+                if (a > 0.8f) {
+                    float x = (a - 0.8f) / 0.2f;                   // 0.. over the knee
+                    float y = 0.8f + 0.2f * (x / (1.0f + x));      // -> 1.0 asymptotically
+                    v = v < 0 ? -y : y;
+                }
+            }
+            if (++st_blocks == 940) {   // ~5 s
+                LOG("audio", "last 5 s: %u underruns, %u stale blocks, %u samples over full scale (limited), peak %.2f", st_under, st_stale,
+                    st_clip, st_peak);
+                st_under = st_stale = st_clip = st_blocks = 0, st_peak = 0;
             }
             BYTE *dst = nullptr;
             if (SUCCEEDED(w.render->GetBuffer(AUDIO_BLOCK_SAMPLES, &dst))) {

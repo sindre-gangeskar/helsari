@@ -143,7 +143,21 @@ void SpuThread::mfc_command(uint32_t cmd) {
         // The same line read again at once with the same contents: the SPU is polling
         // (an idle job queue, a held lock). Back off so a waiting SPU does not occupy a
         // host core. Re-reads with work in between are normal and never slowed.
-        llar_idle.poll(raddr == (ea & ~127u) && !memcmp(rdata, ea_ptr(raddr), 128));
+        {
+            bool unchanged = raddr == (ea & ~127u) && !memcmp(rdata, ea_ptr(raddr), 128);
+            // Long idle (the backoff would sleep): block until the line is committed to
+            // (atomics wake us through line_notify) or a short timeout, instead of
+            // waking every 50 us to look. KZ2_LLAR_WAIT_US=0: backoff sleeps only.
+            static const uint32_t wait_us = [] {
+                const char *e = getenv("KZ2_LLAR_WAIT_US");
+                return e ? (uint32_t)atoi(e) : 1000u;
+            }();
+            if (unchanged && wait_us && llar_idle.streak >= 256 && host_now_ns() - llar_idle.last < 10000) {
+                line_wait(raddr, rdata, wait_us);
+                llar_idle.streak++;
+                llar_idle.last = host_now_ns();
+            } else llar_idle.poll(unchanged);
+        }
         raddr = ea & ~127u;
         memcpy(rdata, ea_ptr(raddr), 128);
         ls_written(lsa & ~127u, 128);

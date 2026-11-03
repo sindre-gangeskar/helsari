@@ -160,6 +160,15 @@ struct SpuThread {
     void code_loaded(uint32_t lsa, uint32_t ea, uint32_t size);
     bool map_module(const NativeModule *m);
     bool code_dirty = true;                // LS written since map_at last looked
+    // Per 128-byte line: written since map_at last looked at a pc in it. map_at runs at the
+    // first interpreted pc of each such line - not just at the first interpreted pc after a
+    // write, which is usually the job kernel, leaving the job's own code (jumped to later)
+    // interpreted for good.
+    uint8_t line_seen[LS_SIZE / 128] = {};   // 0: fresh
+    void mark_fresh(uint32_t lsa, uint32_t size) {
+        if (!size) return;
+        for (uint32_t l = lsa >> 7, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 7; l <= e; l++) line_seen[l] = 0;
+    }
     bool map_at(uint32_t pc);              // map a module whose image LS holds at pc
     // Modules mapped most recently, tried first by map_at: job managers reload the
     // same few job binaries over and over, so the match is nearly always here.
@@ -177,6 +186,7 @@ struct SpuThread {
     // LS [lsa, lsa+size) is about to be written by anything other than a code load.
     void ls_written(uint32_t lsa, uint32_t size) {
         code_dirty = true;
+        mark_fresh(lsa, size);
         if (cap_any && size) capture_overwritten(lsa, size);
         for (uint32_t q = lsa >> 4, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 4; q <= e && size; q++)
             if (code_q[q] == CODE) { unmap_range(lsa, size); return; }
@@ -194,11 +204,12 @@ struct SpuThread {
     IdleBackoff llar_idle;                 // GETLLAR re-reading an unchanged line at once (spu_mfc.cpp)
     uint64_t cap_clock = 0;
     void loaded_from(uint32_t lsa, uint32_t ea, uint32_t size) {
+        mark_fresh(lsa, size);
         for (uint32_t l = lsa >> 7, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 7; l <= e && size; l++) src_delta[l] = ea - lsa;
     }
     // Interpreter hook: pc is about to run without native code.
     void note_interpreted(uint32_t pc) {
-        exec_q[pc >> 4] = 1;
+        exec_q[pc >> 4] |= 0x10 | (1 << ((pc >> 2) & 3));   // per word (see spu_capture.cpp)
         for (auto &c : caps)
             if (pc >= c.lo && pc < c.hi) {
                 if (!(++cap_clock & 0x3fffff)) checkpoint_captures();

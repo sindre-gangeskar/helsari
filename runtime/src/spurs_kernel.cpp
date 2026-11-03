@@ -280,6 +280,7 @@ HLE(cellSpursWorkloadAttributeSetName) {
 // KZ2_SPURS_WAKE_ON_WRITE=0: monitor only.
 namespace { std::atomic<uint32_t> g_spurs_lines[8]; }
 extern "C" void line_notify(uint64_t ea) {
+    line_wake(ea);
     uint32_t line = (uint32_t)ea & ~127u;
     bool ours = false;
     for (auto &l : g_spurs_lines) if (l.load(std::memory_order_relaxed) == line) ours = true;
