@@ -4,8 +4,13 @@
 
 #include <windows.h>
 #include <xinput.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include "idle_backoff.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -197,66 +202,168 @@ HLE(cellPadGetData) {
 }
 
 /* ================================== audio ================================== */
-// One port; a host timer advances the read index every 256 samples (5.33 ms)
-// and posts an event to every registered notify queue, which is what the
-// game's audio thread blocks on. Samples are not played yet.
+// One port: a ring of nBlock blocks of 256 samples (big-endian float, nChannel
+// interleaved) the game mixes into ahead of the read index. Every block the
+// "hardware" plays the block at the read index, advances it and posts an event to
+// every registered notify queue (what the game's audio thread blocks on).
+// Playback goes to the default output device through WASAPI (shared mode, the
+// port's channel count; Windows converts and down-mixes to the device), and the
+// device clock paces the blocks so audio and game stay in step. Without a device,
+// a host timer paces them silently. KZ2_NO_AUDIO=1: no output.
 
 namespace {
-constexpr uint32_t AUDIO_BLOCK_SAMPLES = 256;
-struct AudioPort { uint32_t addr, read_index, nchannel, nblock; bool open, running; };
-AudioPort g_port;
+constexpr uint32_t AUDIO_BLOCK_SAMPLES = 256, MAX_PORTS = 8, OUT_CHANNELS = 8;
+struct AudioPort {
+    uint32_t addr = 0, read_index = 0, nchannel = 0, nblock = 0;
+    std::atomic<bool> open{false}, running{false};
+    std::atomic<float> level{1.0f};
+};
+AudioPort g_ports[MAX_PORTS];
 std::vector<uint64_t> g_notify_keys;
 std::atomic<bool> g_audio_thread{false};
+std::atomic<uint64_t> g_audio_block{0};   // blocks played since start: every port's clock
 
+struct Wasapi { IAudioClient *client = nullptr; IAudioRenderClient *render = nullptr; UINT32 frames = 0; };
+
+bool wasapi_open(uint32_t nch, Wasapi &w) {
+    static const GUID clsid_enum = {0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
+    static const GUID iid_enum = {0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
+    static const GUID iid_client = {0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2}};
+    static const GUID iid_render = {0xf294acfc, 0x3146, 0x4483, {0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2}};
+    static const GUID ieee_float = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+    if (getenv("KZ2_NO_AUDIO") && atoi(getenv("KZ2_NO_AUDIO"))) return false;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator *en = nullptr;
+    IMMDevice *dev = nullptr;
+    if (FAILED(CoCreateInstance(clsid_enum, nullptr, CLSCTX_ALL, iid_enum, (void **)&en))) return false;
+    HRESULT hr = en->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
+    en->Release();
+    if (FAILED(hr)) return false;
+    hr = dev->Activate(iid_client, CLSCTX_ALL, nullptr, (void **)&w.client);
+    dev->Release();
+    if (FAILED(hr)) return false;
+    WAVEFORMATEXTENSIBLE fmt{};
+    fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    fmt.Format.nChannels = (WORD)nch;
+    fmt.Format.nSamplesPerSec = 48000;
+    fmt.Format.wBitsPerSample = 32;
+    fmt.Format.nBlockAlign = (WORD)(nch * 4);
+    fmt.Format.nAvgBytesPerSec = 48000 * nch * 4;
+    fmt.Format.cbSize = sizeof fmt - sizeof fmt.Format;
+    fmt.Samples.wValidBitsPerSample = 32;
+    // PS3 order: L R C LFE, then surround left/right, then back left/right (7.1).
+    fmt.dwChannelMask = nch == 8 ? 0x63f : nch == 6 ? 0x3f : 0x3;
+    fmt.SubFormat = ieee_float;
+    hr = w.client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                              1000000 /* 100 ms */, 0, (WAVEFORMATEX *)&fmt, nullptr);
+    if (FAILED(hr) || FAILED(w.client->GetBufferSize(&w.frames)) ||
+        FAILED(w.client->GetService(iid_render, (void **)&w.render)) || FAILED(w.client->Start())) {
+        LOG("audio", "WASAPI output unavailable (0x%lx): audio is timed but silent", (long)hr);
+        if (w.render) w.render->Release(), w.render = nullptr;
+        w.client->Release(), w.client = nullptr;
+        return false;
+    }
+    LOG("audio", "WASAPI output: %u channels, 48 kHz, device buffer %u frames", nch, w.frames);
+    return true;
+}
+
+// Mixes every running port's block at the read index into one 7.1 stream (2-channel
+// ports onto front left/right), scaled by the port level, then advances all ports.
 void audio_thread() {
-    uint64_t block = 0;
+    Wasapi w;
+    bool out = wasapi_open(OUT_CHANNELS, w);
+    const UINT32 target = 4 * AUDIO_BLOCK_SAMPLES;   // ~21 ms queued at the device
     LARGE_INTEGER f, t0, t;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
+    std::vector<float> mix(OUT_CHANNELS * AUDIO_BLOCK_SAMPLES);
     for (;;) {
-        double due = (double)(block + 1) * AUDIO_BLOCK_SAMPLES / 48000.0;
-        do { Sleep(1); QueryPerformanceCounter(&t); } while ((double)(t.QuadPart - t0.QuadPart) / f.QuadPart < due);
-        block++;
-        if (g_port.running && g_port.nblock) st64(g_port.read_index, block % g_port.nblock);
+        uint64_t block = g_audio_block.load();
+        if (out) {
+            UINT32 pad = 0;
+            if (FAILED(w.client->GetCurrentPadding(&pad))) out = false;
+            else if (pad > target) { host_sleep_us(1000); continue; }
+        }
+        if (!out) {   // no device: pace by the clock
+            double due = (double)(block + 1) * AUDIO_BLOCK_SAMPLES / 48000.0;
+            do { Sleep(1); QueryPerformanceCounter(&t); } while ((double)(t.QuadPart - t0.QuadPart) / f.QuadPart < due);
+        }
+        if (out) {
+            std::fill(mix.begin(), mix.end(), 0.0f);
+            bool any = false;
+            for (auto &p : g_ports) {
+                if (!p.open || !p.running || !p.nblock || !p.nchannel) continue;
+                const uint32_t n = p.nchannel;
+                const uint32_t *src = (const uint32_t *)mem::ptr(p.addr + (uint32_t)(block % p.nblock) * n * AUDIO_BLOCK_SAMPLES * 4);
+                const float lv = p.level.load();
+                for (uint32_t i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
+                    for (uint32_t c = 0; c < n && c < OUT_CHANNELS; c++) {
+                        uint32_t u = __builtin_bswap32(src[i * n + c]);
+                        float v;
+                        memcpy(&v, &u, 4);
+                        mix[i * OUT_CHANNELS + c] += v * lv;
+                    }
+                any = true;
+            }
+            BYTE *dst = nullptr;
+            if (SUCCEEDED(w.render->GetBuffer(AUDIO_BLOCK_SAMPLES, &dst))) {
+                if (any) memcpy(dst, mix.data(), mix.size() * 4);
+                w.render->ReleaseBuffer(AUDIO_BLOCK_SAMPLES, any ? 0 : AUDCLNT_BUFFERFLAGS_SILENT);
+            }
+        }
+        block = g_audio_block.fetch_add(1) + 1;
+        for (auto &p : g_ports)
+            if (p.open && p.running && p.nblock) st64(p.read_index, block % p.nblock);
         for (uint64_t key : g_notify_keys)
             if (uint32_t q = kern::equeue_by_key(key)) kern::equeue_push(q, {0, 0, 0, 0});
     }
 }
+AudioPort *port(uint32_t id) { return id < MAX_PORTS && g_ports[id].open ? &g_ports[id] : nullptr; }
 } // namespace
 
 HLE(cellAudioInit) { RET(0); }
 HLE(cellAudioQuit) { RET(0); }
 HLE(cellAudioPortOpen) {
     // CellAudioPortParam: u64 nChannel, u64 nBlock, u64 attr, float level
-    uint32_t p = ARG32(0);
-    g_port.nchannel = (uint32_t)ld64(p);
-    g_port.nblock = (uint32_t)ld64(p + 8);
-    uint32_t size = g_port.nchannel * g_port.nblock * AUDIO_BLOCK_SAMPLES * 4;
-    g_port.addr = mem::alloc(size, 0x80);
-    memset(mem::ptr(g_port.addr), 0, size);
-    g_port.read_index = mem::alloc(8, 16);
-    st64(g_port.read_index, 0);
-    g_port.open = true;
-    st32(ARG32(1), 0);
-    LOG("audio", "port open: %u channels, %u blocks", g_port.nchannel, g_port.nblock);
+    uint32_t prm = ARG32(0);
+    uint32_t id = 0;
+    while (id < MAX_PORTS && g_ports[id].open) id++;
+    if (id == MAX_PORTS) { RET(0x80310705); return; }   // CELL_AUDIO_ERROR_PORT_FULL
+    AudioPort &p = g_ports[id];
+    p.nchannel = (uint32_t)ld64(prm);
+    p.nblock = (uint32_t)ld64(prm + 8);
+    uint32_t size = p.nchannel * p.nblock * AUDIO_BLOCK_SAMPLES * 4;
+    if (!p.addr) p.addr = mem::alloc(std::max(size, 8u * 8 * AUDIO_BLOCK_SAMPLES * 4), 0x80);   // reused on reopen
+    memset(mem::ptr(p.addr), 0, size);
+    if (!p.read_index) p.read_index = mem::alloc(8, 16);
+    st64(p.read_index, 0);
+    p.level = 1.0f, p.running = false, p.open = true;
+    st32(ARG32(1), id);
+    LOG("audio", "port %u open: %u channels, %u blocks", id, p.nchannel, p.nblock);
     if (!g_audio_thread.exchange(true)) std::thread(audio_thread).detach();
     RET(0);
 }
 HLE(cellAudioGetPortConfig) {
     // CellAudioPortConfig: u32 readIndexAddr, u32 status, u64 nChannel, u64 nBlock, u32 portSize, u32 portAddr
+    AudioPort *p = port(ARG32(0));
+    if (!p) { RET(0x80310709); return; }   // CELL_AUDIO_ERROR_PORT_NOT_OPEN
     uint32_t c = ARG32(1);
-    st32(c, g_port.read_index);
-    st32(c + 4, g_port.running ? 2 : 1);
-    st64(c + 8, g_port.nchannel);
-    st64(c + 16, g_port.nblock);
-    st32(c + 24, g_port.nchannel * g_port.nblock * AUDIO_BLOCK_SAMPLES * 4);
-    st32(c + 28, g_port.addr);
+    st32(c, p->read_index);
+    st32(c + 4, p->running ? 2 : 1);
+    st64(c + 8, p->nchannel);
+    st64(c + 16, p->nblock);
+    st32(c + 24, p->nchannel * p->nblock * AUDIO_BLOCK_SAMPLES * 4);
+    st32(c + 28, p->addr);
     RET(0);
 }
-HLE(cellAudioPortStart) { g_port.running = true; RET(0); }
-HLE(cellAudioPortStop) { g_port.running = false; RET(0); }
-HLE(cellAudioPortClose) { g_port.open = false; RET(0); }
-HLE(cellAudioSetPortLevel) { RET(0); }
+HLE(cellAudioPortStart) { if (AudioPort *p = port(ARG32(0))) p->running = true; RET(0); }
+HLE(cellAudioPortStop) { if (AudioPort *p = port(ARG32(0))) p->running = false; RET(0); }
+HLE(cellAudioPortClose) { if (AudioPort *p = port(ARG32(0))) p->running = false, p->open = false; RET(0); }
+HLE(cellAudioSetPortLevel) {
+    // (u32 port, float level): the level arrives in f1
+    if (AudioPort *p = port(ARG32(0))) p->level = (float)ctx->f[1];
+    RET(0);
+}
 HLE(cellAudioSetNotifyEventQueue) { g_notify_keys.push_back(ARG(0)); RET(0); }
 HLE(cellAudioRemoveNotifyEventQueue) { RET(0); }
 HLE(cellAudioGetPortTimestamp) { st64(ARG32(2), ppu_timebase() / 80); RET(0); }
