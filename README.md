@@ -1,4 +1,5 @@
-# Killzone 2 static recompilation (PS3 → Windows x64)
+# Project Visari
+An unofficial Killzone 2 static recompilation project.  
 
 An experimental static recompiler: the game's PowerPC (Cell PPU) machine code
 is translated ahead of time into C, compiled with clang, and linked against a
