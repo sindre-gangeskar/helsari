@@ -106,6 +106,7 @@ FpInfo translate_fp(const FpKey &key) {
     bool used_tex[16] = {};
     int nconst = 0;
     uint64_t wrote_r = 0, wrote_h = 0;  // which registers the program writes
+    bool last_h[64][4] = {};            // R component last written through its H halves
     uint32_t a = key.addr;
     for (int n = 0; n < 1024; n++) {
         Ctx c{fpword(a), {fpword(a + 4), fpword(a + 8), fpword(a + 12)}, ""};
@@ -124,6 +125,21 @@ FpInfo translate_fp(const FpKey &key) {
         }
         uint32_t op = bits(c.dst, 24, 6) | (bits(c.s[1], 31, 1) << 6);
         std::string s0 = src_expr(c, 0), s1 = src_expr(c, 1), s2 = src_expr(c, 2);
+        // R and H registers share storage: R[n].x is H[2n].x:H[2n].y (low:high half), R[n].y
+        // H[2n].z:w, R[n].z H[2n+1].x:y, R[n].w H[2n+1].z:w. Here they are separate arrays,
+        // which only matters when bits are reinterpreted: an unpack reading an R component
+        // last written through H gets those two halves, as if packed (Killzone 2 stores
+        // normals with h[2].xy = n; up4(r[1]) in some shaders - noise on those materials
+        // otherwise). KZ2_NO_RH_ALIAS=1: off.
+        static const bool no_rh = getenv("KZ2_NO_RH_ALIAS") && atoi(getenv("KZ2_NO_RH_ALIAS"));
+        if (!no_rh && (op == 0x14 || op == 0x25 || op == 0x28 || op == 0x2a || op == 0x2d) && bits(c.s[0], 0, 2) == 0 &&
+            !bits(c.s[0], 8, 1)) {
+            uint32_t rn = bits(c.s[0], 2, 6), comp = bits(c.s[0], 9, 2);
+            if (last_h[rn][comp]) {
+                std::string hr = "h[" + std::to_string(rn * 2 + (comp >= 2 ? 1 : 0)) + "]";
+                s0 = "pk2(float4(" + hr + (comp & 1 ? ".z, " : ".x, ") + hr + (comp & 1 ? ".w, 0, 0))" : ".y, 0, 0))");
+            }
+        }
         uint32_t tex = bits(c.dst, 17, 4);
         std::string texs = "t" + std::to_string(tex), smp = "s" + std::to_string(tex);
         auto sample = [&](const std::string &coord, const std::string &fn = "Sample", const std::string &extra = "") {
@@ -253,7 +269,15 @@ FpInfo translate_fp(const FpKey &key) {
         } else if (!e.empty()) {
             bool m[4] = {(bool)bits(c.dst, 9, 1), (bool)bits(c.dst, 10, 1), (bool)bits(c.dst, 11, 1), (bool)bits(c.dst, 12, 1)};
             std::string dreg = (bits(c.dst, 7, 1) ? "h[" : "r[") + std::to_string(bits(c.dst, 1, 6)) + "]";
-            if (!bits(c.dst, 30, 1)) (bits(c.dst, 7, 1) ? wrote_h : wrote_r) |= 1ull << bits(c.dst, 1, 6);
+            if (!bits(c.dst, 30, 1)) {
+                (bits(c.dst, 7, 1) ? wrote_h : wrote_r) |= 1ull << bits(c.dst, 1, 6);
+                uint32_t dn = bits(c.dst, 1, 6);
+                for (int k = 0; k < 4; k++)
+                    if (m[k]) {
+                        if (bits(c.dst, 7, 1)) last_h[dn / 2][(dn & 1) * 2 + k / 2] = true;
+                        else last_h[dn][k] = false;
+                    }
+            }
             bool nodest = bits(c.dst, 30, 1);
             std::string ccw = bits(c.s[0], 30, 1) ? "cc1" : "cc0";
             body += "  { float4 t = " + e + ";\n";

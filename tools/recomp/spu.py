@@ -97,6 +97,15 @@ class Module:
     def is_code(self, pc):
         return self.protect is None or self.protect[(pc - self.ls_base) >> 4]
 
+    def word_checked(self, pc):
+        """Is this word part of what the runtime compares with LS? Captures record executed
+        words: a word of a code quadword that never ran may differ between loads (data next
+        to code), so its compiled form could be stale - it goes through the interpreter."""
+        if self.protect is None:
+            return True
+        v = self.protect[(pc - self.ls_base) >> 4]
+        return v is True or bool((int(v) >> ((pc >> 2) & 3)) & 1)
+
     @property
     def end(self):
         return self.ls_base + len(self.code)
@@ -174,9 +183,10 @@ def find_modules(e):
     return mods
 
 
-def gen_module(dec, m, prefix):
+def gen_module(dec, m, prefix, extra_starts=()):
     """C++ for one module; returns (source text, [(pc, function name)], [function names]).
-    Functions are named <prefix>_c<chunk>."""
+    Functions are named <prefix>_c<chunk>. extra_starts: entry points seen only at run time
+    (computed jumps; spu_cache/entries.txt)."""
     n = len(m.code) // 4
     words = struct.unpack(f'>{n}I', m.code[:4 * n])
     pcs = [m.ls_base + 4 * k for k in range(n)]
@@ -184,6 +194,10 @@ def gen_module(dec, m, prefix):
     starts = {m.ls_base}
     for k, (x, op, pc) in enumerate(zip(words, ops, pcs)):
         if not m.is_code(pc):
+            continue
+        if not m.word_checked(pc):
+            if pc + 4 < m.end:
+                starts.add(pc + 4)
             continue
         if op in DIRECT or op in COND:
             t = branch_target(op, x, pc)
@@ -196,6 +210,7 @@ def gen_module(dec, m, prefix):
     for pc in range(m.ls_base, m.end, 16):
         if m.is_code(pc) and pc > m.ls_base and not m.is_code(pc - 16):
             starts.add(pc)
+    starts |= {s for s in extra_starts if m.ls_base <= s < m.end}
     starts = {s for s in starts if m.is_code(s)}
 
     # chunks: runs of whole blocks, about CHUNK_INSNS instructions each
@@ -251,7 +266,7 @@ def gen_module(dec, m, prefix):
             if pc in starts:
                 o.append(f'L_{pc:x}:')
             s = f'step_r<{op}>(t, g, 0x{x:08x}u, 0x{pc:x}u)'
-            if op in TO_INTERP:
+            if op in TO_INTERP or not m.word_checked(pc):
                 o.append(f'    t.interp_once = true; ret = 0x{pc:x}; goto out;')
             elif op in DIRECT:
                 o.append(f'    {s}; {jump(branch_target(op, x, pc), pc)}')
@@ -338,15 +353,28 @@ def module_table(table, symbol):
 PRELUDE = '#include "spu/spu_ops.h"\n\nnamespace spu {\n\n'
 
 
-def generate(e, out, log):
+def read_extra_entries(cache_dir):
+    """spu_cache/entries.txt (spu_capture.cpp): "<module> <pc hex>" per line -> {module: {pc}}."""
+    extra = {}
+    path = os.path.join(cache_dir, 'entries.txt')
+    if os.path.isfile(path):
+        for line in open(path, encoding='utf-8'):
+            p = line.split()
+            if len(p) == 2:
+                extra.setdefault(p[0], set()).add(int(p[1], 16))
+    return extra
+
+
+def generate(e, out, log, extra=None):
     """Write build/generated/spu/*.cpp; returns the list of source files."""
+    extra = extra or {}
     dec = Decoder()
     mods = find_modules(e)
     spu_dir = os.path.join(out, 'spu')
     os.makedirs(spu_dir, exist_ok=True)
     files, table = [], []
     for mi, m in enumerate(mods):
-        src, entries, fns = gen_module(dec, m, f'spu_m{mi}')
+        src, entries, fns = gen_module(dec, m, f'spu_m{mi}', extra.get(m.name, ()))
         if not entries:
             continue
         p = os.path.join(spu_dir, f'spu_m{mi:02d}.cpp')
@@ -434,9 +462,10 @@ def generate_cache(cache_dir, out, log):
     os.makedirs(os.path.join(out, 'spu_rt'), exist_ok=True)
     buckets = [[] for _ in range(RT_BUCKETS)]
     table = []
+    extra = read_extra_entries(cache_dir)
     for m in read_cache(cache_dir):
         h = m.name.rsplit('_', 1)[1]
-        src, entries, fns = gen_module(dec, m, f'spu_rt_{h}')
+        src, entries, fns = gen_module(dec, m, f'spu_rt_{h}', extra.get(m.name, ()))
         if not entries:
             continue
         buckets[int(h, 16) % RT_BUCKETS].append(f'// {m.name}: {len(m.code)} bytes at LS 0x{m.ls_base:x}\n' + src)

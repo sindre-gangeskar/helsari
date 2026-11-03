@@ -213,6 +213,8 @@ void SpuThread::run() {
             static const bool map_lines = !getenv("KZ2_SPU_MAP_LINES") || atoi(getenv("KZ2_SPU_MAP_LINES"));
             if ((map_lines ? !line_seen[pc >> 7] : code_dirty) && map_at(pc)) continue;
         }
+        if (!interp_once && pc != last_interp + 4 && code_q[pc >> 4] == CODE) record_entry(pc);
+        last_interp = pc;
         interp_once = false;
         note_interpreted(pc);
         uint32_t x = ls32(pc);

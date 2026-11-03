@@ -208,6 +208,10 @@ struct SpuThread {
         for (uint32_t l = lsa >> 7, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 7; l <= e && size; l++) src_delta[l] = ea - lsa;
     }
     // Interpreter hook: pc is about to run without native code.
+    // The interpreter reached mapped module code that has no compiled entry (a computed
+    // jump the recompiler could not see): saved for the next build (spu_capture.cpp).
+    uint32_t last_interp = ~0u;
+    void record_entry(uint32_t pc);
     void note_interpreted(uint32_t pc) {
         exec_q[pc >> 4] |= 0x10 | (1 << ((pc >> 2) & 3));   // per word (see spu_capture.cpp)
         for (auto &c : caps)

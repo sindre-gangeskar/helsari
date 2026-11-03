@@ -3,6 +3,8 @@
 #pragma once
 #include "runtime.h"
 
+#include "no_errno_macros.h"
+
 #include <cstdint>
 
 namespace kern {

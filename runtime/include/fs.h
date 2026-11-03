@@ -3,6 +3,7 @@
 //   /app_home/...  -> <dump>/PS3_GAME/USRDIR
 //   /dev_hdd0/..., /dev_hdd1/... -> <data_dir>/dev_hdd0, dev_hdd1 (writable)
 #pragma once
+#include "no_errno_macros.h"
 #include <cstdint>
 #include <string>
 

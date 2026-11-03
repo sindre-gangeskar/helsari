@@ -1146,20 +1146,38 @@ int g_draw_logged_frame = -1;
 void apply_state() {
     // blend
     uint32_t be = reg(0x0310) & 1, sf = reg(0x0314), df = reg(0x0318), eq = reg(0x0320), mask = reg(0x0324);
-    uint64_t bk = fnv(&be, 4, fnv(&sf, 4, fnv(&df, 4, fnv(&eq, 4, fnv(&mask, 4)))));
+    // Blending and write masks are per render target on the RSX: target 0 uses BLEND_ENABLE
+    // and COLOR_MASK, targets 1-3 SET_BLEND_ENABLE_MRT (0x12c, bits 1-3) and
+    // SET_COLOR_MASK_MRT (0x370: A,R,G,B bits from 4 * target). Killzone 2 packs normals as
+    // raw half floats into target 2: a decal blending into the albedo must not blend those
+    // bytes (random normals: sparkling noise on walls). The MRT mask counts only once the
+    // game has set it. KZ2_MRT_STATE=0: target 0's state for all.
+    static const bool mrt_state = !getenv("KZ2_MRT_STATE") || atoi(getenv("KZ2_MRT_STATE"));
+    static bool mrt_mask_seen;
+    uint32_t mrt_be = mrt_state ? reg(0x012c) : 0, mrt_mask = mrt_state ? reg(0x0370) : 0;
+    if (mrt_mask) mrt_mask_seen = true;
+    uint32_t key_mrt[3] = {mrt_state, mrt_be, mrt_mask_seen ? mrt_mask : 0xffffffffu};
+    uint64_t bk = fnv(key_mrt, sizeof key_mrt, fnv(&be, 4, fnv(&sf, 4, fnv(&df, 4, fnv(&eq, 4, fnv(&mask, 4))))));
     auto &bs = g_blend[bk];
     if (!bs) {
         D3D11_BLEND_DESC d{};
-        d.IndependentBlendEnable = FALSE;
-        auto &t = d.RenderTarget[0];
-        t.BlendEnable = be;
-        t.SrcBlend = blend_factor(sf & 0xffff, false);
-        t.DestBlend = blend_factor(df & 0xffff, false);
-        t.BlendOp = blend_op(eq & 0xffff);
-        t.SrcBlendAlpha = blend_factor(sf >> 16, true);
-        t.DestBlendAlpha = blend_factor(df >> 16, true);
-        t.BlendOpAlpha = blend_op(eq >> 16);
-        t.RenderTargetWriteMask = ((mask >> 16) & 1 ? 1 : 0) | ((mask >> 8) & 1 ? 2 : 0) | (mask & 1 ? 4 : 0) | ((mask >> 24) & 1 ? 8 : 0);
+        d.IndependentBlendEnable = TRUE;
+        UINT8 wm0 = ((mask >> 16) & 1 ? 1 : 0) | ((mask >> 8) & 1 ? 2 : 0) | (mask & 1 ? 4 : 0) | ((mask >> 24) & 1 ? 8 : 0);
+        for (int k = 0; k < 4; k++) {
+            auto &t = d.RenderTarget[k];
+            t.BlendEnable = !mrt_state ? be : k == 0 ? be : (mrt_be >> k) & 1;
+            t.SrcBlend = blend_factor(sf & 0xffff, false);
+            t.DestBlend = blend_factor(df & 0xffff, false);
+            t.BlendOp = blend_op(eq & 0xffff);
+            t.SrcBlendAlpha = blend_factor(sf >> 16, true);
+            t.DestBlendAlpha = blend_factor(df >> 16, true);
+            t.BlendOpAlpha = blend_op(eq >> 16);
+            t.RenderTargetWriteMask = wm0;
+            if (k && mrt_state && mrt_mask_seen) {
+                uint32_t m = mrt_mask >> (4 * k);
+                t.RenderTargetWriteMask = ((m >> 1) & 1 ? 1 : 0) | ((m >> 2) & 1 ? 2 : 0) | ((m >> 3) & 1 ? 4 : 0) | (m & 1 ? 8 : 0);
+            }
+        }
         g_dev->CreateBlendState(&d, &bs);
     }
     uint32_t bc = reg(0x031c);
@@ -1908,7 +1926,8 @@ void draw() {
         LOG("draw", "   surface fmt=%08x %ux%u target=%x color=%x/%x/%x/%x depth=%x pitch=%x", reg(0x0208), b.w, b.h,
             reg(0x0220), b.color[0] ? b.color[0]->ea : 0, b.color[1] ? b.color[1]->ea : 0, b.color[2] ? b.color[2]->ea : 0,
             b.color[3] ? b.color[3]->ea : 0, b.depth ? b.depth->ea : 0, reg(0x020c));
-        LOG("draw", "   zpitch %x, depth %s", reg(0x022c), b.proxied[4] ? "via proxy" : "direct");
+        LOG("draw", "   zpitch %x, depth %s; blend MRT %x, colour mask MRT %08x", reg(0x022c), b.proxied[4] ? "via proxy" : "direct",
+            reg(0x012c), reg(0x0370));
         {   // geometry: primitive, index buffer, vertex range, and each enabled attribute as fmt@offset
             std::string attrs;
             for (int a = 0; a < 16; a++)

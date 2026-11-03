@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
+# Clang targeting MSVC otherwise defaults to Debug (checked STL) and the DLL runtime.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
 project(kz2recomp C CXX)
+# Optimisation levels are set per target below.
+set(CMAKE_C_FLAGS_RELEASE "")
+set(CMAKE_CXX_FLAGS_RELEASE "")
 
 # Everything game-specific is generated on the user's machine from their own
 # dump. Nothing derived from the game is part of this repository.
@@ -11,6 +19,10 @@ if(NOT KZ2_DUMP)
 endif()
 
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+
+if(NOT MINGW)
+  add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES _CRT_NONSTDC_NO_WARNINGS)
+endif()
 
 set(GEN_DIR ${CMAKE_BINARY_DIR}/generated)
 message(STATUS "Generating C from ${KZ2_DUMP} ...")
@@ -32,7 +44,8 @@ file(STRINGS ${GEN_DIR}/spu_sources.txt GENERATED_SPU_SOURCES)
 # build/spu_cache/ (spu_capture.cpp) and compiled here on every build; the
 # generator only rewrites files whose content changed.
 set(SPU_CACHE_DIR ${CMAKE_BINARY_DIR}/spu_cache)
-set(SPU_CACHE_CMD ${Python3_EXECUTABLE} -m recomp.spu_cache --cache ${SPU_CACHE_DIR} --out ${GEN_DIR})
+set(SPU_CACHE_CMD ${Python3_EXECUTABLE} -m recomp.spu_cache --cache ${SPU_CACHE_DIR} --out ${GEN_DIR}
+    --elf ${GEN_DIR}/decrypt/EBOOT.elf)
 execute_process(COMMAND ${SPU_CACHE_CMD} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools)
 set(SPU_RT_SOURCES ${GEN_DIR}/spu_rt/spu_rt_modules.cpp)
 foreach(i RANGE 0 15)
@@ -45,7 +58,7 @@ endforeach()
 add_custom_target(spu_cache_gen
   COMMAND ${SPU_CACHE_CMD}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools
-  BYPRODUCTS ${SPU_RT_SOURCES}
+  BYPRODUCTS ${SPU_RT_SOURCES} ${GENERATED_SPU_SOURCES}
   COMMENT "Compiling captured SPU code")
 
 # Generated code compiles in large, memory-hungry units: cap how many build at
@@ -113,4 +126,13 @@ target_compile_definitions(kz2 PRIVATE
   KZ2_DEFAULT_ELF="${GEN_DIR}/decrypt/EBOOT.elf")
 target_compile_options(kz2 PRIVATE -O2 -g -msse4.2)
 target_link_libraries(kz2 PRIVATE kz2_spu kz2_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm ole32 synchronization)
-target_link_options(kz2 PRIVATE -static)
+if(MINGW)
+  target_link_options(kz2 PRIVATE -static)
+else()
+  # Microsoft's signed Clang (Visual Studio Build Tools): allowed by Smart App Control.
+  # 128-bit division comes from compiler-rt; the same 2 MB default stack as MinGW.
+  get_filename_component(_llvm_bin ${CMAKE_CXX_COMPILER} DIRECTORY)
+  file(GLOB _rt "${_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+  target_link_libraries(kz2 PRIVATE ${_rt})
+  target_link_options(kz2 PRIVATE -fuse-ld=lld -g -Wl,/STACK:2097152)
+endif()

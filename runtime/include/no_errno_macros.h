@@ -1,0 +1,39 @@
+// The PS3 kernel's error names (kern::EAGAIN, ...) collide with the C library's errno
+// macros. Pull in the standard headers whose templates use those macros first (they need
+// them while being parsed), then remove the macros. Include before declaring such names.
+#pragma once
+#include <cerrno>
+#include <chrono>
+#include <locale>
+#include <system_error>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#undef EAGAIN
+#undef EINVAL
+#undef ENOMEM
+#undef ESRCH
+#undef ENOENT
+#undef EDEADLK
+#undef EPERM
+#undef EBUSY
+#undef ETIMEDOUT
+#undef ECANCELED
+#undef EEXIST
+#undef EISCONN
+#undef ENOTCONN
+#undef EBADF
+#undef EIO
+#undef EMFILE
+#undef ENOTDIR
+#undef EISDIR
+#undef ENOSPC
+#undef EROFS
+#undef EFAULT
+#undef EACCES
+#undef ENOSYS
+#undef EOVERFLOW

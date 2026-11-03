@@ -162,7 +162,7 @@ def generate(e, out, rpcs3):
     with out_file(os.path.join(out, 'sources.txt')) as s:
         for p in files + [os.path.join(out, 'ppu_table.c'), os.path.join(out, 'imports.c')]:
             s.write(p.replace('\\', '/') + '\n')
-    spu_files = spu.generate(e, out, log)
+    spu_files = spu.generate(e, out, log, spu.read_extra_entries(os.path.join(out, '..', 'spu_cache')))
     with out_file(os.path.join(out, 'spu_sources.txt')) as s:
         for p in spu_files:
             s.write(p.replace('\\', '/') + '\n')

@@ -22,12 +22,16 @@
 
 ## Building
 
-Requirements: Python 3.10+, CMake, Ninja, LLVM-MinGW (clang), and RPCS3 with
-PS3 firmware installed (used once, to decrypt `EBOOT.BIN`).
+Requirements: Python 3.10+, CMake, Ninja, Visual Studio Build Tools with its
+Clang component, and RPCS3 with PS3 firmware installed (used once, to decrypt
+`EBOOT.BIN`). LLVM-MinGW also works, but Windows Smart App Control can block it
+because it is unsigned; Microsoft's Clang is signed.
 
 ```
-winget install Python.Python.3.13 Kitware.CMake Ninja-build.Ninja MartinStorsjo.LLVM-MinGW.UCRT
-cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ^
+winget install Python.Python.3.13 Kitware.CMake Ninja-build.Ninja
+winget install Microsoft.VisualStudio.BuildTools --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --add Microsoft.VisualStudio.Component.Windows11SDK.26100"
+set LLVM=C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/Llvm/x64/bin
+cmake -B build -G Ninja "-DCMAKE_C_COMPILER=%LLVM%/clang.exe" "-DCMAKE_CXX_COMPILER=%LLVM%/clang++.exe" ^
       -DKZ2_DUMP="E:/PS3 Dumps/_BCES00081-[Killzone2]" -DRPCS3_EXE="E:/RPCS3/rpcs3.exe"
 ninja -C build
 build\kz2.exe
@@ -36,7 +40,8 @@ build\kz2.exe
 Configuring runs the recompiler (`tools/recomp`); the build then compiles the
 generated code. SPU code the game loads at run time is captured to
 `build/spu_cache/` and compiled natively on the next build, so the first runs
-are slower. `kz2.exe --dump <dir>` overrides the dump location; saves go to
+are slower; so are entry points of compiled programs that are only reached
+through computed jumps (`spu_cache/entries.txt`). `kz2.exe --dump <dir>` overrides the dump location; saves go to
 `build/data/`.
 
 ## Debugging

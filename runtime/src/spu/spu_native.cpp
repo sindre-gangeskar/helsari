@@ -114,7 +114,8 @@ bool SpuThread::map_at(uint32_t pc) {
             if (mp.m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size) {
                 static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
                 static std::atomic<int> logs{0};
-                if (mlog && logs < 30 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos))
+                static const uint32_t spc = getenv("KZ2_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("KZ2_SPU_MATCH_PC"), nullptr, 16) : 0;
+                if (mlog && logs < 30 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos) && (!spc || (pc & ~0x1ffu) == (spc & ~0x1ffu)))
                     logs++, LOG("spu", "%s: %s skipped at pc 0x%x: overlaps mapped %s (0x%x+0x%x)", name.c_str(), m->name, pc,
                                 mp.m->name, mp.m->ls_base, mp.m->size);
                 return false;
@@ -126,7 +127,8 @@ bool SpuThread::map_at(uint32_t pc) {
             // KZ2_SPU_MATCH_LOG=<text>: only threads whose name contains it ("1": all).
             static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
             static std::atomic<int> logs{0};
-            if (mlog && logs < 60 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos)) {
+            static const uint32_t mpc = getenv("KZ2_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("KZ2_SPU_MATCH_PC"), nullptr, 16) : 0;
+            if (mlog && logs < 60 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos) && (!mpc || (pc & ~0x1ffu) == (mpc & ~0x1ffu))) {
                 const uint8_t *img = m->image ? m->image : (const uint8_t *)mem::ptr(m->src_ea);
                 for (uint32_t off = 0; off < m->size; off += 16)
                     if (is_code(m, off >> 4) && memcmp(ls + m->ls_base + off, img + off, std::min(16u, m->size - off)) &&
@@ -148,6 +150,23 @@ bool SpuThread::map_at(uint32_t pc) {
         recent[0] = m;
         return true;
     };
+    {   // Diagnostics (KZ2_SPU_MATCH_LOG): every map attempt per line, once per line and thread.
+        static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
+        static std::atomic<int> logs{0};
+        if (mlog && logs < 200 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos)) {
+            int cover = 0;
+            for (const NativeModule *table : {g_native_modules, g_rt_modules}) {
+                int n = table == g_native_modules ? g_native_module_count : g_rt_enabled ? g_rt_module_count : 0;
+                for (int i = 0; i < n; i++)
+                    if (pc >= table[i].ls_base && pc < table[i].ls_base + table[i].size && is_code(&table[i], (pc - table[i].ls_base) >> 4))
+                        cover++;
+            }
+            int used = 0;
+            for (auto &mp : mapped) used += mp.m != nullptr;
+            logs++;
+            LOG("spu", "%s: map_at pc 0x%x: %d modules cover it, %d/8 slots used", name.c_str(), pc, cover, used);
+        }
+    }
     for (const NativeModule *m : recent)
         if (m && try_map(m)) return native[pc >> 2];
     for (const NativeModule *table : {g_native_modules, g_rt_modules}) {

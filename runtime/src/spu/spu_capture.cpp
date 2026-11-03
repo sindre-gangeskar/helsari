@@ -16,6 +16,10 @@
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <set>
+#include <string>
+#include <unordered_set>
 #include <mutex>
 #include <unordered_map>
 
@@ -134,6 +138,36 @@ void save(uint32_t ls_base, const std::vector<uint8_t> &image, const std::vector
     }
 }
 } // namespace
+
+// spu_cache/entries.txt: "<module> <pc>" for code of a mapped module that was entered
+// without a compiled entry point. The build adds them (tools/recomp/spu.py), which turns
+// routines reached only through computed jumps from interpreted into compiled code.
+void SpuThread::record_entry(uint32_t pc) {
+    if (!g_capture_on) return;
+    const NativeModule *m = nullptr;
+    for (auto &mp : mapped)
+        if (mp.m && pc >= mp.m->ls_base && pc < mp.m->ls_base + mp.m->size) m = mp.m;
+    if (!m) return;
+    static thread_local std::unordered_set<uint64_t> noted;   // no lock on repeats
+    if (!noted.insert((uint64_t)(uintptr_t)m << 18 ^ pc).second) return;
+    std::lock_guard<std::mutex> g(g_lock);
+    static std::set<std::string> saved = [] {
+        std::set<std::string> s;
+        std::ifstream f(std::string(CACHE_DIR) + "/entries.txt");
+        for (std::string line; std::getline(f, line);) s.insert(line);
+        return s;
+    }();
+    char key[96];
+    snprintf(key, sizeof key, "%s %x", m->name, pc);
+    if (!saved.insert(key).second) return;
+    std::filesystem::create_directories(CACHE_DIR);
+    if (FILE *fp = fopen((std::string(CACHE_DIR) + "/entries.txt").c_str(), "a")) {
+        fprintf(fp, "%s\n", key);
+        fclose(fp);
+    }
+    static int logs;
+    if (logs++ < 20) LOG("spu", "%s: new entry point for the next build: %s", name.c_str(), key);
+}
 
 // Images are found per 128-byte line (src_delta); a line overlapping mapped native code is not captured.
 static bool line_mapped(const SpuThread &t, uint32_t line) {
