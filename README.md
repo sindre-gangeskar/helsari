@@ -99,4 +99,3 @@ EBOOT.BIN ──rpcs3 --decrypt──▶ EBOOT.elf ──tools/recomp──▶ b
 1. Remaining rendering differences from the PS3.
 2. Separate the game's simulation tick from its frame rate (the game advances
    a fixed step per frame and caps itself at 30 fps).
-3. Audio output.
