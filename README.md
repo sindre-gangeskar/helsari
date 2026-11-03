@@ -12,8 +12,7 @@ generated on your machine, from your own **legally** obtained copy.
 - PC Graphics options
 - Unlocked framerates
 - Native mouse and keyboard controls
-- Easy-to-use wizard for recomping
-- Combined game launcher for Killzone 2 and Killzone 3
+- Game launcher that combines Killzone 2 and Killzone 3 for recomping and playing
 
 
 ## Status
