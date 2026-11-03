@@ -168,6 +168,10 @@ extern uint32_t g_line_seq[LINE_LOCKS];
    Checked after every atomic commit's unlock: one byte load. */
 extern uint8_t g_line_notify[LINE_LOCKS];
 void line_notify(uint64_t ea);
+/* Block until line ea (128 bytes, currently equal to `seen`) gets an atomic commit, or
+   timeout_us passes (memory.cpp). Commits wake waiters through line_notify. */
+void line_wait(uint64_t ea, const void *seen, uint32_t timeout_us);
+void line_wake(uint64_t ea);
 static inline uint32_t line_index(uint64_t ea) { return (uint32_t)(EA(ea) >> 7) & (LINE_LOCKS - 1); }
 static inline void line_lock(uint64_t ea) {
     uint32_t *l = &g_line_locks[line_index(ea)];
