@@ -6,7 +6,7 @@ is translated ahead of time into C, compiled with clang, and linked against a
 runtime that stands in for the PS3 operating system and libraries.
 
 **This repository contains no game code or data.** Everything game-derived is
-generated on your machine, from your own dump, into `build/` (git-ignored).
+generated on your machine, from your own dump, into `build/`
 
 ## Status
 
