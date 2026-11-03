@@ -1,4 +1,4 @@
-# Project Visari
+# Project Visari - WIP
 An unofficial Killzone 2 static recompilation project.  
 
 An experimental static recompiler: the game's PowerPC (Cell PPU) machine code
@@ -7,6 +7,14 @@ runtime that stands in for the PS3 operating system and libraries.
 
 **This repository contains no game code or data.** Everything game-derived is
 generated on your machine, from your own **legally** obtained copy.
+
+## Goals (Still to be verified if achieveable)
+- PC Graphics options
+- Unlocked framerates
+- Native mouse and keyboard controls
+- Easy-to-use wizard for recomping
+- Combined game launcher for Killzone 2 and Killzone 3
+
 
 ## Status
 
