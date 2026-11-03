@@ -1334,6 +1334,20 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
     memcpy(key.remap, remap, 32);
     memcpy(key.gamma, gamma, 16);
     FpInfo fi = translate_fp(key);
+    // Debug: KZ2_DEBUG_PS=<hash prefix> replaces that shader's colour output with
+    // KZ2_DEBUG_EXPR (an HLSL float4 over its registers), alpha 1 - to see intermediates.
+    if (const char *dbg = getenv("KZ2_DEBUG_PS")) {
+        char hs[17];
+        snprintf(hs, sizeof hs, "%016llx", (unsigned long long)h);
+        if (*dbg && !strncmp(hs, dbg, strlen(dbg))) {
+            const char *ex = getenv("KZ2_DEBUG_EXPR");
+            std::string expr = ex ? ex : "float4(r[3].x, saturate(-r[0].x / 100), saturate(-i.o8.z / 100), 1)";
+            size_t at = fi.hlsl.find("  return o;");
+            if (at != std::string::npos) fi.hlsl.insert(at, "  o.c0 = " + expr + ";\n");
+            h ^= 0xdeb6deb6ull;   // a separate shader-cache entry
+            LOG("rsx", "debug output for pixel shader %s: %s", hs, expr.c_str());
+        }
+    }
     PsEntry e{nullptr, sc.consts, fi.hlsl, control, false};
     if (ID3DBlob *b = compile(fi.hlsl, "ps_5_0", h)) {
         g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &e.ps);
@@ -2103,7 +2117,7 @@ void draw() {
         g_step_dumps++;
         char name[64];
         snprintf(name, sizeof name, "step_%04d_%08x", g_draws_this_frame, b.color[0]->ea);
-        dump_surface(*b.color[0], name);
+        dump_surface(b.proxied[0] && b.color[0]->proxy ? *b.color[0]->proxy : *b.color[0], name);   // what was drawn
     }
 }
 
