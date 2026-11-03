@@ -1,7 +1,13 @@
-![Helsari Logo](.github/assets/images/helsari_logo.webp)
+<p align="center" width="100%">
+      <img src=".github/assets/images/helsari_logo.webp" alt="Helsari Logo"/>
+</p>
+<p align="center" width="100%">
+      <img src=".github/assets/images/helsari_message_board.webp" alt="Helsari Message Board"/>
+</p>
 
+<span style="display: block; text-align: center;">
+</span>
 
-![Helsari message board](.github/assets/images/helsari_message_board.webp)
 
 ## Note
 
