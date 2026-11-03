@@ -5,7 +5,7 @@
       <img src=".github/assets/images/helsari_message_board.webp" alt="Helsari Message Board"/>
 </p>
 <p align="center" width="100%">
-      <img src=".github/assets/images/helsari_note.webp" alt="Helsari Note"/>
+      <img src=".github/assets/images/helsari_note.webp" alt="Helsari Note" width="50%"/>
 </p>
 
 ## Components
