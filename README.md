@@ -1,9 +1,6 @@
 ![Helsari Logo](.github/assets/images/helsari_logo.webp)
 
-An experimental static recompiler for Killzone 2 (BCES00081). The game's PS3
-machine code is translated ahead of time into C/C++, compiled with clang, and
-linked against a runtime that stands in for the PS3 operating system, its
-libraries and its GPU.
+An experimental static recompiler that turns Killzone 2 into a native PC game.
 
 **This repository contains no game code or data.** Everything game-derived is
 generated on your machine from your own **legally** obtained copy.
