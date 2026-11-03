@@ -1142,6 +1142,7 @@ std::unordered_map<uint64_t, ID3D11BlendState *> g_blend;
 std::unordered_map<uint64_t, ID3D11DepthStencilState *> g_depth;
 std::unordered_map<uint64_t, ID3D11RasterizerState *> g_raster;
 
+int g_draw_logged_frame = -1;
 void apply_state() {
     // blend
     uint32_t be = reg(0x0310) & 1, sf = reg(0x0314), df = reg(0x0318), eq = reg(0x0320), mask = reg(0x0324);
@@ -1449,6 +1450,26 @@ void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = f
             fwrite(row.data(), 1, row.size(), fp);
         }
         fclose(fp);
+    }
+    // 8-bit RGBA: the alpha channel as a second, grey image (<path minus .bmp>_alpha.bmp).
+    if (f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM) {
+        std::string ap(path);
+        if (ap.size() > 4) ap.insert(ap.size() - 4, "_alpha");
+        if (FILE *fp = fopen(ap.c_str(), "wb")) {
+            uint32_t sz = d.Width * d.Height * 4;
+            uint8_t hdr[54] = {'B', 'M'};
+            *(uint32_t *)&hdr[2] = 54 + sz, *(uint32_t *)&hdr[10] = 54, *(uint32_t *)&hdr[14] = 40;
+            *(int32_t *)&hdr[18] = d.Width, *(int32_t *)&hdr[22] = -(int32_t)d.Height;
+            *(uint16_t *)&hdr[26] = 1, *(uint16_t *)&hdr[28] = 32;
+            fwrite(hdr, 1, 54, fp);
+            std::vector<uint8_t> row(d.Width * 4);
+            for (UINT y = 0; y < d.Height; y++) {
+                const uint8_t *p = (const uint8_t *)m.pData + y * m.RowPitch;
+                for (UINT x = 0; x < d.Width; x++) row[x * 4] = row[x * 4 + 1] = row[x * 4 + 2] = p[x * 4 + 3], row[x * 4 + 3] = 255;
+                fwrite(row.data(), 1, row.size(), fp);
+            }
+            fclose(fp);
+        }
     }
     g_ctx->Unmap(st, 0);
     st->Release();
@@ -1942,7 +1963,9 @@ void draw() {
             }
         // Vertex shader and the first vertices' attributes: every full-screen pass, or KZ2_LOG_ATTRS=<draw>.
         static int attr_draw = getenv("KZ2_LOG_ATTRS") ? atoi(getenv("KZ2_LOG_ATTRS")) : -1;
-        if (g_draws_this_frame == attr_draw || list.size() <= 6) {
+        static int quad_logs;   // particle quads too (the first 40 of the frame)
+        if (g_draw_logged_frame != (int)g_frame) g_draw_logged_frame = (int)g_frame, quad_logs = 0;
+        if (g_draws_this_frame == attr_draw || list.size() <= 6 || (g_prim == 8 && quad_logs++ < 40)) {
             LOG("draw", "   vs=%016llx inputs=%04x outputs=%08x", (unsigned long long)g_vs_hash, reg(0x1ff0), reg(0x1ff4));
             for (int k = 464; k < 468; k++)
                 LOG("draw", "   c[%d] = %g %g %g %g", k, vp_consts[k * 4], vp_consts[k * 4 + 1], vp_consts[k * 4 + 2],
@@ -2049,7 +2072,10 @@ void draw() {
     // inputs) once the game signals them. Start its GPU->CPU copy now and hand it to the
     // GPU, so the write-back at that signal finds it done instead of stalling the RSX
     // thread on the whole queue. KZ2_EARLY_READBACK=0: copy at write-back time.
-    static const bool early_rb = !getenv("KZ2_EARLY_READBACK") || atoi(getenv("KZ2_EARLY_READBACK"));
+    // Default OFF: the copy is taken right after a draw, but more draws (the half-res smoke
+    // and particle passes) can follow before the SPUs read the buffer, so they read a stale
+    // copy (blocky fog over the whole shore level). KZ2_EARLY_READBACK=1: on.
+    static const bool early_rb = getenv("KZ2_EARLY_READBACK") && atoi(getenv("KZ2_EARLY_READBACK"));
     if (early_rb && reg(0x0324))
         for (int i = 0; i < 4; i++) {
             Surface *c = b.color[i];
@@ -2232,7 +2258,8 @@ bool create_device() {
     if (opts.ConstantBufferOffsetting && opts.MapNoOverwriteOnDynamicConstantBuffer &&
         SUCCEEDED(g_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&g_ctx1))) {
         g_cbring = make_cb(CBRING_SIZE);
-        g_vp_windows = g_cbring != nullptr;   // constant windows need buffer offsets (D3D11.1)
+        // constant windows need buffer offsets (D3D11.1). KZ2_VS_WINDOWS=0: whole constant file.
+        g_vp_windows = g_cbring != nullptr && (!getenv("KZ2_VS_WINDOWS") || atoi(getenv("KZ2_VS_WINDOWS")));
         if (!g_cbring) release(g_ctx1);
     }
     if (!g_cbring) LOG("rsx", "driver lacks constant buffer offsets: constants are re-uploaded per draw");
