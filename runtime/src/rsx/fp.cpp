@@ -51,6 +51,18 @@ std::string src_expr(const Ctx &c, int n) {
     bool abs_ = n == 0 ? bits(s, 29, 1) : bits(s, 18, 1);
     if (abs_) r = "abs(" + r + ")";
     if (bits(s, 17, 1)) r = "(-" + r + ")";
+    // Input precision modifier of operand n: SRC1 bits 19-21 (src0), 22-24 (src1), 25-27
+    // (src2) - 1 fp16, 2 fx12 [-2, 2), 3 fx9 [-1, 1], 4 saturate. The operand is clamped
+    // before the operation (Killzone 2's soft particles limit their depth fade this way:
+    // without it, smoke 70 m in front of the scene came out 70x opaque).
+    // KZ2_NO_SRC_PREC=1: ignore.
+    static const bool no_src_prec = getenv("KZ2_NO_SRC_PREC") && atoi(getenv("KZ2_NO_SRC_PREC"));
+    switch (no_src_prec ? 0 : bits(c.s[1], 19 + 3 * n, 3)) {
+    case 1: r = "clamp(" + r + ", -65504.0, 65504.0)"; break;
+    case 2: r = "clamp(" + r + ", -2.0, 2.0)"; break;
+    case 3: r = "clamp(" + r + ", -1.0, 1.0)"; break;
+    case 4: r = "saturate(" + r + ")"; break;
+    }
     return r;
 }
 
@@ -98,6 +110,13 @@ FpInfo translate_fp(const FpKey &key) {
     for (int n = 0; n < 1024; n++) {
         Ctx c{fpword(a), {fpword(a + 4), fpword(a + 8), fpword(a + 12)}, ""};
         a += 16;
+        // KZ2_FP_WORDS=1: each instruction's raw words as a comment (capture shader dumps).
+        static const bool fp_words = getenv("KZ2_FP_WORDS") && atoi(getenv("KZ2_FP_WORDS"));
+        if (fp_words) {
+            char w[96];
+            snprintf(w, sizeof w, "  // i%d: %08x %08x %08x %08x\n", n, c.dst, c.s[0], c.s[1], c.s[2]);
+            body += w;
+        }
         bool has_const = bits(c.s[0], 0, 2) == 2 || bits(c.s[1], 0, 2) == 2 || bits(c.s[2], 0, 2) == 2;
         if (has_const) {
             c.cst = "fc[" + std::to_string(nconst++) + "]";
