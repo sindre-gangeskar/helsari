@@ -1,4 +1,4 @@
-# Project Visari - WIP
+# Project Helsari - WIP
 An unofficial Killzone 2 static recompilation project.  
 
 An experimental static recompiler: the game's PowerPC (Cell PPU) machine code
