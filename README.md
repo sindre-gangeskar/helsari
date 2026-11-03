@@ -1,39 +1,26 @@
 ![Helsari Logo](.github/assets/images/helsari_logo.webp)
 
-An experimental static recompiler: the game's PowerPC (Cell PPU) machine code
-is translated ahead of time into C, compiled with clang, and linked against a
-runtime that stands in for the PS3 operating system and libraries.
+An experimental static recompiler for Killzone 2 (BCES00081). The game's PS3
+machine code is translated ahead of time into C/C++, compiled with clang, and
+linked against a runtime that stands in for the PS3 operating system, its
+libraries and its GPU.
 
 **This repository contains no game code or data.** Everything game-derived is
-generated on your machine, from your own **legally** obtained copy.
+generated on your machine from your own **legally** obtained copy.
 
 ![Helsari message board](.github/assets/images/helsari_message_board.webp)
 
-## Goals (Still to be verified if achieveable)
+## Components
 
-- PC Graphics options
-- Unlocked framerates
-- Native mouse and keyboard controls
-- Game launcher that combines Killzone 2 and Killzone 3 for recomping and playing
-
-
-
-## Status 
-
-| Area                | State                                                                                                                                                                                            |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| PPU → C translation | All 2.9M reachable instructions (49k functions) translate; integer, FPU and VMX/AltiVec                                                                                                          |
-| Boot                | crt0, TLS, libc init, ~15 engine threads (FIOS, audio, pad, SPURS handlers)                                                                                                                      |
-| Kernel              | mutex/cond/lwmutex/lwcond/semaphore/event flag/event queue/rwlock, threads                                                                                                                       |
-| Files               | `/dev_bdvd` mapped onto the dump, split `.666xx` archives joined transparently                                                                                                                   |
-| SPU                 | Interpreter plus a static recompiler: SPURS task ELFs and job binaries in the EBOOT are compiled to C++ (`tools/recomp/spu.py`) and mapped when loaded into local store; Edge Zlib runs natively |
-| GPU (RSX)           | Direct3D 11 backend: vertex/fragment programs translated to HLSL, render-target cache, textures (swizzled, DXT, cube), blend/depth/stencil. Culling and shader branches not yet                  |
-| Input               | XInput controller mapped to DualShock 3                                                                                                                                                          |
-| Audio               | Ports and timing events work; no sound output yet                                                                                                                                                |
-
-The game reaches its first screen — the "Welcome to Killzone 2" language
-select — and renders it correctly. Gameplay will need the SPURS job chains
-(SPU work) that are not run yet.
+| Part        | How it runs                                                                                                                       |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| PPU (CPU)   | Statically recompiled: all reachable code (2.9M instructions, 49k functions) becomes C, including FPU and VMX/AltiVec             |
+| SPU         | Statically recompiled from the EBOOT and from SPU code captured at run time; float, shuffle and rotate instructions use SSE        |
+| SPURS       | Job-manager workloads run on up to 5 host threads each; task sets, events and mailboxes are emulated                             |
+| RSX (GPU)   | Translated to Direct3D 11: shaders to HLSL (cached on disk), render-target cache, vertex decoding on the GPU                      |
+| OS          | Threads, synchronisation primitives, memory, file system (`/dev_bdvd` mapped onto your dump), save data                          |
+| Input       | XInput controller mapped to a DualShock 3                                                                                         |
+| Audio       | Not yet: timing works, no sound output                                                                                            |
 
 ## Building
 
@@ -48,63 +35,69 @@ ninja -C build
 build\kz2.exe
 ```
 
-The configure step runs the recompiler (`tools/recomp`, ~10 s); the build
-compiles ~154 MB of generated C (~20 s on 32 threads).
-
-`kz2.exe --dump <dir>` overrides the dump location; saves and caches go to
+Configuring runs the recompiler (`tools/recomp`); the build then compiles the
+generated code. SPU code the game loads at run time is captured to
+`build/spu_cache/` and compiled natively on the next build, so the first runs
+are slower. `kz2.exe --dump <dir>` overrides the dump location; saves go to
 `build/data/`.
 
-### Debugging switches (environment variables)
+## Debugging
 
-| Variable                             | Effect                                                                                                        |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| `KZ2_WATCHDOG=<sec>`                 | Periodically print every guest thread's current OS call, the most-called imports, and an RSX method histogram |
-| `KZ2_TRACE_HLE=1`                    | Log the first 20 calls of every implemented import                                                            |
-| `KZ2_TRACE_RSX=1`                    | Log the start of the RSX command stream                                                                       |
-| `KZ2_DUMP_FRAME=N`                   | Write every RSX method of frame N to `frame.txt`                                                              |
-| `KZ2_DUMP_RT=N`                      | Save every colour render target at frame N as `rt_<address>.bmp`                                              |
-| `KZ2_DUMP_SHADERS=1`                 | Write generated HLSL to `shaders/` (failed compiles are always written)                                       |
-| `KZ2_LOG_DRAWS=N`, `KZ2_LOG_ATTRS=d` | Per-draw state for frame N; vertex attributes and textures of draw d                                          |
-| `KZ2_SKIP_DRAWS=a,b`                 | Skip draw indices (bisecting rendering bugs)                                                                  |
-| `KZ2_DUMP_FRAME=N`                   | Write every RSX method of frame N to `frame.txt`                                                              |
-| `KZ2_DUMP_RT=N`                      | Save every colour render target at frame N as `rt_<address>.bmp`                                              |
-| `KZ2_DUMP_SHADERS=1`                 | Write generated HLSL to `shaders/` (failed compiles are always written)                                       |
-| `KZ2_LOG_DRAWS=N`, `KZ2_LOG_ATTRS=d` | Per-draw state for frame N; vertex attributes and textures of draw d                                          |
-| `KZ2_SKIP_DRAWS=a,b`                 | Skip draw indices (bisecting rendering bugs)                                                                  |
+In the game window:
+
+| Key   | Effect                                                                                                    |
+| ----- | --------------------------------------------------------------------------------------------------------- |
+| `F12` | Frame capture: logs every draw, saves render targets, pass inputs/outputs and translated shaders as files |
+| `F9`  | Frame timeline for 4 frames (RSX, SPU and main-thread waits), without the capture's file dumps            |
+| `F11` | Toggle environment (cube-map) reflections                                                                 |
+
+Environment variables:
+
+| Variable                             | Effect                                                                                        |
+| ------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `KZ2_WATCHDOG=<sec>`                 | Periodically print every guest thread's current OS call and an RSX method histogram           |
+| `KZ2_PROFILE=<sec>`                  | Sample all threads: CPU time per thread and hot spots (`KZ2_PROFILE_THREADS=name,...` for more) |
+| `KZ2_TRACE_HLE=1`, `KZ2_TRACE_RSX=1` | Log the first calls of every implemented import / the start of the RSX command stream         |
+| `KZ2_DUMP_FRAME=N`, `KZ2_DUMP_RT=N`  | Write every RSX method of frame N to `frame.txt` / save its render targets                    |
+| `KZ2_DUMP_SHADERS=1`                 | Write all generated HLSL to `shaders/` (failed compiles are always written)                   |
+| `KZ2_LOG_DRAWS=N`, `KZ2_LOG_ATTRS=d` | Per-draw state for frame N; vertex attributes and textures of draw d                          |
+| `KZ2_SKIP_DRAWS=a,b`                 | Skip draw indices (bisecting rendering bugs)                                                  |
+| `KZ2_SPU_NATIVE=0`                   | Run all SPU code in the interpreter                                                           |
+
+Most rendering and performance changes also have a switch to turn them off for
+comparison (e.g. `KZ2_CPU_VERTEX`, `KZ2_NO_SHADER_CACHE`, `KZ2_NO_MIPS`); they
+are documented where they are read in `runtime/src`.
 
 ## How it works
 
 ```
-EBOOT.BIN ──rpcs3 --decrypt──▶ EBOOT.elf ──tools/recomp──▶ build/generated/*.c ──clang──▶ kz2.exe
-                                                                                  ▲
-                                                               runtime/ (OS + libraries)
+EBOOT.BIN ──rpcs3 --decrypt──▶ EBOOT.elf ──tools/recomp──▶ build/generated/ ──clang──▶ kz2.exe
+                                                                                ▲
+                                                               runtime/ (OS, libraries, RSX, SPU)
 ```
 
 **`tools/recomp`** (Python)
-- `elf.py` — PS3 ELF: segments, `.opd` function descriptors, TLS, import stubs.
-- `nid.py` — imports are identified by NID = SHA-1(name + salt)[0:4]. Names are
+- `elf.py`: PS3 ELF segments, `.opd` function descriptors, TLS, import stubs.
+- `nid.py`: imports are identified by NID = SHA-1(name + salt)[0:4]. Names are
   recovered by hashing strings found in your `rpcs3.exe`; no database is shipped.
-- `ppc.py` — PPU decoder (integer, branch, FPU, VMX).
-- `analyze.py` — recursive-descent function discovery from every `.opd` entry and
-  `bl` target; jump-table recovery (including bounds checks in predecessor blocks
-  and TOC copies in other registers). Leaving a function's region becomes a tail
-  call, so splitting functions is always safe.
-- `codegen.py` — one C function per guest function; gotos for local branches,
-  `musttail` for tail calls, C calls for `bl`.
+- `ppc.py`, `analyze.py`, `codegen.py`: PPU decoding, function discovery (from
+  every `.opd` entry and `bl` target, with jump-table recovery), and one C
+  function per guest function.
+- `spu.py`, `spu_cache.py`: SPU modules (task ELFs, job binaries, captured code)
+  to C++, sharing instruction semantics with the interpreter.
 
 **`runtime/`** (C++)
-- Guest memory is a 4 GiB reservation committed on demand (vectored exception
-  handler). Vector registers are stored byte-reversed so all lane sizes read
-  natively.
-- Imports are bound by writing fake function descriptors into the game's stub
-  slots; calls land in `hle_*.cpp`. Unimplemented imports log once and return 0.
-- `spurs.cpp` identifies SPU task ELFs by content and substitutes native code.
+- Guest memory is a 4 GiB reservation committed on demand. Imports are bound
+  by writing function descriptors into the game's stub slots; calls land in
+  `hle_*.cpp`.
+- `rsx/`: the RSX command stream is translated to Direct3D 11 draws; vertex
+  and fragment programs become HLSL.
+- `spu/`, `spurs_*.cpp`: SPU threads, DMA and the SPURS kernel; recompiled SPU
+  code is mapped when its image is loaded into local store.
 
-## What's next
+## Next technical steps
 
-1. **RSX renderer** — culling, shader control flow (IFE/LOOP/REP, VP branches),
-   MSAA, 2D blit engines, performance (vertex fetch runs on the CPU).
-2. **SPU** — Killzone 2 also runs SPURS job chains (skinning, culling, lighting).
-   Either recompile SPU code the same way as the PPU, or replace jobs natively.
-3. Audio output (the mixer already writes into the port buffer), save data.
-4. The 21 unresolved indirect jumps are reported at runtime if ever reached.
+1. Remaining rendering differences from the PS3.
+2. Separate the game's simulation tick from its frame rate (the game advances
+   a fixed step per frame and caps itself at 30 fps).
+3. Audio output.
