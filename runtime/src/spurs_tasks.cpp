@@ -92,11 +92,15 @@ uint32_t load_elf(spu::SpuThread &s, uint32_t elf) {
 }
 
 void finish(Task &t, uint32_t exit_code) {
-    bit_clear(t.taskset + TS_RUNNING, t.id);
-    bit_clear(t.taskset + TS_ENABLED, t.id);
-    bit_clear(t.taskset + TS_READY, t.id);
-    bit_clear(t.taskset + TS_PENDING_READY, t.id);
     if (t.exit_code_addr) st32(t.exit_code_addr, exit_code);
+    // One commit, under one line lock, with the id released last. SPU code (Havok) reuses a task
+    // id as soon as its enabled bit is clear: cleared separately, the later clears wiped the new
+    // task's ready bit, leaving it enabled but never started, and the game froze.
+    {
+        mem::LineGuard g(t.taskset);
+        for (uint32_t set : {TS_READY, TS_PENDING_READY, TS_RUNNING, TS_ENABLED})
+            __atomic_fetch_and(bit_word(t.taskset + set, t.id), ~bit_mask(t.id), __ATOMIC_SEQ_CST);
+    }
     t.done = true;
 }
 

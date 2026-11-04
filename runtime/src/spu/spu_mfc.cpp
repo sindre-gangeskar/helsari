@@ -95,6 +95,14 @@ uint32_t SpuThread::pending_events() {
 }
 
 void SpuThread::mfc_command(uint32_t cmd) {
+    static const bool slow_on = getenv("KZ2_SLOW") != nullptr;   // see slow_list in hle_gcm.cpp
+    if (slow_on) {
+        extern void slow_work(const char *name, uint64_t ran_ns);
+        thread_local uint64_t last;
+        uint64_t seg = host_now_ns() - last;
+        if (seg < 2000000) slow_work(name.c_str(), seg);         // longer: it waited, not computed
+        last = host_now_ns();
+    }
     uint32_t lsa = mfc_lsa & (LS_SIZE - 1), ea = mfc_eal, size = mfc_size;
     // KZ2_SPU_TRACE logs commands while instructions are traced; KZ2_SPU_TRACE_MFC logs
     // every command of the traced workload, with lock-line contents for atomic stores.

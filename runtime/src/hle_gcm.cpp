@@ -93,24 +93,56 @@ void gcm_tl(const char *fmt, ...) {
 // KZ2_DELAY_CYCLE_US=<us>: which thread limits the frame? Adds that much busy work per frame, in
 // 8 s phases: none, main, rsx, both. A thread on the critical path makes frames that much longer;
 // on any other thread the delay disappears into a wait. Logs the fps of each phase ("delay" lines).
+//
+// KZ2_SLOW="jm_gfx,no name,task": which work holds up the frame? In 8 s phases (none, then each
+// name) SPU threads with that name run KZ2_SLOW_PCT percent slower (default 25): a busy wait in
+// proportion to the compute before each MFC command, so results become visible that much later.
+// If fps falls in step it is on the critical path; if not, speeding it up would gain nothing.
+static const std::vector<std::string> &slow_list() {
+    static const std::vector<std::string> list = [] {
+        std::vector<std::string> v;
+        if (const char *e = getenv("KZ2_SLOW"))
+            for (const char *p = e; *p;) {
+                const char *c = strchr(p, ',');
+                v.emplace_back(p, c ? c - p : strlen(p));
+                if (!c) break;
+                p = c + 1;
+            }
+        return v;
+    }();
+    return list;
+}
+void slow_work(const char *name, uint64_t ran_ns) {
+    auto &l = slow_list();
+    if (l.empty()) return;
+    uint64_t now = host_now_ns();
+    size_t phase = (size_t)((now / 8000000000ull) % (l.size() + 1));
+    if (!phase || !strstr(name, l[phase - 1].c_str())) return;
+    static const uint64_t pct = getenv("KZ2_SLOW_PCT") ? (uint64_t)atoi(getenv("KZ2_SLOW_PCT")) : 25;
+    for (uint64_t wait = ran_ns * pct / 100; host_now_ns() - now < wait;) {}
+}
+namespace spu { void slow_work(const char *name, uint64_t ran_ns) { ::slow_work(name, ran_ns); } }
+
 void frame_delay(int who) {   // 0 main, 1 rsx (called once per frame by each)
     static const uint64_t delay_ns = getenv("KZ2_DELAY_CYCLE_US") ? (uint64_t)atoi(getenv("KZ2_DELAY_CYCLE_US")) * 1000 : 0;
     static const bool ab_pool = getenv("KZ2_TASK_POOL_AB") != nullptr; // see scheduler_thread
+    static const bool slow = !slow_list().empty();
     static const bool ab = ab_pool || getenv("KZ2_TASK_POLL_AB");
-    if (!delay_ns && !ab) return;
+    if (!delay_ns && !ab && !slow) return;
     static const char *const names[4] = {"none", "main", "rsx", "both"};
     uint64_t now = host_now_ns(), slot = now / 8000000000ull;
     int phase = (int)(slot % 4);
     if (who == 1) {
         static uint64_t cur_slot, start, flips;
         if (slot != cur_slot) {
-            if (cur_slot && flips) LOG("delay", "%-9s +%llu us: %.1f fps", ab_pool ? (cur_slot % 2 ? "pool" : "new") : ab ? (cur_slot % 2 ? "line wake" : "poll 1 ms") : names[cur_slot % 4],
+            size_t sp = slow ? (size_t)(cur_slot % (slow_list().size() + 1)) : 0;
+            if (cur_slot && flips) LOG("delay", "%-9s +%llu us: %.1f fps", slow ? (sp ? slow_list()[sp - 1].c_str() : "none") : ab_pool ? (cur_slot % 2 ? "pool" : "new") : ab ? (cur_slot % 2 ? "line wake" : "poll 1 ms") : names[cur_slot % 4],
                                        (unsigned long long)(delay_ns / 1000), flips * 1e9 / (double)(now - start));
             cur_slot = slot, start = now, flips = 0;
         }
         flips++;
     }
-    if (!ab && (phase == 3 || phase == who + 1))
+    if (delay_ns && !ab && (phase == 3 || phase == who + 1))
         for (uint64_t t0 = now; host_now_ns() - t0 < delay_ns;) {}
 }
 namespace rsx { void frame_delay_rsx() { frame_delay(1); } }
