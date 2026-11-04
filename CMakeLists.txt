@@ -20,6 +20,10 @@ endif()
 
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 
+# The game is compiled on the machine that plays it, so it can use all of that CPU: AVX-512's
+# 32 vector registers cut register spills in SPU code by nearly half. Needs at least AVX2.
+set(KZ2_MARCH native CACHE STRING "Target CPU (native, or e.g. x86-64-v3 for a binary that runs elsewhere)")
+
 if(NOT MINGW)
   add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES _CRT_NONSTDC_NO_WARNINGS)
 endif()
@@ -118,13 +122,13 @@ add_library(kz2_spu STATIC ${GENERATED_SPU_SOURCES} ${SPU_RT_SOURCES})
 add_dependencies(kz2_spu spu_cache_gen)
 set_target_properties(kz2_spu PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON JOB_POOL_COMPILE spu_pool)
 target_include_directories(kz2_spu PRIVATE runtime/include runtime/src ${GEN_DIR})
-target_compile_options(kz2_spu PRIVATE -O2 -march=x86-64-v3 -Wno-unused-label)
+target_compile_options(kz2_spu PRIVATE -O2 -march=${KZ2_MARCH} -Wno-unused-label)
 target_include_directories(kz2 PRIVATE runtime/include runtime/src ${GEN_DIR})
 cmake_path(SET _dump NORMALIZE "${KZ2_DUMP}")
 target_compile_definitions(kz2 PRIVATE
   KZ2_DEFAULT_DUMP="${_dump}"
   KZ2_DEFAULT_ELF="${GEN_DIR}/decrypt/EBOOT.elf")
-target_compile_options(kz2 PRIVATE -O2 -g -march=x86-64-v3)
+target_compile_options(kz2 PRIVATE -O2 -g -march=${KZ2_MARCH})
 target_link_libraries(kz2 PRIVATE kz2_spu kz2_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm ole32 synchronization)
 if(MINGW)
   target_link_options(kz2 PRIVATE -static)

@@ -7,7 +7,7 @@
 #include "runtime.h"
 
 #include <cfloat>
-#include <smmintrin.h>
+#include <immintrin.h>
 #include <cmath>
 #include <cstdlib>
 
@@ -298,6 +298,53 @@ inline __m128 v_spr_slow(__m128 x) {
 }
 inline __m128 v_spr(__m128 x) { return v_any_big(x) ? v_spr_slow(x) : x; }
 
+// Whole-register integer helpers (V keeps each word in host order).
+inline __m128i iv(const V &v) { return _mm_loadu_si128((const __m128i *)v.w); }
+inline V vi(__m128i x) { V r; _mm_storeu_si128((__m128i *)r.w, x); return r; }
+inline __m128i not_(__m128i x) { return _mm_xor_si128(x, _mm_set1_epi32(-1)); }
+inline __m128i lo16(__m128i x) { return _mm_and_si128(x, _mm_set1_epi32(0xffff)); }
+inline __m128i cmpgt_u32(__m128i a, __m128i b) {
+    const __m128i s = _mm_set1_epi32((int)0x80000000);
+    return _mm_cmpgt_epi32(_mm_xor_si128(a, s), _mm_xor_si128(b, s));
+}
+// Float operations with one combined check: is any lane of any operand or result inf or NaN
+// (exponent all ones)? If so, the same operation in full, out of line, so the hot code stays small.
+inline __m128 f_abs(__m128 x) { return _mm_and_ps(x, _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff))); }
+inline bool f_big(__m128i maxabs) { return !_mm_testz_si128(_mm_cmpgt_epi32(maxabs, _mm_set1_epi32(0x7f7fffff)), _mm_set1_epi32(-1)); }
+inline __m128i f_max(__m128 a, __m128 b) { return _mm_max_epu32(_mm_castps_si128(f_abs(a)), _mm_castps_si128(f_abs(b))); }
+inline __m128i f_max(__m128i m, __m128 b) { return _mm_max_epu32(m, _mm_castps_si128(f_abs(b))); }
+#define SPU_COLD __attribute__((noinline, cold))
+SPU_COLD inline __m128 f_add_slow(__m128 a, __m128 b) { return v_spr_slow(_mm_add_ps(v_spf_slow(a), v_spf_slow(b))); }
+SPU_COLD inline __m128 f_sub_slow(__m128 a, __m128 b) { return v_spr_slow(_mm_sub_ps(v_spf_slow(a), v_spf_slow(b))); }
+SPU_COLD inline __m128 f_mul_slow(__m128 a, __m128 b) { return v_spr_slow(_mm_mul_ps(v_spf_slow(a), v_spf_slow(b))); }
+SPU_COLD inline __m128 f_madd_slow(__m128 a, __m128 b, __m128 c) { return v_spr_slow(_mm_add_ps(f_mul_slow(a, b), v_spf_slow(c))); }
+SPU_COLD inline __m128 f_msub_slow(__m128 a, __m128 b, __m128 c) { return v_spr_slow(_mm_sub_ps(f_mul_slow(a, b), v_spf_slow(c))); }
+SPU_COLD inline __m128 f_nmsub_slow(__m128 a, __m128 b, __m128 c) { return v_spr_slow(_mm_sub_ps(v_spf_slow(c), f_mul_slow(a, b))); }
+inline __m128 f_add(__m128 a, __m128 b) {
+    __m128 r = _mm_add_ps(a, b);
+    return __builtin_expect(f_big(f_max(f_max(a, b), r)), 0) ? f_add_slow(a, b) : r;
+}
+inline __m128 f_sub(__m128 a, __m128 b) {
+    __m128 r = _mm_sub_ps(a, b);
+    return __builtin_expect(f_big(f_max(f_max(a, b), r)), 0) ? f_sub_slow(a, b) : r;
+}
+inline __m128 f_mul(__m128 a, __m128 b) {
+    __m128 r = _mm_mul_ps(a, b);
+    return __builtin_expect(f_big(f_max(f_max(a, b), r)), 0) ? f_mul_slow(a, b) : r;
+}
+inline __m128 f_madd(__m128 a, __m128 b, __m128 c) {
+    __m128 m = _mm_mul_ps(a, b), r = _mm_add_ps(m, c);
+    return __builtin_expect(f_big(f_max(f_max(f_max(f_max(a, b), m), c), r)), 0) ? f_madd_slow(a, b, c) : r;
+}
+inline __m128 f_msub(__m128 a, __m128 b, __m128 c) {
+    __m128 m = _mm_mul_ps(a, b), r = _mm_sub_ps(m, c);
+    return __builtin_expect(f_big(f_max(f_max(f_max(f_max(a, b), m), c), r)), 0) ? f_msub_slow(a, b, c) : r;
+}
+inline __m128 f_nmsub(__m128 a, __m128 b, __m128 c) {
+    __m128 m = _mm_mul_ps(a, b), r = _mm_sub_ps(c, m);
+    return __builtin_expect(f_big(f_max(f_max(f_max(f_max(a, b), m), c), r)), 0) ? f_nmsub_slow(a, b, c) : r;
+}
+
 inline V splat(uint32_t v) { return V{{v, v, v, v}}; }
 
 // 128-bit helpers on the big-endian register image.
@@ -422,19 +469,19 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
     case ILH: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)i16); gpr[rt] = r; break;
     case ILHU: gpr[rt] = splat(i16 << 16); break;
     case IL: gpr[rt] = splat((uint32_t)s16); break;
-    case IOHL: for (int i = 0; i < 4; i++) gpr[rt].w[i] |= i16; break;
+    case IOHL: gpr[rt] = vi(_mm_or_si128(iv(gpr[rt]), _mm_set1_epi32((int)i16))); break;
     case ILA: gpr[rt] = splat((x >> 7) & 0x3ffff); break;
     case FSMBI: for (int i = 0; i < 16; i++) r.set_b(i, (i16 >> (15 - i)) & 1 ? 0xff : 0); gpr[rt] = r; break;
 
     /* ---------- integer arithmetic ---------- */
     case AH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) + vb.h(i)); gpr[rt] = r; break;
     case AHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) + (uint16_t)i10); gpr[rt] = r; break;
-    case A: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + vb.w[i]; gpr[rt] = r; break;
-    case AI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + (uint32_t)i10; gpr[rt] = r; break;
+    case A: gpr[rt] = vi(_mm_add_epi32(iv(va), iv(vb))); break;
+    case AI: gpr[rt] = vi(_mm_add_epi32(iv(va), _mm_set1_epi32((int)i10))); break;
     case SFH: for (int i = 0; i < 8; i++) r.set_h(i, vb.h(i) - va.h(i)); gpr[rt] = r; break;
     case SFHI: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)i10 - va.h(i)); gpr[rt] = r; break;
-    case SF: for (int i = 0; i < 4; i++) r.w[i] = vb.w[i] - va.w[i]; gpr[rt] = r; break;
-    case SFI: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)i10 - va.w[i]; gpr[rt] = r; break;
+    case SF: gpr[rt] = vi(_mm_sub_epi32(iv(vb), iv(va))); break;
+    case SFI: gpr[rt] = vi(_mm_sub_epi32(_mm_set1_epi32((int)i10), iv(va))); break;
     case ADDX: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] + vb.w[i] + (gpr[rt].w[i] & 1); gpr[rt] = r; break;
     case CG: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((uint64_t)va.w[i] + vb.w[i]) >> 32); gpr[rt] = r; break;
     case CGX: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((uint64_t)va.w[i] + vb.w[i] + (gpr[rt].w[i] & 1)) >> 32); gpr[rt] = r; break;
@@ -445,21 +492,16 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
             r.w[i] = (gpr[rt].w[i] & 1) ? vb.w[i] >= va.w[i] : vb.w[i] > va.w[i];
         gpr[rt] = r;
         break;
-    case MPY: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * (int16_t)vb.w[i]); gpr[rt] = r; break;
-    case MPYU: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] & 0xffff) * (vb.w[i] & 0xffff); gpr[rt] = r; break;
-    case MPYI: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * i10); gpr[rt] = r; break;
-    case MPYUI: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] & 0xffff) * ((uint32_t)i10 & 0xffff); gpr[rt] = r; break;
-    case MPYA: {
-        const V &C = gpr[rt];
-        for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)va.w[i] * (int16_t)vb.w[i]) + C.w[i];
-        gpr[(x >> 21) & 0x7f] = r;
-        break;
-    }
-    case MPYH: for (int i = 0; i < 4; i++) r.w[i] = ((va.w[i] >> 16) * (vb.w[i] & 0xffff)) << 16; gpr[rt] = r; break;
-    case MPYS: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(((int16_t)va.w[i] * (int16_t)vb.w[i]) >> 16); gpr[rt] = r; break;
-    case MPYHH: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int16_t)(va.w[i] >> 16) * (int16_t)(vb.w[i] >> 16)); gpr[rt] = r; break;
+    case MPY: gpr[rt] = vi(_mm_madd_epi16(lo16(iv(va)), lo16(iv(vb)))); break;
+    case MPYU: gpr[rt] = vi(_mm_mullo_epi32(lo16(iv(va)), lo16(iv(vb)))); break;
+    case MPYI: gpr[rt] = vi(_mm_madd_epi16(lo16(iv(va)), _mm_set1_epi32(i10 & 0xffff))); break;
+    case MPYUI: gpr[rt] = vi(_mm_mullo_epi32(lo16(iv(va)), _mm_set1_epi32(i10 & 0xffff))); break;
+    case MPYA: gpr[(x >> 21) & 0x7f] = vi(_mm_add_epi32(_mm_madd_epi16(lo16(iv(va)), lo16(iv(vb))), iv(gpr[rt]))); break;
+    case MPYH: gpr[rt] = vi(_mm_slli_epi32(_mm_mullo_epi32(_mm_srli_epi32(iv(va), 16), lo16(iv(vb))), 16)); break;
+    case MPYS: gpr[rt] = vi(_mm_srai_epi32(_mm_madd_epi16(lo16(iv(va)), lo16(iv(vb))), 16)); break;
+    case MPYHH: gpr[rt] = vi(_mm_madd_epi16(_mm_srli_epi32(iv(va), 16), _mm_srli_epi32(iv(vb), 16))); break;
     case MPYHHA: for (int i = 0; i < 4; i++) r.w[i] = gpr[rt].w[i] + (uint32_t)((int16_t)(va.w[i] >> 16) * (int16_t)(vb.w[i] >> 16)); gpr[rt] = r; break;
-    case MPYHHU: for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] >> 16) * (vb.w[i] >> 16); gpr[rt] = r; break;
+    case MPYHHU: gpr[rt] = vi(_mm_mullo_epi32(_mm_srli_epi32(iv(va), 16), _mm_srli_epi32(iv(vb), 16))); break;
     case MPYHHAU: for (int i = 0; i < 4; i++) r.w[i] = gpr[rt].w[i] + (va.w[i] >> 16) * (vb.w[i] >> 16); gpr[rt] = r; break;
     case CLZ: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ? __builtin_clz(va.w[i]) : 32; gpr[rt] = r; break;
     case CNTB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)__builtin_popcount(va.b(i))); gpr[rt] = r; break;
@@ -479,35 +521,30 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
         }
         gpr[rt] = r;
         break;
-    case XSBH: for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)(int8_t)va.h(i)); gpr[rt] = r; break;
-    case XSHW: for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)(int16_t)va.w[i]; gpr[rt] = r; break;
+    case XSBH: gpr[rt] = vi(_mm_srai_epi16(_mm_slli_epi16(iv(va), 8), 8)); break;
+    case XSHW: gpr[rt] = vi(_mm_srai_epi32(_mm_slli_epi32(iv(va), 16), 16)); break;
     case XSWD: for (int i = 0; i < 2; i++) r.set_d(i, (uint64_t)(int64_t)(int32_t)va.w[2 * i + 1]); gpr[rt] = r; break;
 
     /* ---------- logical ---------- */
-    case AND: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & vb.w[i]; gpr[rt] = r; break;
-    case ANDC: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & ~vb.w[i]; gpr[rt] = r; break;
-    case ANDBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) & (uint8_t)i10); gpr[rt] = r; break;
+    case AND: gpr[rt] = vi(_mm_and_si128(iv(va), iv(vb))); break;
+    case ANDC: gpr[rt] = vi(_mm_andnot_si128(iv(vb), iv(va))); break;
+    case ANDBI: gpr[rt] = vi(_mm_and_si128(iv(va), _mm_set1_epi8((char)i10))); break;
     case ANDHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) & (uint16_t)i10); gpr[rt] = r; break;
-    case ANDI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] & (uint32_t)i10; gpr[rt] = r; break;
-    case OR: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | vb.w[i]; gpr[rt] = r; break;
-    case ORC: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | ~vb.w[i]; gpr[rt] = r; break;
-    case ORBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) | (uint8_t)i10); gpr[rt] = r; break;
+    case ANDI: gpr[rt] = vi(_mm_and_si128(iv(va), _mm_set1_epi32((int)i10))); break;
+    case OR: gpr[rt] = vi(_mm_or_si128(iv(va), iv(vb))); break;
+    case ORC: gpr[rt] = vi(_mm_or_si128(iv(va), not_(iv(vb)))); break;
+    case ORBI: gpr[rt] = vi(_mm_or_si128(iv(va), _mm_set1_epi8((char)i10))); break;
     case ORHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) | (uint16_t)i10); gpr[rt] = r; break;
-    case ORI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] | (uint32_t)i10; gpr[rt] = r; break;
+    case ORI: gpr[rt] = vi(_mm_or_si128(iv(va), _mm_set1_epi32((int)i10))); break;
     case ORX: r.w[0] = va.w[0] | va.w[1] | va.w[2] | va.w[3]; gpr[rt] = r; break;
-    case XOR: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ^ vb.w[i]; gpr[rt] = r; break;
+    case XOR: gpr[rt] = vi(_mm_xor_si128(iv(va), iv(vb))); break;
     case XORBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) ^ (uint8_t)i10); gpr[rt] = r; break;
     case XORHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) ^ (uint16_t)i10); gpr[rt] = r; break;
-    case XORI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] ^ (uint32_t)i10; gpr[rt] = r; break;
-    case NAND: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] & vb.w[i]); gpr[rt] = r; break;
-    case NOR: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] | vb.w[i]); gpr[rt] = r; break;
-    case EQV: for (int i = 0; i < 4; i++) r.w[i] = ~(va.w[i] ^ vb.w[i]); gpr[rt] = r; break;
-    case SELB: {
-        const V &C = gpr[rt];
-        for (int i = 0; i < 4; i++) r.w[i] = (C.w[i] & vb.w[i]) | (~C.w[i] & va.w[i]);
-        gpr[(x >> 21) & 0x7f] = r;
-        break;
-    }
+    case XORI: gpr[rt] = vi(_mm_xor_si128(iv(va), _mm_set1_epi32((int)i10))); break;
+    case NAND: gpr[rt] = vi(not_(_mm_and_si128(iv(va), iv(vb)))); break;
+    case NOR: gpr[rt] = vi(not_(_mm_or_si128(iv(va), iv(vb)))); break;
+    case EQV: gpr[rt] = vi(not_(_mm_xor_si128(iv(va), iv(vb)))); break;
+    case SELB: gpr[(x >> 21) & 0x7f] = vi(_mm_or_si128(_mm_and_si128(iv(gpr[rt]), iv(vb)), _mm_andnot_si128(iv(gpr[rt]), iv(va)))); break;
     case SHUFB: {
         // Selector byte c: 0x00-0x1f picks byte c of a:b, 10xxxxxx gives 0x00, 110xxxxx 0xff,
         // 111xxxxx 0x80. Two pshufb lookups (a, b) blended on bit 4, then the constants.
@@ -526,20 +563,20 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
     /* ---------- shifts and rotates ---------- */
     case SHLH: for (int i = 0; i < 8; i++) { int s = vb.h(i) & 0x1f; r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) << s)); } gpr[rt] = r; break;
     case SHLHI: { int s = i7 & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) << s)); gpr[rt] = r; break; }
-    case SHL: for (int i = 0; i < 4; i++) { int s = vb.w[i] & 0x3f; r.w[i] = s > 31 ? 0 : va.w[i] << s; } gpr[rt] = r; break;
-    case SHLI: { int s = i7 & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = s > 31 ? 0 : va.w[i] << s; gpr[rt] = r; break; }
+    case SHL: gpr[rt] = vi(_mm_sllv_epi32(iv(va), _mm_and_si128(iv(vb), _mm_set1_epi32(0x3f)))); break;
+    case SHLI: gpr[rt] = vi(_mm_sll_epi32(iv(va), _mm_cvtsi32_si128(i7 & 0x3f))); break;
     case ROTH: for (int i = 0; i < 8; i++) { int s = vb.h(i) & 0xf; uint16_t v = va.h(i); r.set_h(i, (uint16_t)((v << s) | (v >> ((16 - s) & 15)))); } gpr[rt] = r; break;
     case ROTHI: { int s = i7 & 0xf; for (int i = 0; i < 8; i++) { uint16_t v = va.h(i); r.set_h(i, (uint16_t)((v << s) | (v >> ((16 - s) & 15)))); } gpr[rt] = r; break; }
-    case ROT: for (int i = 0; i < 4; i++) { int s = vb.w[i] & 0x1f; r.w[i] = (va.w[i] << s) | (s ? va.w[i] >> (32 - s) : 0); } gpr[rt] = r; break;
-    case ROTI: { int s = i7 & 0x1f; for (int i = 0; i < 4; i++) r.w[i] = (va.w[i] << s) | (s ? va.w[i] >> (32 - s) : 0); gpr[rt] = r; break; }
+    case ROT: { __m128i n = _mm_and_si128(iv(vb), _mm_set1_epi32(0x1f)); gpr[rt] = vi(_mm_or_si128(_mm_sllv_epi32(iv(va), n), _mm_srlv_epi32(iv(va), _mm_sub_epi32(_mm_set1_epi32(32), n)))); } break;
+    case ROTI: { int n = i7 & 0x1f; gpr[rt] = vi(_mm_or_si128(_mm_sll_epi32(iv(va), _mm_cvtsi32_si128(n)), _mm_srl_epi32(iv(va), _mm_cvtsi32_si128(32 - n)))); } break;
     case ROTHM: for (int i = 0; i < 8; i++) { int s = (0 - vb.h(i)) & 0x1f; r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) >> s)); } gpr[rt] = r; break;
     case ROTHMI: { int s = (0 - i7) & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, s > 15 ? 0 : (uint16_t)(va.h(i) >> s)); gpr[rt] = r; break; }
-    case ROTM: for (int i = 0; i < 4; i++) { int s = (0 - vb.w[i]) & 0x3f; r.w[i] = s > 31 ? 0 : va.w[i] >> s; } gpr[rt] = r; break;
-    case ROTMI: { int s = (0 - i7) & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = s > 31 ? 0 : va.w[i] >> s; gpr[rt] = r; break; }
+    case ROTM: gpr[rt] = vi(_mm_srlv_epi32(iv(va), _mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), iv(vb)), _mm_set1_epi32(0x3f)))); break;
+    case ROTMI: gpr[rt] = vi(_mm_srl_epi32(iv(va), _mm_cvtsi32_si128((0 - i7) & 0x3f))); break;
     case ROTMAH: for (int i = 0; i < 8; i++) { int s = (0 - vb.h(i)) & 0x1f; r.set_h(i, (uint16_t)((int16_t)va.h(i) >> (s > 15 ? 15 : s))); } gpr[rt] = r; break;
     case ROTMAHI: { int s = (0 - i7) & 0x1f; for (int i = 0; i < 8; i++) r.set_h(i, (uint16_t)((int16_t)va.h(i) >> (s > 15 ? 15 : s))); gpr[rt] = r; break; }
-    case ROTMA: for (int i = 0; i < 4; i++) { int s = (0 - vb.w[i]) & 0x3f; r.w[i] = (uint32_t)((int32_t)va.w[i] >> (s > 31 ? 31 : s)); } gpr[rt] = r; break;
-    case ROTMAI: { int s = (0 - i7) & 0x3f; for (int i = 0; i < 4; i++) r.w[i] = (uint32_t)((int32_t)va.w[i] >> (s > 31 ? 31 : s)); gpr[rt] = r; break; }
+    case ROTMA: gpr[rt] = vi(_mm_srav_epi32(iv(va), _mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), iv(vb)), _mm_set1_epi32(0x3f)))); break;
+    case ROTMAI: gpr[rt] = vi(_mm_sra_epi32(iv(va), _mm_cvtsi32_si128((0 - i7) & 0x3f))); break;
     case SHLQBI: gpr[rt] = shl_bits(va, vb.w[0] & 7); break;
     case SHLQBII: gpr[rt] = shl_bits(va, i7 & 7); break;
     case SHLQBY: gpr[rt] = shl_bytes(va, vb.w[0] & 0x1f); break;
@@ -557,24 +594,24 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
     case ROTQMBYBI: gpr[rt] = shr_bytes(va, (0 - (vb.w[0] >> 3)) & 0x1f); break;
 
     /* ---------- compares ---------- */
-    case CEQB: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) == vb.b(i) ? 0xff : 0); gpr[rt] = r; break;
-    case CEQBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) == (uint8_t)i10 ? 0xff : 0); gpr[rt] = r; break;
-    case CEQH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) == vb.h(i) ? 0xffff : 0); gpr[rt] = r; break;
-    case CEQHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) == (uint16_t)i10 ? 0xffff : 0); gpr[rt] = r; break;
-    case CEQ: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] == vb.w[i] ? ~0u : 0; gpr[rt] = r; break;
-    case CEQI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] == (uint32_t)i10 ? ~0u : 0; gpr[rt] = r; break;
-    case CGTB: for (int i = 0; i < 16; i++) r.set_b(i, (int8_t)va.b(i) > (int8_t)vb.b(i) ? 0xff : 0); gpr[rt] = r; break;
-    case CGTBI: for (int i = 0; i < 16; i++) r.set_b(i, (int8_t)va.b(i) > (int8_t)(uint8_t)i10 ? 0xff : 0); gpr[rt] = r; break;
+    case CEQB: gpr[rt] = vi(_mm_cmpeq_epi8(iv(va), iv(vb))); break;
+    case CEQBI: gpr[rt] = vi(_mm_cmpeq_epi8(iv(va), _mm_set1_epi8((char)i10))); break;
+    case CEQH: gpr[rt] = vi(_mm_cmpeq_epi16(iv(va), iv(vb))); break;
+    case CEQHI: gpr[rt] = vi(_mm_cmpeq_epi16(iv(va), _mm_set1_epi16((short)i10))); break;
+    case CEQ: gpr[rt] = vi(_mm_cmpeq_epi32(iv(va), iv(vb))); break;
+    case CEQI: gpr[rt] = vi(_mm_cmpeq_epi32(iv(va), _mm_set1_epi32((int)i10))); break;
+    case CGTB: gpr[rt] = vi(_mm_cmpgt_epi8(iv(va), iv(vb))); break;
+    case CGTBI: gpr[rt] = vi(_mm_cmpgt_epi8(iv(va), _mm_set1_epi8((char)i10))); break;
     case CGTH: for (int i = 0; i < 8; i++) r.set_h(i, (int16_t)va.h(i) > (int16_t)vb.h(i) ? 0xffff : 0); gpr[rt] = r; break;
     case CGTHI: for (int i = 0; i < 8; i++) r.set_h(i, (int16_t)va.h(i) > (int16_t)i10 ? 0xffff : 0); gpr[rt] = r; break;
-    case CGT: for (int i = 0; i < 4; i++) r.w[i] = (int32_t)va.w[i] > (int32_t)vb.w[i] ? ~0u : 0; gpr[rt] = r; break;
-    case CGTI: for (int i = 0; i < 4; i++) r.w[i] = (int32_t)va.w[i] > i10 ? ~0u : 0; gpr[rt] = r; break;
-    case CLGTB: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) > vb.b(i) ? 0xff : 0); gpr[rt] = r; break;
-    case CLGTBI: for (int i = 0; i < 16; i++) r.set_b(i, va.b(i) > (uint8_t)i10 ? 0xff : 0); gpr[rt] = r; break;
+    case CGT: gpr[rt] = vi(_mm_cmpgt_epi32(iv(va), iv(vb))); break;
+    case CGTI: gpr[rt] = vi(_mm_cmpgt_epi32(iv(va), _mm_set1_epi32((int)i10))); break;
+    case CLGTB: gpr[rt] = vi(_mm_xor_si128(_mm_cmpeq_epi8(_mm_max_epu8(iv(vb), iv(va)), iv(vb)), _mm_set1_epi8(-1))); break;
+    case CLGTBI: gpr[rt] = vi(_mm_xor_si128(_mm_cmpeq_epi8(_mm_max_epu8(_mm_set1_epi8((char)i10), iv(va)), _mm_set1_epi8((char)i10)), _mm_set1_epi8(-1))); break;
     case CLGTH: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) > vb.h(i) ? 0xffff : 0); gpr[rt] = r; break;
     case CLGTHI: for (int i = 0; i < 8; i++) r.set_h(i, va.h(i) > (uint16_t)i10 ? 0xffff : 0); gpr[rt] = r; break;
-    case CLGT: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] > vb.w[i] ? ~0u : 0; gpr[rt] = r; break;
-    case CLGTI: for (int i = 0; i < 4; i++) r.w[i] = va.w[i] > (uint32_t)i10 ? ~0u : 0; gpr[rt] = r; break;
+    case CLGT: gpr[rt] = vi(cmpgt_u32(iv(va), iv(vb))); break;
+    case CLGTI: gpr[rt] = vi(cmpgt_u32(iv(va), _mm_set1_epi32((int)i10))); break;
 
     /* ---------- halts (raise an error) ---------- */
     case HEQ: case HEQI: case HGT: case HGTI: case HLGT: case HLGTI: {
@@ -609,12 +646,12 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
     case HBR: case HBRA: case HBRR: case NOP: case LNOP: case SYNC: case DSYNC: break;
 
     /* ---------- single precision ---------- */
-    case FA: gpr[rt] = fv(v_spr(_mm_add_ps(v_spf(vf(va)), v_spf(vf(vb))))); break;
-    case FS: gpr[rt] = fv(v_spr(_mm_sub_ps(v_spf(vf(va)), v_spf(vf(vb))))); break;
-    case FM: gpr[rt] = fv(v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb))))); break;
-    case FMA: gpr[(x >> 21) & 0x7f] = fv(v_spr(_mm_add_ps(v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb)))), v_spf(vf(gpr[rt]))))); break;
-    case FMS: gpr[(x >> 21) & 0x7f] = fv(v_spr(_mm_sub_ps(v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb)))), v_spf(vf(gpr[rt]))))); break;
-    case FNMS: gpr[(x >> 21) & 0x7f] = fv(v_spr(_mm_sub_ps(v_spf(vf(gpr[rt])), v_spr(_mm_mul_ps(v_spf(vf(va)), v_spf(vf(vb))))))); break;
+    case FA: gpr[rt] = fv(f_add(vf(va), vf(vb))); break;
+    case FS: gpr[rt] = fv(f_sub(vf(va), vf(vb))); break;
+    case FM: gpr[rt] = fv(f_mul(vf(va), vf(vb))); break;
+    case FMA: gpr[(x >> 21) & 0x7f] = fv(f_madd(vf(va), vf(vb), vf(gpr[rt]))); break;
+    case FMS: gpr[(x >> 21) & 0x7f] = fv(f_msub(vf(va), vf(vb), vf(gpr[rt]))); break;
+    case FNMS: gpr[(x >> 21) & 0x7f] = fv(f_nmsub(vf(va), vf(vb), vf(gpr[rt]))); break;
     // frest/frsqest return the exact value; fi then passes it through.
     case FREST: gpr[rt] = fv(v_spr(_mm_div_ps(_mm_set1_ps(1.0f), v_spf(vf(va))))); break;
     case FRSQEST: gpr[rt] = fv(v_spr(_mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(_mm_andnot_ps(_mm_set1_ps(-0.0f), v_spf(vf(va))))))); break;
