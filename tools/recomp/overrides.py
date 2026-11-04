@@ -18,4 +18,7 @@ OVERRIDES = {
     # GRAPHICS section of the options menu (runtime/src/pc_options.cpp).
     0x47ccc0: 'menu URL dispatcher (this, url): takes the clicks of our rows',
     0x47b900: 'calls a script function: adds our section when a page opens',
+    # 1:1 mouse look (runtime/src/mouse.cpp).
+    0x80a78: 'look input (this, outY, outX, settings): adds the mouse to the stick value',
+    0x6623d8: 'view data from a camera struct, per rendered frame: the view follows the mouse here',
 }

@@ -7,3 +7,4 @@ EBOOT.BIN
 kz2.log
 data/
 __pycache__/
+*.bin

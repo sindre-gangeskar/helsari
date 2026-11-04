@@ -20,6 +20,8 @@
 /* =================================== pad =================================== */
 
 void dualsense_merge(XINPUT_GAMEPAD &g);   // dualsense.cpp
+void cam_scan_step(XINPUT_GAMEPAD &g);     // cam_scan.cpp
+void mouse_note_controller();               // mouse.cpp
 
 static const bool g_trace_pad = getenv("KZ2_TRACE_PAD") != nullptr;
 namespace {
@@ -49,6 +51,10 @@ void keyboard(XINPUT_GAMEPAD &g) {
         {VK_RETURN, XINPUT_GAMEPAD_START}, {VK_BACK, XINPUT_GAMEPAD_BACK},
     };
     for (auto &m : map) if (key(m.vk)) g.wButtons |= m.bit;
+    // Mouse and keyboard play: fire, aim, sprint.
+    if (key(VK_LBUTTON)) g.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if (key(VK_RBUTTON)) g.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;   // zoom, in the Standard scheme
+    if (key(VK_SHIFT)) g.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
     if (key('1')) g.bLeftTrigger = 255;
     if (key('3')) g.bRightTrigger = 255;
     auto stick = [](SHORT &x, SHORT &y, int l, int r, int u, int d) {
@@ -145,8 +151,15 @@ HLE(cellPadGetData) {
     XINPUT_STATE s{};
     if (XInputGetState(0, &s) != ERROR_SUCCESS) s = {};
     dualsense_merge(s.Gamepad);
+    {   // A real controller in use (before the keyboard is added in): the look goes back to the game.
+        const XINPUT_GAMEPAD &pad = s.Gamepad;
+        const int dead = 8000;
+        if (pad.wButtons || pad.bLeftTrigger > 40 || pad.bRightTrigger > 40 || abs(pad.sThumbLX) > dead || abs(pad.sThumbLY) > dead || abs(pad.sThumbRX) > dead || abs(pad.sThumbRY) > dead)
+            mouse_note_controller();
+    }
     keyboard(s.Gamepad);
     script(s.Gamepad);
+    cam_scan_step(s.Gamepad);
     WORD b = s.Gamepad.wButtons;
     if (g_trace_pad) {
         static int calls;
