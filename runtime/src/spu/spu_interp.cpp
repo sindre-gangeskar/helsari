@@ -236,7 +236,9 @@ void SpuThread::run() {
         last_interp = pc;
         // KZ2_SPU_HOTSPOTS samples interpreted instructions only (compiled-code calls are not code
         // the interpreter runs, and counting them made compiled tasks look interpreted).
-        if (!(++interpreted & 1023) && g_hot_on) hot_sample(*this);
+        // Counted across run() calls: most runs are too short to reach 1024 on their own.
+        ++interpreted;
+        if (g_hot_on) { static thread_local uint32_t hot_tick; if (!(++hot_tick & 1023)) hot_sample(*this); }
         interp_once = false;
         note_interpreted(pc);
         uint32_t x = ls32(pc);
