@@ -13,7 +13,7 @@
 | Part      | How it runs                                                                                                                 |
 | --------- | --------------------------------------------------------------------------------------------------------------------------- |
 | PPU (CPU) | Statically recompiled: all reachable code (2.9M instructions, 49k functions) becomes C, including FPU and VMX/AltiVec       |
-| SPU       | Statically recompiled from the EBOOT and from SPU code captured at run time; float, shuffle and rotate instructions use SSE |
+| SPU       | Statically recompiled from the EBOOT and from SPU code captured at run time; float, shuffle and rotate instructions use SIMD |
 | SPURS     | Job-manager workloads run on up to 5 host threads each; task sets, events and mailboxes are emulated                        |
 | RSX (GPU) | Translated to Direct3D 11: shaders to HLSL (cached on disk), render-target cache, vertex decoding on the GPU                |
 | OS        | Threads, synchronisation primitives, memory, file system (`/dev_bdvd` mapped onto your dump), save data                     |
@@ -24,8 +24,10 @@
 
 Requirements: Python 3.10+, CMake, Ninja, Visual Studio Build Tools with its
 Clang component, and RPCS3 with PS3 firmware installed (used once, to decrypt
-`EBOOT.BIN`). LLVM-MinGW also works, but Windows Smart App Control can block it
-because it is unsigned; Microsoft's Clang is signed.
+`EBOOT.BIN`). The game needs a CPU with AVX2. Microsoft's Clang is signed, so
+Windows Smart App Control allows it. The build still has LLVM-MinGW settings, but
+Smart App Control can block that unsigned compiler, and they are untested since
+the switch.
 
 ```
 winget install Python.Python.3.13 Kitware.CMake Ninja-build.Ninja
@@ -41,8 +43,8 @@ Configuring runs the recompiler (`tools/recomp`); the build then compiles the
 generated code. SPU code the game loads at run time is captured to
 `build/spu_cache/` and compiled natively on the next build, so the first runs
 are slower; so are entry points of compiled programs that are only reached
-through computed jumps (`spu_cache/entries.txt`). `kz2.exe --dump <dir>` overrides the dump location; saves go to
-`build/data/`.
+through computed jumps (`spu_cache/entries.txt`). `kz2.exe --dump <dir>` overrides
+the dump location; saves go to `build/data/`.
 
 ## Debugging
 
@@ -66,6 +68,8 @@ Environment variables:
 | `KZ2_LOG_DRAWS=N`, `KZ2_LOG_ATTRS=d` | Per-draw state for frame N; vertex attributes and textures of draw d                            |
 | `KZ2_SKIP_DRAWS=a,b`                 | Skip draw indices (bisecting rendering bugs)                                                    |
 | `KZ2_SPU_NATIVE=0`                   | Run all SPU code in the interpreter                                                             |
+| `KZ2_DEBUG_PS=<hash>`, `KZ2_DEBUG_EXPR` | Replace one pixel shader's output with an HLSL expression                                    |
+| `KZ2_FP_WORDS=1`                     | Put raw fragment program words into the generated HLSL                                          |
 
 Most rendering and performance changes also have a switch to turn them off for
 comparison (e.g. `KZ2_CPU_VERTEX`, `KZ2_NO_SHADER_CACHE`, `KZ2_NO_MIPS`); they
@@ -100,6 +104,8 @@ EBOOT.BIN ──rpcs3 --decrypt──▶ EBOOT.elf ──tools/recomp──▶ b
 
 ## Next technical steps
 
-1. Remaining rendering differences from the PS3.
-2. Separate the game's simulation tick from its frame rate (the game advances
+1. Hold 30 fps in the busiest scenes: faster SPU code generation, then
+   post-processing on the GPU instead of the SPUs.
+2. Remaining rendering differences from the PS3.
+3. Separate the game's simulation tick from its frame rate (the game advances
    a fixed step per frame and caps itself at 30 fps).
