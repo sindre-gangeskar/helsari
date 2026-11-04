@@ -17,7 +17,7 @@
 | SPURS     | Job-manager workloads run on up to 5 host threads each; task sets, events and mailboxes are emulated                        |
 | RSX (GPU) | Translated to Direct3D 11: shaders to HLSL (cached on disk), render-target cache, vertex decoding on the GPU                |
 | OS        | Threads, synchronisation primitives, memory, file system (`/dev_bdvd` mapped onto your dump), save data                     |
-| Input     | XInput controller mapped to a DualShock 3                                                                                   |
+| Input     | XInput controller mapped to a DualShock 3; 1:1 raw mouse look on foot, see [Mouse look](#mouse-look)                        |
 | Audio     | cellAudio ports mixed to 7.1 and played through WASAPI                                                                      |
 
 ## Building
@@ -45,6 +45,24 @@ generated code. SPU code the game loads at run time is captured to
 are slower; so are entry points of compiled programs that are only reached
 through computed jumps (`spu_cache/entries.txt`). `helsari2.exe --dump <dir>` overrides
 the dump location; saves go to `build/data/`.
+
+## Mouse look
+
+Looking around with the mouse on foot is 1:1: raw input, with no acceleration or
+smoothing, updated every rendered frame.
+
+The game's logic runs at a fixed 15 Hz with an interpolated camera, so input
+through its look code reaches the screen late and blended. With the mouse, the
+player's rotation is written every rendered frame instead, and the view is
+corrected to match, so the camera, the character and the aim turn together. Using
+a controller hands the look back to the game until the mouse moves again.
+
+The viewmodel has its own transform at draw time: each part follows the game's
+pose smoothly, which removes the 15 Hz steps, and its sway is the same size at any
+pitch. **Options > Gameplay > Viewmodel Sway Multiplier** sets how much sway there
+is (0.25x to 2x).
+
+`KZ2_MOUSE_SENS=<n>` sets the sensitivity, and `KZ2_MOUSE_OFF=1` turns all of this off.
 
 ## Debugging
 

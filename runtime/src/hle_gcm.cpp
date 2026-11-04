@@ -203,7 +203,6 @@ namespace spu
     std::string stats_line(double secs, uint32_t frames);
 }
 void pc_options_start();  // pc_options.cpp
-void cam_scan_start();    // cam_scan.cpp
 void mouse_start(HWND h); // mouse.cpp
 bool mouse_message(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *result);
 std::string spurs_stats_line(double frames);
@@ -292,8 +291,6 @@ namespace
         }
         if (m == WM_KEYDOWN && w == VK_F11)
             rsx::toggle_cube_maps();
-        if (m == WM_KEYDOWN && w == VK_F6)
-            cam_scan_start();
         return DefWindowProcW(h, m, w, l);
     }
 

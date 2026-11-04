@@ -451,7 +451,9 @@ void spurs_tasks_dump() {
                     LOG("watchdog", "      line+%02x got %s", 64 * half, res_s.c_str());
                 }
             }
-            if (!shown[t.get()]++) t->spu->dump_history();
+            // The task can finish at any moment while this runs, and then it has no SPU any more.
+            spu::SpuThread *spu_now = t->spu;
+            if (spu_now && !shown[t.get()]++) spu_now->dump_history();
         }
         for (uint32_t id = 0; id < 32; id++) {
             if (!bit_test(ts + TS_ENABLED, id)) continue;

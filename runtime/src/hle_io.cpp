@@ -20,7 +20,6 @@
 /* =================================== pad =================================== */
 
 void dualsense_merge(XINPUT_GAMEPAD &g);   // dualsense.cpp
-void cam_scan_step(XINPUT_GAMEPAD &g);     // cam_scan.cpp
 void mouse_note_controller();               // mouse.cpp
 
 static const bool g_trace_pad = getenv("KZ2_TRACE_PAD") != nullptr;
@@ -159,7 +158,6 @@ HLE(cellPadGetData) {
     }
     keyboard(s.Gamepad);
     script(s.Gamepad);
-    cam_scan_step(s.Gamepad);
     WORD b = s.Gamepad.wButtons;
     if (g_trace_pad) {
         static int calls;

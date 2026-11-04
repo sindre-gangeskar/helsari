@@ -22,6 +22,9 @@
 #include <filesystem>
 #include <unordered_map>
 
+bool mouse_look_active(); // mouse.cpp
+bool mouse_turning();     // mouse.cpp
+float pc_viewmodel_sway(); // GAMEPLAY menu (pc_options.cpp)
 namespace rsx {
 uint32_t regs[0x10000 / 4];
 uint32_t vp_ucode[512 * 4];
@@ -1878,6 +1881,117 @@ void draw() {
         s_vch = g_cur_win.hi_count ? cb_push(&vp_consts[g_cur_win.hi_base * 4], g_cur_win.hi_count * 16) : s_vc;
         last_win = g_cur_win;
     };
+    // The viewmodel is drawn with its own camera, near plane 0.01 where the world uses 0.25. That shows
+    // in the transform: c[3].z - c[3].w is about -0.02 here and about -0.49 for the world. Its
+    // camera-relative transform (c[4..7]) steps with the game's ticks, which is the stutter. Each mesh
+    // follows it smoothly instead, every frame, so the steps go and real motion (bob, recoil) stays.
+    // c[0..3] is rebuilt from it: clip = (sx * x, sy * y, -z + near * w, -z).
+    float gun_saved[8 * 4];
+    bool gun_edited = false;
+    const float gun_near = vp_consts[3 * 4 + 2] - vp_consts[3 * 4 + 3];
+    if (gun_near < -0.008f && gun_near > -0.05f && mouse_look_active())
+    {
+        struct Smooth { float m[16], rest[16]; uint64_t last; int frame; };
+        static std::unordered_map<uint64_t, Smooth> meshes;
+        static std::unordered_map<uint64_t, uint32_t> seen;
+        static int frame = -1;
+        static bool turning;
+        static uint64_t last_turn_ns;
+        static const float rot_ms = getenv("KZ2_GUN_ROT_MS") ? (float)atof(getenv("KZ2_GUN_ROT_MS")) : 120.f;
+        static const float pos_ms = getenv("KZ2_GUN_POS_MS") ? (float)atof(getenv("KZ2_GUN_POS_MS")) : 40.f;
+        static const float fwd_ms = getenv("KZ2_GUN_FWD_MS") ? (float)atof(getenv("KZ2_GUN_FWD_MS")) : 150.f;
+        if (frame != (int)g_frame)
+        {
+            frame = (int)g_frame;
+            seen.clear();
+            turning = mouse_turning();
+            if (turning)
+                last_turn_ns = host_now_ns();
+        }
+        // The same mesh can be drawn twice with different transforms (say, two hands): count them apart.
+        const uint64_t mesh = ((uint64_t)(uint32_t)g_vs_hash << 32) | (uint32_t)list.size();
+        Smooth &f = meshes[mesh ^ ((uint64_t)seen[mesh]++ << 24)];
+        const uint64_t now = host_now_ns();
+        const float *live = &vp_consts[4 * 4];
+        float aim[16];
+        memcpy(aim, live, sizeof aim);
+        // The resting pose: taken once the mouse has been still for a moment.
+        if (!f.last || (!turning && now - last_turn_ns > 400000000ull))
+            memcpy(f.rest, live, sizeof f.rest);
+        // The viewmodel's parent sits 0.38 below the camera, and its lag turns it about the world's up
+        // axis. That swings the lever sideways by lag * 0.38 * sin(pitch), and forward and back with
+        // the pitch lag. The rotation stays as sway; the lever's movement comes off the position,
+        // leaving bob and recoil.
+        const float rest_len2 = f.rest[0] * f.rest[0] + f.rest[1] * f.rest[1] + f.rest[2] * f.rest[2];
+        const float *lever = &f.rest[12];
+        if (f.last && rest_len2 > 0.f && lever[0] * lever[0] + lever[1] * lever[1] + lever[2] * lever[2] < 4.f)
+        {
+            float q[3];
+            for (int i = 0; i < 3; i++)
+                q[i] = (f.rest[i * 4] * lever[0] + f.rest[i * 4 + 1] * lever[1] + f.rest[i * 4 + 2] * lever[2]) / rest_len2;
+            for (int k = 0; k < 3; k++)
+                aim[12 + k] = live[12 + k] - (live[k] * q[0] + live[4 + k] * q[1] + live[8 + k] * q[2] - lever[k]);
+        }
+        // The rotation sway, as a small turn about each view axis away from the resting pose. The lag is
+        // a turn about the world's up axis, so looking up or down part of it becomes a roll about the
+        // line of sight: that part is dropped. The other two are scaled and capped, so the sway is the
+        // same size at any pitch. The options menu's Viewmodel Sway Multiplier sets how much.
+        if (f.last && rest_len2 > 0.f)
+        {
+            const float multiplier = pc_viewmodel_sway();
+            const float amount = 0.6f * multiplier, cap = 0.07f * multiplier;
+            const auto d = [&](int row, int col) {
+                return (live[row] * f.rest[col] + live[4 + row] * f.rest[4 + col] + live[8 + row] * f.rest[8 + col]) / rest_len2;
+            };
+            float wx = 0.5f * (d(2, 1) - d(1, 2)) * amount, wy = 0.5f * (d(0, 2) - d(2, 0)) * amount;
+            wx = wx > cap ? cap : wx < -cap ? -cap : wx;
+            wy = wy > cap ? cap : wy < -cap ? -cap : wy;
+            for (int j = 0; j < 3; j++)
+            {
+                const float *r = &f.rest[j * 4];
+                aim[j * 4] = r[0] + wy * r[2];
+                aim[j * 4 + 1] = r[1] - wx * r[2];
+                aim[j * 4 + 2] = r[2] + wx * r[1] - wy * r[0];
+            }
+        }
+        if (!f.last || now - f.last > 200000000ull)
+        {
+            memcpy(f.m, live, sizeof f.m);
+            memcpy(f.rest, live, sizeof f.rest);
+        }
+        else if (f.frame != frame)
+        {
+            const float dt_ms = (float)(now - f.last) / 1e6f;
+            const float rot = rot_ms > 0.f ? 1.f - expf(-dt_ms / rot_ms) : 1.f, pos = pos_ms > 0.f ? 1.f - expf(-dt_ms / pos_ms) : 1.f;
+            for (int i = 0; i < 12; i++)
+                f.m[i] += (aim[i] - f.m[i]) * rot;
+            for (int i = 12; i < 14; i++)
+                f.m[i] += (aim[i] - f.m[i]) * pos;
+            // Forward and back: the game moves the weapon in and out with the pitch, in steps.
+            f.m[14] += (aim[14] - f.m[14]) * (fwd_ms > 0.f ? 1.f - expf(-dt_ms / fwd_ms) : 1.f);
+        }
+        f.last = now;
+        f.frame = frame;
+        const float *c = vp_consts;
+        const float sx2 = (live[0] * live[0] + live[4] * live[4] + live[8] * live[8]), sy2 = (live[1] * live[1] + live[5] * live[5] + live[9] * live[9]);
+        if (sx2 > 0.f && sy2 > 0.f)
+        {
+            const float sx = sqrtf((c[0] * c[0] + c[4] * c[4] + c[8] * c[8]) / sx2), sy = sqrtf((c[1] * c[1] + c[5] * c[5] + c[9] * c[9]) / sy2);
+            memcpy(gun_saved, vp_consts, sizeof gun_saved);
+            memcpy(&vp_consts[4 * 4], f.m, sizeof f.m);
+            for (int j = 0; j < 4; j++)
+            {
+                const float *v = &f.m[j * 4];
+                float *out = &vp_consts[j * 4];
+                out[0] = sx * v[0];
+                out[1] = sy * v[1];
+                out[2] = -v[2] + (j == 3 ? gun_near : 0.f);
+                out[3] = -v[2];
+            }
+            gun_edited = true;
+            vp_consts_dirty = true;
+        }
+    }
     bool win_changed = memcmp(&last_win, &g_cur_win, sizeof last_win) != 0;
     if (!cb_on) {
     } else if (g_cbring) {
@@ -1930,7 +2044,12 @@ void draw() {
     if (!cb_on) {
     } else if (g_cbring) s_px = cb_push(&px, 32 + 256 + ps->consts.size() * 16);
     else upload_cb(g_cb_px, &px, 32 + 256 + ps->consts.size() * 16);
-    if (cb_on && g_cbring && s_vx.gen != s_vc.gen) push_vc();   // ring wrapped in between
+    if (cb_on && g_cbring && s_vx.gen != s_vc.gen) push_vc();
+    if (gun_edited)
+    {
+        memcpy(vp_consts, gun_saved, sizeof gun_saved);
+        vp_consts_dirty = true; // the next draw must not see the edited matrix
+    }   // ring wrapped in between
     if ((int)g_frame == g_log_frame) {
         float f[8];
         memcpy(f, px.fc, 32);

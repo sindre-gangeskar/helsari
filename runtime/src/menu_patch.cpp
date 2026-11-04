@@ -61,15 +61,19 @@ namespace menu_patch
         // The game loads its pages from these caches, one per language; the .jsp files are not read.
         bool is_page_cache(const std::string &name) { return name.find("cachedjspingamesp.core") != std::string::npos; }
 
-        // The GRAPHICS list for the options page. pc_options.cpp hides it when the page opens, adds the
-        // section entry, shows the values and takes the rows' clicks.
+        // The GRAPHICS and GAMEPLAY lists for the options page. pc_options.cpp hides them when the page
+        // opens, adds the section entries, shows the values and takes the rows' clicks. Short names and
+        // no label text, since the room here is small (see patch_page): the labels are set when shown.
         const char *const GRAPHICS_LIST =
-            R"x(<_l name="listGraphicsSettings" c="_Normal" p="16,14,620,203" a="true" bn="DOWN_BUTTON" bp="UP_BUTTON" g="900" /> )x"
-            R"x(<_i name="itemPcFps" c="_Medium" p=",,620,29" g="901" h="static://helsari/fps" /> <_t name="textPcFps" c="_Medium" >FRAMERATE LIMIT</_t> <_i: name="!" g="901" /> )x"
-            R"x(<_i name="itemPcRes" c="_Medium" p=",29,620,29" g="902" h="static://helsari/res" /> <_t name="textPcRes" c="_Medium" >RESOLUTION</_t> <_i: name="!" g="902" /> )x"
-            R"x(<_i name="itemPcMode" c="_Medium" p=",58,620,29" g="903" h="static://helsari/mode" /> <_t name="textPcMode" c="_Medium" >WINDOW MODE</_t> <_i: name="!" g="903" /> )x"
-            R"x(<_i name="itemPcVsync" c="_Medium" p=",87,620,29" g="904" h="static://helsari/vsync" /> <_t name="textPcVsync" c="_Medium" >VSYNC</_t> <_i: name="!" g="904" /> )x"
-            R"x(<_l: name="!" g="900" /> )x";
+            R"x(<_l name="lG" c="_Normal" p="16,14,620,203" a="true" bn="DOWN_BUTTON" bp="UP_BUTTON" g="900" /> )x"
+            R"x(<_i name="iF" c="_Medium" p=",,620,29" g="901" h="static://hs/fps" /> <_t name="tF" c="_Medium" >-</_t> <_i: name="!" g="901" /> )x"
+            R"x(<_i name="iR" c="_Medium" p=",29,620,29" g="902" h="static://hs/res" /> <_t name="tR" c="_Medium" >-</_t> <_i: name="!" g="902" /> )x"
+            R"x(<_i name="iM" c="_Medium" p=",58,620,29" g="903" h="static://hs/mode" /> <_t name="tM" c="_Medium" >-</_t> <_i: name="!" g="903" /> )x"
+            R"x(<_i name="iV" c="_Medium" p=",87,620,29" g="904" h="static://hs/vsync" /> <_t name="tV" c="_Medium" >-</_t> <_i: name="!" g="904" /> )x"
+            R"x(<_l: name="!" g="900" /> )x"
+            R"x(<_l name="lP" c="_Normal" p="16,14,620,203" a="true" bn="DOWN_BUTTON" bp="UP_BUTTON" g="905" /> )x"
+            R"x(<_i name="iS" c="_Medium" p=",,620,29" g="906" h="static://hs/sway" /> <_t name="tS" c="_Medium" >-</_t> <_i: name="!" g="906" /> )x"
+            R"x(<_l: name="!" g="905" /> )x";
 
         // What to change in a page cache. Returns false if it is left alone. A page must keep its exact
         // length (growing one crashed the game), so what we add is paid for by turning the script's CRLF

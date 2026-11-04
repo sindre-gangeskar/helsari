@@ -1,4 +1,4 @@
-// The GRAPHICS section of the game's own options menu. menu_patch.cpp adds its list and rows to
+// The GRAPHICS and GAMEPLAY sections of the game's own options menu. menu_patch.cpp adds their lists and rows to
 // the page layout; the page's script is compiled and cannot be edited, so this runs Lua in the live
 // script when the page opens (adds the section, shows the values) and takes the rows' clicks at the
 // game's URL dispatcher. Settings persist in settings.ini.
@@ -38,10 +38,13 @@ namespace
         int w, h;
     } RES[] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
     constexpr int FPS_N = 4, RES_N = 5;
+    const float SWAY[] = {0.25f, 0.5f, 0.75f, 1.f, 1.25f, 1.5f, 1.75f, 2.f};
+    constexpr int SWAY_N = 8;
 
     int g_fps = 1, g_res = 0;
     bool g_borderless = false;
     std::atomic<bool> g_vsync{false};
+    std::atomic<int> g_sway{3};
     std::atomic<uint32_t> g_L{0}; // Lua state of the page's script
     std::mutex g_lock;
 
@@ -49,8 +52,8 @@ namespace
     {
         if (FILE *f = fopen(SETTINGS_FILE, "w"))
         {
-            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
-                    g_borderless, (int)g_vsync.load());
+            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nviewmodel_sway=%.2f\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
+                    g_borderless, (int)g_vsync.load(), SWAY[g_sway.load()]);
             fclose(f);
         }
     }
@@ -62,6 +65,7 @@ namespace
             return;
         char line[128], s[64];
         int a, b;
+        float v;
         while (fgets(line, sizeof line, f))
         {
             if (sscanf(line, "framerate_limit=%63s", s) == 1)
@@ -83,6 +87,12 @@ namespace
             else if (sscanf(line, "vsync=%d", &a) == 1)
             {
                 g_vsync = a != 0;
+            }
+            else if (sscanf(line, "viewmodel_sway=%f", &v) == 1)
+            {
+                for (int i = 0; i < SWAY_N; i++)
+                    if (SWAY[i] == v)
+                        g_sway = i;
             }
         }
         fclose(f);
@@ -164,12 +174,13 @@ namespace
         "end\n";
     std::string show_values()
     {
-        char res[48];
+        char res[48], sway[48];
         snprintf(res, sizeof res, "RESOLUTION: %d X %d", RES[g_res].w, RES[g_res].h);
+        snprintf(sway, sizeof sway, "VIEWMODEL SWAY MULTIPLIER: %.2fX", SWAY[g_sway.load()]);
         return LUA_SET +
-               set_text("textPcFps", std::string("FRAMERATE LIMIT: ") + FPS[g_fps]) + set_text("textPcRes", res) +
-               set_text("textPcMode", g_borderless ? "WINDOW MODE: BORDERLESS" : "WINDOW MODE: WINDOWED") +
-               set_text("textPcVsync", g_vsync ? "VSYNC: ON" : "VSYNC: OFF");
+               set_text("tF", std::string("FRAMERATE LIMIT: ") + FPS[g_fps]) + set_text("tR", res) +
+               set_text("tM", g_borderless ? "WINDOW MODE: BORDERLESS" : "WINDOW MODE: WINDOWED") +
+               set_text("tV", g_vsync ? "VSYNC: ON" : "VSYNC: OFF") + set_text("tS", sway);
     }
 
     bool menu_on() { return !getenv("KZ2_MENU_PATCH") || atoi(getenv("KZ2_MENU_PATCH")); }
@@ -180,6 +191,8 @@ namespace rsx
 {
     bool pc_vsync() { return g_vsync.load(std::memory_order_relaxed); }
 }
+
+float pc_viewmodel_sway() { return SWAY[g_sway.load(std::memory_order_relaxed)]; }
 
 // Window thread, once the window exists.
 void pc_options_start()
@@ -221,21 +234,25 @@ extern "C" void f_0047b900(PPU_CTX)
     {
         std::lock_guard<std::mutex> lk(g_lock);
         // Only pages that have our list: the main menu has an options table of its own but no rows yet.
-        lua_run(ctx, L, "if gOptionsTable and gBrowser and gBrowser:GetTagByName(\"listGraphicsSettings\") then\n"
+        lua_run(ctx, L, "if gOptionsTable and gBrowser and gBrowser:GetTagByName(\"lG\") and gBrowser:GetTagByName(\"lP\") then\n"
                         "local l = gOptionsTable.links\n"
                         "local n = getn(l)\n"
-                        "if l[n].sub_menu_list ~= \"listGraphicsSettings\" then\n"
-                        "l[n+1] = { title = \"GRAPHICS\", link = \"static://script.ingameoptionsscript.ShowOptionsSubMenu(4)\", "
-                        "sub_menu_list = \"listGraphicsSettings\", description = \"Change the graphics settings\", links = {} }\n"
+                        "if l[n].sub_menu_list ~= \"lP\" then\n"
+                        "l[n+1] = { title = \"GRAPHICS\", link = \"static://script.ingameoptionsscript.ShowOptionsSubMenu(\"..(n+1)..\")\", "
+                        "sub_menu_list = \"lG\", description = \"Change the graphics settings\", links = {} }\n"
+                        "l[n+2] = { title = \"GAMEPLAY\", link = \"static://script.ingameoptionsscript.ShowOptionsSubMenu(\"..(n+2)..\")\", "
+                        "sub_menu_list = \"lP\", description = \"Change the gameplay settings\", links = {} }\n"
                         // Showing the options panel shows every list in it, then the game hides its own by
                         // name. Lua finds functions by name at each call, so this covers the compiled callers.
                         "local hide = HideAllSettingOptions\n"
                         "function HideAllSettingOptions()\n"
                         "hide()\n"
-                        "gBrowser:GetTagByName(\"listGraphicsSettings\"):SetVisible(false)\n"
+                        "gBrowser:GetTagByName(\"lG\"):SetVisible(false)\n"
+                        "gBrowser:GetTagByName(\"lP\"):SetVisible(false)\n"
                         "end\n"
                         "end\n"
-                        "gBrowser:GetTagByName(\"listGraphicsSettings\"):SetVisible(false)\n" +
+                        "gBrowser:GetTagByName(\"lG\"):SetVisible(false)\n"
+                        "gBrowser:GetTagByName(\"lP\"):SetVisible(false)\n" +
                             show_values() + "end\n");
     }
     f_0047b900_guest(ctx);
@@ -243,7 +260,7 @@ extern "C" void f_0047b900(PPU_CTX)
 
 extern "C" void f_0047ccc0(PPU_CTX)
 {
-    static const std::string prefix = "static://helsari/";
+    static const std::string prefix = "static://hs/";
     std::string url;
     if (menu_on() && (uint32_t)ctx->r[4])
         url = (const char *)mem::ptr((uint32_t)ctx->r[4]);
@@ -263,6 +280,8 @@ extern "C" void f_0047ccc0(PPU_CTX)
         g_borderless = !g_borderless, apply_window();
     else if (row == "vsync")
         g_vsync = !g_vsync;
+    else if (row == "sway")
+        g_sway = (g_sway.load() + 1) % SWAY_N;
     save();
     if (const uint32_t L = g_L.load())
         lua_run(ctx, L, show_values());
