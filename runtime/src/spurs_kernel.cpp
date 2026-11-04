@@ -197,7 +197,7 @@ void workload_thread(Workload *w, int k) {
         s.pc = PM_ADDR;
         s.interrupts = false, s.event_mask = 0, s.event_stat = 0, s.dec_armed = false, s.stall_stat = 0;
         for (auto &l : s.stalled) l.active = false;
-        w->running++;
+        if (w->running++ == 0) gcm_tl("%s starts (ready %d)", w->name.c_str(), w->ready());
         { mem::LineGuard g(w->spurs); __atomic_add_fetch(w->contention_byte(), 1, __ATOMIC_SEQ_CST); }
         // Log the first few runs of each workload, then every 1000th.
         bool log = runs < 5 || runs % 1000 == 0;
@@ -221,7 +221,7 @@ void workload_thread(Workload *w, int k) {
         exit_idle.step(clock::now() - t_run < std::chrono::microseconds(30));   // found nothing to do
         runs++;
         { mem::LineGuard g(w->spurs); __atomic_sub_fetch(w->contention_byte(), 1, __ATOMIC_SEQ_CST); }
-        w->running--;
+        if (--w->running == 0) gcm_tl("%s idle", w->name.c_str());
     }
 }
 
@@ -338,6 +338,30 @@ extern "C" void line_notify(uint64_t ea) {
     }
 }
 
+// KZ2_CHAIN_STAT=1: what runs while the RSX is parked, sampled about every 50 us (burns one
+// core): how many jm_post instances are inside the job manager, and when none is, which other
+// workloads are. Reported in the stats line.
+namespace {
+std::atomic<uint64_t> g_cs_parked{0}, g_cs_post[9], g_cs_none_any{0}, g_cs_none_other[64];
+void chain_sampler() {
+    name_host_thread("chain sampler");
+    for (;;) {
+        host_sleep_us(50);
+        if (!gcm_parked_ea()) continue;
+        g_cs_parked++;
+        int n = g_wl_count.load(), post = 0;
+        for (int i = 0; i < n; i++)
+            if (g_wl_list[i]->name == "jm_post") post = g_wl_list[i]->running.load();
+        g_cs_post[std::min(post, 8)]++;
+        if (post) continue;
+        bool any = false;
+        for (int i = 0; i < n; i++)
+            if (g_wl_list[i]->running.load() > 0) any = true, g_cs_none_other[i]++;
+        if (!any) g_cs_none_any++;
+    }
+}
+} // namespace
+
 // Per workload since the last call: "name busy ms/frame (runs/frame, ready max r,
 // instances used u/n)". Resets.
 std::string spurs_stats_line(double frames) {
@@ -355,6 +379,27 @@ std::string spurs_stats_line(double frames) {
         last_p = tp, last_f = tf;
         last_k = k, last_u = u;
         out = pb;
+    }
+    static const bool chain = getenv("KZ2_CHAIN_STAT") != nullptr;
+    if (chain) {
+        static std::once_flag once;
+        std::call_once(once, [] { std::thread(chain_sampler).detach(); });
+        uint64_t parked = g_cs_parked.exchange(0);
+        if (parked) {
+            char cb[200];
+            int o = snprintf(cb, sizeof cb, "while parked (%.1f ms/frame) jm_post running:", parked * 0.05 / frames);
+            for (int i = 0; i < 6; i++) o += snprintf(cb + o, sizeof cb - o, " %d=%.0f%%", i, 100.0 * g_cs_post[i].exchange(0) / parked);
+            out += cb;
+            o = snprintf(cb, sizeof cb, "; none of post, nothing at all %.0f%%; others:", 100.0 * g_cs_none_any.exchange(0) / parked);
+            out += cb;
+            int wn = g_wl_count.load();
+            for (int i = 0; i < wn; i++)
+                if (uint64_t v = g_cs_none_other[i].exchange(0)) {
+                    snprintf(cb, sizeof cb, " %s=%.0f%%", g_wl_list[i]->name.c_str(), 100.0 * v / parked);
+                    out += cb;
+                }
+            out += "; ";
+        }
     }
     size_t first = out.size();
     std::lock_guard<std::mutex> lk(g_lock);

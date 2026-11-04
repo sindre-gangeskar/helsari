@@ -67,7 +67,12 @@ uint32_t syscall_dispatch(PPUContext *ctx, uint64_t n) {
     case 141: {                                          // usleep
         // Windows sleeps in whole timer ticks (1 ms at best), but games poll with
         // usleep(30): a high-resolution timer sleeps that short without spinning.
-        host_sleep_us((uint32_t)std::min<uint64_t>(ARG(0), 0xffffffffu));
+        // The main thread polls for finished SPU work with sleeps of about 0.5 ms, tuned for
+        // PS3 speeds: capped so it notices sooner. KZ2_MAIN_USLEEP_CAP=<us>, 0: no cap.
+        static const uint32_t main_cap = getenv("KZ2_MAIN_USLEEP_CAP") ? (uint32_t)atoi(getenv("KZ2_MAIN_USLEEP_CAP")) : 50;
+        uint32_t us = (uint32_t)std::min<uint64_t>(ARG(0), 0xffffffffu);
+        if (main_cap && us > main_cap && thread::current_id() == 0x1000000) us = main_cap;
+        host_sleep_us(us);
         return OK;
     }
     case 142: std::this_thread::sleep_for(std::chrono::seconds(ARG(0))); return OK;
