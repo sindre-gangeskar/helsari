@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -82,12 +83,46 @@ bool image_matches(const uint8_t *ls, const NativeModule *m) {
 }
 } // namespace
 
+// KZ2_SKIP_JOBS=job_d62e00,job_d65480 ("post" = the whole post-processing set): these jobs do
+// no pixel work. Measures what a job costs, or (later) lets the GPU do its work. They still run:
+// returning at once hangs the game, the job manager relies on the job's calls back into it. So
+// the job gets empty job data (no rows, no optional inputs). Job's code starts at its header's
+// entry offset, 0x30; r3 = context, context+32 = job data.
+// Not in the set: job_d69c80, a 4-byte PUT from job data - the signal the frame waits for.
+namespace {
+const uint32_t JOB_ENTRY = 0x30;
+uint32_t skip_job(SpuThread &t, uint32_t pc) {
+    uint32_t data = t.ls32((t.gpr[3].w[0] + 32) & (LS_SIZE - 4));
+    t.ls[(data + 2) & (LS_SIZE - 1)] &= ~0x07;   // q0 word 0, bits 4-10: optional inputs
+    t.ls[(data + 3) & (LS_SIZE - 1)] &= ~0xf0;
+    t.ls[(data + 16 + 5) & (LS_SIZE - 1)] = 0;   // q1 byte 5: rows
+    for (auto &mp : t.mapped)
+        if (mp.m && mp.m->ls_base + JOB_ENTRY == pc)
+            for (uint32_t i = 0; i < mp.m->count; i++)
+                if (mp.m->entries[i].pc == pc) return mp.m->entries[i].fn(t, pc);
+    t.interp_once = true;
+    return pc;
+}
+bool job_skipped(const char *job) {
+    static const std::string list = [] {
+        const char *e = getenv("KZ2_SKIP_JOBS");
+        std::string s = e ? e : "";
+        if (s == "post")
+            s = "job_d4a280,job_d52080,job_d55200,job_d68180,job_d5b200,job_d4e380,"
+                "job_d48600,job_d61280,job_d5db00,job_d62e00,job_d65480";
+        return s;
+    }();
+    return !list.empty() && strncmp(job, "job_", 4) == 0 && list.find(job) != std::string::npos;
+}
+}
+
 bool SpuThread::map_module(const NativeModule *m) {
     int slot = -1;
     for (int i = 0; i < 8; i++) if (!mapped[i].m) { slot = i; break; }
     if (slot < 0) return false;
     if (!native) native = std::make_unique<NativeFn[]>(LS_SIZE / 4);
     for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = m->entries[i].fn;
+    if (job_skipped(m->name)) native[(m->ls_base + JOB_ENTRY) >> 2] = skip_job;
     // code_q for this module: computed once, copied at every map (jobs map hundreds of times a frame).
     {
         static std::mutex lock;
@@ -107,6 +142,7 @@ bool SpuThread::map_module(const NativeModule *m) {
         memcpy(code_q + (m->ls_base >> 4), t, qn);
     }
     mapped[slot].m = m;
+    if (name[6] == 'j' && !m->image) gcm_post_job_mapped(m->name);   // "spurs:jm_...": F9 buffer dumps
     if (g_maps++ < 20) LOG("spu", "%s: native code for %s mapped at 0x%x", name.c_str(), m->name, m->ls_base);
     return true;
 }
@@ -210,6 +246,7 @@ void SpuThread::unmap_range(uint32_t lsa, uint32_t size) {
             code = is_code(m, (a - m->ls_base) >> 4);
         if (!code) continue;
         for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = nullptr;
+        if (native[(m->ls_base + JOB_ENTRY) >> 2] == skip_job) native[(m->ls_base + JOB_ENTRY) >> 2] = nullptr;
         memset(code_q + (m->ls_base >> 4), 0, ((m->ls_base + m->size - 1) >> 4) - (m->ls_base >> 4) + 1);
         mp.m = nullptr;
         code_epoch++;

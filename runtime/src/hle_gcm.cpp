@@ -28,14 +28,16 @@ std::atomic<uint32_t> g_parked_ea{0};   // guest address of the jump the RSX is 
 std::atomic<uint32_t> g_flip_count{0};
 // F9: the SPU post-processing buffers as images, colour and alpha (Killzone 2's addresses),
 // to see what each stage holds. post_<ea>.bmp, post_<ea>_a.bmp.
-void dump_post_buffers() {
+void dump_post_buffers(const char *tag) {
+    static const bool on = getenv("KZ2_POST_DUMP") && atoi(getenv("KZ2_POST_DUMP"));   // slows the frames it runs in
+    if (!on) return;
     static const struct { uint32_t ea, w, h; } bufs[] = {
         {0x31a9c200, 640, 360}, {0x31b7d200, 640, 360}, {0x31c5e200, 640, 360}, {0x31d3f200, 320, 180},
         {0x31d77600, 320, 180}, {0x31dafa00, 320, 180}, {0x31de7e00, 320, 180}, {0x31e20200, 160, 90}, {0x31e2e300, 160, 90}};
     for (auto &b : bufs)
         for (int alpha = 0; alpha < 2; alpha++) {
             char path[64];
-            snprintf(path, sizeof path, alpha ? "post_%08x_a.bmp" : "post_%08x.bmp", b.ea);
+            snprintf(path, sizeof path, alpha ? "post_%s_%08x_a.bmp" : "post_%s_%08x.bmp", tag, b.ea);
             FILE *f = fopen(path, "wb");
             if (!f) continue;
             uint32_t sz = b.w * b.h * 4;
@@ -58,6 +60,20 @@ void dump_post_buffers() {
             }
             fclose(f);
         }
+}
+
+// A post-processing job is about to run: during the F9 capture frame, save the buffers it will
+// read (once per job per frame). The chain reuses its buffers, so the end of the frame is too late.
+void gcm_post_job_mapped(const char *job) {
+    if (!g_tl_flips.load() || g_flip_count.load() + 2 != g_tl_flips.load()) return;
+    static std::mutex lock;
+    static uint32_t frame[2] = {~0u, ~0u};
+    int k = !strcmp(job, "job_d62e00") ? 0 : !strcmp(job, "job_d65480") ? 1 : -1;
+    if (k < 0) return;
+    std::lock_guard<std::mutex> g(lock);
+    if (frame[k] == g_flip_count.load()) return;
+    frame[k] = g_flip_count.load();
+    dump_post_buffers(job + 4);
 }
 
 void gcm_tl(const char *fmt, ...) {
@@ -198,7 +214,12 @@ void flip(uint32_t id) {
     }
     g_last_flip = id;
     if (id < 8) rsx::flip(g_disp[id].offset, g_disp[id].width, g_disp[id].height, g_disp[id].pitch);
-    if (g_flip_handler) g_pending_flip_handler = 1;
+    if (g_flip_handler) {
+        g_pending_flip_handler = 1;
+        // vblank_loop may deliver it early: see there.
+        { std::lock_guard<std::mutex> g(g_intr_lock); }
+        g_intr_cv.notify_all();
+    }
 }
 
 /* ---------------- RSX FIFO ---------------- */
@@ -264,7 +285,7 @@ void method(uint32_t m, uint32_t arg) {
     case 0x1d74: st32(LABEL_ADDR + g_rsx.be_semaphore_offset, arg); tl("rsx label 0x%x = 0x%x (tex)", g_rsx.be_semaphore_offset, arg); break;
     case GCM_FLIP_METHOD:
         tl("rsx flip 0x%x", arg);
-        if (g_tl_flips.load() && g_flip_count.load() + 2 == g_tl_flips.load()) dump_post_buffers();
+        if (g_tl_flips.load() && g_flip_count.load() + 2 == g_tl_flips.load()) dump_post_buffers("flip");
         flip(arg);
         g_flip_count++;
         break;
@@ -356,7 +377,14 @@ void fifo_thread() {
 
 // Runs on a guest thread so handlers can be invoked with a valid context.
 void vblank_loop(PPUContext *ctx) {
-    auto next_vblank = std::chrono::steady_clock::now();
+    using clock = std::chrono::steady_clock;
+    auto next_vblank = clock::now();
+    auto last_flip = next_vblank;
+    // A flip is delivered at once when the frame already took two refresh periods: waiting for
+    // the next tick idles everything (4 ms per frame on average) and snaps frame times to the
+    // 8 ms grid, so saving work often gains nothing. Faster frames still wait: this keeps the
+    // cap. KZ2_VBLANK_ON_FLIP=0: flips only on ticks.
+    static const bool on_flip = !getenv("KZ2_VBLANK_ON_FLIP") || atoi(getenv("KZ2_VBLANK_ON_FLIP"));
     for (;;) {
         // KZ2_VBLANK_US=<us>: the emulated refresh period. The game waits for two per frame,
         // so this sets its frame cap: 8000 about 62 fps (default), 16000 about 31 fps.
@@ -367,7 +395,15 @@ void vblank_loop(PPUContext *ctx) {
             std::vector<uint32_t> cmds;
             {
                 std::unique_lock<std::mutex> lk(g_intr_lock);
-                if (!g_intr_cv.wait_until(lk, next_vblank, [] { return !g_user_commands.empty(); })) break;
+                const auto floor = last_flip + std::chrono::microseconds(2 * vblank_us);
+                bool tick = false;
+                while (g_user_commands.empty() && !tick) {
+                    const bool flip = on_flip && g_pending_flip_handler.load();
+                    const auto until = flip ? std::min(next_vblank, floor) : next_vblank;
+                    if (clock::now() >= until) tick = true;
+                    else g_intr_cv.wait_until(lk, until);
+                }
+                if (tick) break;
                 cmds.swap(g_user_commands);
             }
             for (uint32_t c : cmds)
@@ -379,8 +415,16 @@ void vblank_loop(PPUContext *ctx) {
                     if (uint32_t pe = g_parked_ea.load()) gcm_parked_wake(pe, 4);   // handlers release parked jumps
                 }
         }
+        tl("vblank tick (flip pending %u)", g_pending_flip_handler.load());
         if (g_vblank_handler) { ctx->r[3] = 1; ppu_invoke(ctx, g_vblank_handler); }
-        if (g_pending_flip_handler.exchange(0) && g_flip_handler) { ctx->r[3] = 1; ppu_invoke(ctx, g_flip_handler); }
+        tl("vblank handler done");
+        if (g_pending_flip_handler.exchange(0) && g_flip_handler) {
+            ctx->r[3] = 1;
+            ppu_invoke(ctx, g_flip_handler);
+            tl("flip handler done");
+            last_flip = clock::now();
+            if (on_flip) next_vblank = last_flip;   // the next tick counts from here
+        }
     }
 }
 
