@@ -89,6 +89,30 @@ void gcm_tl(const char *fmt, ...) {
     LOG("tl", "%9.3f ms  %s", (now - t0) / 1e6, buf);
 }
 #define tl gcm_tl
+
+// KZ2_DELAY_CYCLE_US=<us>: which thread limits the frame? Adds that much busy work per frame, in
+// 8 s phases: none, main, rsx, both. A thread on the critical path makes frames that much longer;
+// on any other thread the delay disappears into a wait. Logs the fps of each phase ("delay" lines).
+void frame_delay(int who) {   // 0 main, 1 rsx (called once per frame by each)
+    static const uint64_t delay_ns = getenv("KZ2_DELAY_CYCLE_US") ? (uint64_t)atoi(getenv("KZ2_DELAY_CYCLE_US")) * 1000 : 0;
+    static const bool ab = getenv("KZ2_TASK_POLL_AB") != nullptr;   // see scheduler_thread
+    if (!delay_ns && !ab) return;
+    static const char *const names[4] = {"none", "main", "rsx", "both"};
+    uint64_t now = host_now_ns(), slot = now / 8000000000ull;
+    int phase = (int)(slot % 4);
+    if (who == 1) {
+        static uint64_t cur_slot, start, flips;
+        if (slot != cur_slot) {
+            if (cur_slot && flips) LOG("delay", "%-9s +%llu us: %.1f fps", ab ? (cur_slot % 2 ? "line wake" : "poll 1 ms") : names[cur_slot % 4],
+                                       (unsigned long long)(delay_ns / 1000), flips * 1e9 / (double)(now - start));
+            cur_slot = slot, start = now, flips = 0;
+        }
+        flips++;
+    }
+    if (!ab && (phase == 3 || phase == who + 1))
+        for (uint64_t t0 = now; host_now_ns() - t0 < delay_ns;) {}
+}
+namespace rsx { void frame_delay_rsx() { frame_delay(1); } }
 uint32_t gcm_parked_ea() { return g_parked_ea.load(); }
 void gcm_parked_wake(uint32_t ea, uint32_t size) {
     uint32_t pe = g_parked_ea.load();
@@ -567,6 +591,7 @@ HLE(cellGcmSetDisplayBuffer) {
     RET(0);
 }
 HLE(_cellGcmSetFlipCommand) {
+    frame_delay(0);
     uint32_t c = ARG32(0), id = ARG32(1);
     uint32_t cur = ld32(c + 8);
     if (cur + 8 > ld32(c + 4)) {

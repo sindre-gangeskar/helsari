@@ -102,6 +102,14 @@ void note_call(const char *name, PPUContext *ctx, bool entering) {
             const char *&n = names[ctx->lr];
             if (!n) { char *b = new char[40]; snprintf(b, 40, "usleep@%llx", (unsigned long long)ctx->lr); n = b; }
             name = n;
+            // Timeline: which object is main waiting for in the loop at 0x61e50 (array at 0x11bf660)?
+            if (ctx->lr == 0x61edc) {
+                uint32_t count = ld32(0x11bf660), arr = ld32(0x11bf664);
+                for (uint32_t i = 0; i < count && i < 64; i++) {
+                    uint32_t obj = ld32(arr + i * 4), busy = ld32(obj + 0x10);
+                    if (busy) { gcm_tl("main waits for object %u/%u at 0x%x vtable 0x%x +0x10=0x%x", i, count, obj, ld32(obj), busy); break; }
+                }
+            }
         }
         if (t_cur->call_depth++ == 0) t_cur->call_name = name, t_cur->call_t0 = host_now_ns();
     } else if (t_cur->call_depth > 0 && --t_cur->call_depth == 0) {

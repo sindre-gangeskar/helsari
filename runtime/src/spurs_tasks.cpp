@@ -180,6 +180,8 @@ void scheduler_thread(uint32_t ts) {
     name_host_thread("taskset scheduler");
     std::unique_lock<std::mutex> lk(g_lock);
     while (!g_shutdown[ts]) {
+        uint8_t seen[128];
+        memcpy(seen, mem::ptr(ts & ~127u), 128);
         auto &tasks = g_tasksets[ts];
         tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](auto &t) { return t->done.load(); }), tasks.end());
         for (uint32_t id = 0; id < 128; id++) {
@@ -201,7 +203,19 @@ void scheduler_thread(uint32_t ts) {
             t->spu = std::make_unique<spu::SpuThread>();
             std::thread(task_thread, t).detach();
         }
-        g_wake.wait_for(lk, std::chrono::milliseconds(1));
+        // Tasks made ready by SPU code send no wake-up, and a 1 ms poll cost ~3.5 ms per frame at
+        // the bridge (37.6 -> 43.5 fps). All task bitsets share the taskset's first line: sleep
+        // until it gets a commit. A change since `seen` returns at once, so no wake-up is lost.
+        // KZ2_TASK_WAKE=0: poll only. KZ2_TASK_POLL_AB=1: alternate every 8 s, fps in "delay" lines.
+        static const bool wake = !getenv("KZ2_TASK_WAKE") || atoi(getenv("KZ2_TASK_WAKE"));
+        static const bool ab = getenv("KZ2_TASK_POLL_AB") != nullptr;
+        if (wake && (!ab || (host_now_ns() / 8000000000ull) % 2 == 1)) {
+            lk.unlock();
+            line_wait(ts, seen, 1000);
+            lk.lock();
+        } else {
+            g_wake.wait_for(lk, std::chrono::milliseconds(1));
+        }
     }
 }
 

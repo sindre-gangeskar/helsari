@@ -2567,6 +2567,8 @@ void maybe_screenshot() {
 
 void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     if (!g_ok) return;
+    extern void frame_delay_rsx();
+    frame_delay_rsx();
     cb_flush();
     g_frame++;
     if ((int)g_frame == g_dump_frame) dump_surfaces();
