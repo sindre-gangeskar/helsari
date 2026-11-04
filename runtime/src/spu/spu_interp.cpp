@@ -175,6 +175,7 @@ std::string stats_line(double secs, uint32_t frames) {
 
 void SpuThread::run() {
     running = true;
+    _mm_setcsr(_mm_getcsr() | 0x8040);   // DAZ + FTZ: see v_spf in spu_ops.h
     // KZ2_SPU_TRACE=N logs the first N instructions executed by each SPU thread.
     static const int64_t trace_limit = getenv("KZ2_SPU_TRACE") ? atoll(getenv("KZ2_SPU_TRACE")) : 0;
     uint32_t event_poll = 0;

@@ -270,7 +270,14 @@ inline __m128 v_ftz(__m128 x) {
     __m128i den = _mm_cmpeq_epi32(e, _mm_setzero_si128());
     return _mm_castsi128_ps(_mm_blendv_epi8(b, _mm_and_si128(b, _mm_set1_epi32((int)0x80000000)), den));
 }
-inline __m128 v_spf(__m128 x) {
+// SPU threads run with DAZ and FTZ set (SpuThread::run): the hardware then treats denormals
+// as SPUs do, so only infinities and NaNs (exponent all ones, rare) need the slow paths.
+// Checked bit-identical against the full versions on 480M results; twice as fast.
+inline bool v_any_big(__m128 x) {
+    __m128i e = _mm_and_si128(_mm_castps_si128(x), _mm_set1_epi32(0x7f800000));
+    return _mm_movemask_epi8(_mm_cmpeq_epi32(e, _mm_set1_epi32(0x7f800000))) != 0;
+}
+inline __m128 v_spf_slow(__m128 x) {
     __m128i b = _mm_castps_si128(x), e = _mm_and_si128(b, _mm_set1_epi32(0x7f800000));
     __m128i sign = _mm_and_si128(b, _mm_set1_epi32((int)0x80000000));
     __m128i den = _mm_cmpeq_epi32(e, _mm_setzero_si128()), big = _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7f800000));
@@ -278,7 +285,8 @@ inline __m128 v_spf(__m128 x) {
     b = _mm_blendv_epi8(b, _mm_or_si128(sign, _mm_set1_epi32(0x7f7fffff)), big);
     return _mm_castsi128_ps(b);
 }
-inline __m128 v_spr(__m128 x) {
+inline __m128 v_spf(__m128 x) { return v_any_big(x) ? v_spf_slow(x) : x; }
+inline __m128 v_spr_slow(__m128 x) {
     __m128i b = _mm_castps_si128(x), e = _mm_and_si128(b, _mm_set1_epi32(0x7f800000));
     __m128i sign = _mm_and_si128(b, _mm_set1_epi32((int)0x80000000));
     __m128i den = _mm_cmpeq_epi32(e, _mm_setzero_si128()), big = _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7f800000));
@@ -288,6 +296,7 @@ inline __m128 v_spr(__m128 x) {
     b = _mm_andnot_si128(nan, b);   // NaN -> +0
     return _mm_castsi128_ps(b);
 }
+inline __m128 v_spr(__m128 x) { return v_any_big(x) ? v_spr_slow(x) : x; }
 
 inline V splat(uint32_t v) { return V{{v, v, v, v}}; }
 

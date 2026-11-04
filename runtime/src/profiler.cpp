@@ -127,7 +127,7 @@ void profiler(int secs) {
                 for (auto &[rip, k] : th) top.push_back({k, rip}), n += k;
                 std::sort(top.rbegin(), top.rend());
                 LOG("profile", " hot spots of %s (%llu samples):", names[threads[i].second].c_str(), (unsigned long long)n);
-                for (size_t j = 0; j < top.size() && j < 20; j++)
+                for (size_t j = 0; j < top.size() && j < (want ? 500u : 20u); j++)
                     LOG("profile", "    %5.1f%%  %s", 100.0 * top[j].first / n, where(top[j].second).c_str());
             }
             busy.clear();
