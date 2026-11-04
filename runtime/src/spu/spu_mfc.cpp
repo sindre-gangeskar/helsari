@@ -120,6 +120,15 @@ void SpuThread::mfc_command(uint32_t cmd) {
             LOG("spu", "%s: mfc cmd 0x%x on NULL page: ea 0x%x lsa 0x%x size 0x%x at pc 0x%x (lr 0x%x)", name.c_str(),
                 cmd, ea, lsa, size, pc, gpr[0].w[0]);
     }
+    // KZ2_POST_TRACE=1, F9 timeline: the post-processing chain's bulk transfers and which job's
+    // code is mapped, to map which job reads and writes which buffer.
+    static const bool post_trace = getenv("KZ2_POST_TRACE") != nullptr;   // off by default: this runs on every transfer
+    if (post_trace && size >= 512 && name.find("jm_post") != std::string::npos && (cmd == 0x40 || cmd == 0x41 || cmd == 0x42 || cmd == 0x20 || cmd == 0x21 || cmd == 0x22)) {
+        const char *job = "-";
+        for (auto &mp : mapped)
+            if (mp.m && mp.m->ls_base >= 0x4000) job = mp.m->name;
+        gcm_tl("%s %s ea 0x%x size 0x%x lsa 0x%x job %s", name.c_str(), cmd >= 0x40 ? "GET" : "PUT", ea, size, lsa, job);
+    }
     switch (cmd) {
     case 0x40: case 0x41: case 0x42:                // GET, GETB, GETF
         if (same_code_reload(lsa, ea_ptr(ea), size)) { loaded_from(lsa, ea, size); break; }
@@ -225,6 +234,13 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
         // low 4 bits of its EA, and the next element starts at the following quadword.
         uint32_t la = (lsa & (LS_SIZE - 16)) | (eal & 15);
         if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, la, sz);
+        static const bool post_trace_list = getenv("KZ2_POST_TRACE") != nullptr;
+        if (post_trace_list && sz >= 256 && name.find("jm_post") != std::string::npos) {
+            const char *job = "-";
+            for (auto &mp : mapped)
+                if (mp.m && mp.m->ls_base >= 0x4000) job = mp.m->name;
+            gcm_tl("%s list %s ea 0x%x size 0x%x lsa 0x%x job %s", name.c_str(), get ? "GET" : "PUT", eal, sz, la, job);
+        }
         if (get && same_code_reload(la, ea_ptr(eal), sz)) loaded_from(la, eal, sz);
         else if (get) ls_written(la, sz), memcpy(ls + la, ea_ptr(eal), sz), loaded_from(la, eal, sz);
         else {

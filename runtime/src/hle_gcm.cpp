@@ -26,6 +26,40 @@
 std::atomic<uint32_t> g_tl_flips{0};
 std::atomic<uint32_t> g_parked_ea{0};   // guest address of the jump the RSX is parked on (0: not parked)
 std::atomic<uint32_t> g_flip_count{0};
+// F9: the SPU post-processing buffers as images, colour and alpha (Killzone 2's addresses),
+// to see what each stage holds. post_<ea>.bmp, post_<ea>_a.bmp.
+void dump_post_buffers() {
+    static const struct { uint32_t ea, w, h; } bufs[] = {
+        {0x31a9c200, 640, 360}, {0x31b7d200, 640, 360}, {0x31c5e200, 640, 360}, {0x31d3f200, 320, 180},
+        {0x31d77600, 320, 180}, {0x31dafa00, 320, 180}, {0x31de7e00, 320, 180}, {0x31e20200, 160, 90}, {0x31e2e300, 160, 90}};
+    for (auto &b : bufs)
+        for (int alpha = 0; alpha < 2; alpha++) {
+            char path[64];
+            snprintf(path, sizeof path, alpha ? "post_%08x_a.bmp" : "post_%08x.bmp", b.ea);
+            FILE *f = fopen(path, "wb");
+            if (!f) continue;
+            uint32_t sz = b.w * b.h * 4;
+            uint8_t hdr[54] = {'B', 'M'};
+            *(uint32_t *)&hdr[2] = 54 + sz, *(uint32_t *)&hdr[10] = 54, *(uint32_t *)&hdr[14] = 40;
+            *(int32_t *)&hdr[18] = b.w, *(int32_t *)&hdr[22] = -(int32_t)b.h;
+            *(uint16_t *)&hdr[26] = 1, *(uint16_t *)&hdr[28] = 32;
+            fwrite(hdr, 1, 54, f);
+            std::vector<uint8_t> row(b.w * 4);
+            for (uint32_t y = 0; y < b.h; y++) {
+                const uint8_t *p = (const uint8_t *)mem::ptr(b.ea + y * b.w * 4);
+                for (uint32_t x = 0; x < b.w; x++) {   // memory: A R G B
+                    const uint8_t *q = p + x * 4;
+                    uint8_t *o = &row[x * 4];
+                    if (alpha) o[0] = o[1] = o[2] = q[0];
+                    else o[0] = q[3], o[1] = q[2], o[2] = q[1];
+                    o[3] = 255;
+                }
+                fwrite(row.data(), 1, row.size(), f);
+            }
+            fclose(f);
+        }
+}
+
 void gcm_tl(const char *fmt, ...) {
     if (!rsx::capturing() && g_flip_count.load() >= g_tl_flips.load()) return;
     static uint64_t t0;
@@ -228,7 +262,12 @@ void method(uint32_t m, uint32_t arg) {
         tl("rsx label 0x%x = 0x%x (back end)", g_rsx.be_semaphore_offset, arg);
         break;
     case 0x1d74: st32(LABEL_ADDR + g_rsx.be_semaphore_offset, arg); tl("rsx label 0x%x = 0x%x (tex)", g_rsx.be_semaphore_offset, arg); break;
-    case GCM_FLIP_METHOD: tl("rsx flip 0x%x", arg); flip(arg); g_flip_count++; break;
+    case GCM_FLIP_METHOD:
+        tl("rsx flip 0x%x", arg);
+        if (g_tl_flips.load() && g_flip_count.load() + 2 == g_tl_flips.load()) dump_post_buffers();
+        flip(arg);
+        g_flip_count++;
+        break;
     case 0xeb00: {                                                      // GCM_SET_USER_COMMAND
         static std::atomic<int> logs{0};
         if (logs++ < 5) LOG("rsx", "user command 0x%x (handler 0x%x)", arg, g_user_handler);
