@@ -57,21 +57,25 @@ bool is_code(const NativeModule *m, uint32_t q) {   // q: quadword index from ls
 // Does LS hold m's image? Runtime modules are compared on their code quadwords only:
 // those are all that was compiled, and the rest is data the program may have changed.
 bool image_matches(const uint8_t *ls, const NativeModule *m) {
-    if (!m->image) return !memcmp(ls + m->ls_base, mem::ptr(m->src_ea), m->size);
+    // EBOOT modules compare with the game image, captured ones with their embedded copy. Only code
+    // counts: the rest of a segment is data the running program has changed, and comparing it
+    // would keep a task that was unmapped once in the interpreter for good.
+    const uint8_t *img = m->image ? m->image : (const uint8_t *)mem::ptr(m->src_ea);
+    if (!m->protect) return !memcmp(ls + m->ls_base, img, m->size);
     // protect: per quadword, a bit per executed word (spu_capture.cpp); runs of whole
     // quadwords are compared with one memcmp, partial ones word by word.
     for (uint32_t off = 0; off < m->size;) {
         uint8_t bits = m->protect[off >> 4] & 0xf;
         if (bits != 0xf) {
             for (uint32_t w = 0; w < 4 && off + w * 4 < m->size; w++)
-                if ((bits >> w & 1) && memcmp(ls + m->ls_base + off + w * 4, m->image + off + w * 4, 4)) return false;
+                if ((bits >> w & 1) && memcmp(ls + m->ls_base + off + w * 4, img + off + w * 4, 4)) return false;
             off += 16;
             continue;
         }
         uint32_t end = off;
         while (end < m->size && (m->protect[end >> 4] & 0xf) == 0xf) end += 16;
         end = std::min(end, m->size);
-        if (memcmp(ls + m->ls_base + off, m->image + off, end - off)) return false;
+        if (memcmp(ls + m->ls_base + off, img + off, end - off)) return false;
         off = end;
     }
     return true;
