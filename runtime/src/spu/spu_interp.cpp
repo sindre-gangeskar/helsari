@@ -78,7 +78,7 @@ void SpuThread::dump_history() {
     LOG("spu", "%s:%s", name.c_str(), regs.c_str());
 }
 
-std::atomic<uint64_t> g_insns{0}, g_run_ns{0}, g_wait_ns{0};
+std::atomic<uint64_t> g_insns{0}, g_run_ns{0}, g_wait_ns{0}, g_interp{0};
 
 // KZ2_SPU_HOTSPOTS=1: every 1024th instruction is sampled as (thread, pc, hash of
 // the 256 code bytes around it - job managers load different code at the same
@@ -147,7 +147,9 @@ extern std::atomic<uint64_t> g_maps, g_unmaps, g_match_tries;
 std::string stats_line(double secs, uint32_t frames) {
     static int calls;
     if (g_hot_on && ++calls % 6 == 0) hot_dump();
-    static uint64_t last_i, last_r, last_w;
+    static uint64_t last_i, last_r, last_w, last_in;
+    uint64_t in_now = g_interp.load(), d_in = in_now - last_in;
+    last_in = in_now;
     uint64_t i = g_insns.load(), r = g_run_ns.load(), w = g_wait_ns.load();
     uint64_t di = i - last_i, dr = r - last_r, dw = w - last_w;
     last_i = i, last_r = r, last_w = w;
@@ -158,9 +160,9 @@ std::string stats_line(double secs, uint32_t frames) {
     // busy = time in run() not blocked on events, summed over SPU threads (in cores)
     double busy = (double)(dr - std::min(dr, dw)) / 1e9;
     snprintf(b, sizeof b,
-             "SPU %.1fM insns/frame, %.0fM insns/s, %.2f cores busy (%.0fM insns/s per busy core), "
+             "SPU %.1fM steps/frame (%.1fM interpreted, the rest compiled-code calls), %.0fM steps/s, %.2f cores busy (%.0fM per busy core), "
              "native maps %.0f unmaps %.0f match tries %.0f per frame",
-             di / 1e6 / f, di / 1e6 / secs, busy / secs, busy > 0 ? di / 1e6 / busy : 0.0, (maps - last_maps) / f,
+             di / 1e6 / f, d_in / 1e6 / f, di / 1e6 / secs, busy / secs, busy > 0 ? di / 1e6 / busy : 0.0, (maps - last_maps) / f,
              (unmaps - last_unmaps) / f, (tries - last_tries) / f);
     last_maps = maps, last_unmaps = unmaps, last_tries = tries;
     return b;
@@ -171,16 +173,17 @@ void SpuThread::run() {
     // KZ2_SPU_TRACE=N logs the first N instructions executed by each SPU thread.
     static const int64_t trace_limit = getenv("KZ2_SPU_TRACE") ? atoll(getenv("KZ2_SPU_TRACE")) : 0;
     uint32_t event_poll = 0;
-    uint64_t executed = 0;
+    uint64_t executed = 0, interpreted = 0;
     auto started = std::chrono::steady_clock::now();
     struct Flush {   // account on every exit path
-        uint64_t &n;
+        uint64_t &n, &in;
         std::chrono::steady_clock::time_point t0;
         ~Flush() {
             g_insns += n;
+            g_interp += in;
             g_run_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
         }
-    } flush{executed, started};
+    } flush{executed, interpreted, started};
     while (running) {
         if (!(++executed & 1023) && g_hot_on) hot_sample(*this);
         // Long-lived programs (resident job code, e.g. the MP3 decoder) are never replaced,
@@ -215,6 +218,7 @@ void SpuThread::run() {
         }
         if (!interp_once && pc != last_interp + 4 && code_q[pc >> 4] == CODE) record_entry(pc);
         last_interp = pc;
+        interpreted++;
         interp_once = false;
         note_interpreted(pc);
         uint32_t x = ls32(pc);

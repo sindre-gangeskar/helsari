@@ -185,6 +185,19 @@ void SpuThread::begin_capture(uint32_t pc) {
     uint32_t l = pc >> 7, d = src_delta[l];
     slot->last_use = ++cap_clock;
     slot->lo = l << 7, slot->hi = slot->lo + 128, slot->valid = false;   // nothing to capture: remember the line
+    // Inside a mapped captured module: code that did not run when it was captured (often in
+    // the menu; a new path in-game). Re-capture over the module's own range: the save merges
+    // the newly executed words into its file, and the next build compiles them.
+    if (g_capture_on)
+        for (auto &mp : mapped)
+            if (mp.m && mp.m->image && pc >= mp.m->ls_base && pc < mp.m->ls_base + mp.m->size &&
+                !(mp.m->ls_base & 127) && !(mp.m->size & 127) && mp.m->size <= MAX_IMAGE) {
+                slot->lo = mp.m->ls_base, slot->hi = mp.m->ls_base + mp.m->size, slot->valid = true;
+                slot->image.assign(ls + slot->lo, ls + slot->hi);
+                memset(exec_q + (slot->lo >> 4), 0, mp.m->size >> 4);
+                exec_q[pc >> 4] = 0x10 | (1 << ((pc >> 2) & 3));
+                return;
+            }
     if (!g_capture_on || !d || line_mapped(*this, l)) {
         static std::atomic<int> logs{0};
         if (g_capture_on && pc >= 0x5000 && pc < 0x3f000 && logs++ < 30) LOG("spu", "%s: no capture at pc 0x%x (delta 0x%x, mapped %d)", name.c_str(), pc, d, (int)line_mapped(*this, l));
@@ -205,6 +218,7 @@ void SpuThread::begin_capture(uint32_t pc) {
 }
 
 void SpuThread::flush_capture(Capture &c) {
+    cap_hot_size = 0;   // note_interpreted's remembered slot may be this one
     if (c.valid) {
         std::vector<uint8_t> mask(exec_q + (c.lo >> 4), exec_q + (c.hi >> 4));
         for (uint8_t b : mask)

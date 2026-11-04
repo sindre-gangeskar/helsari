@@ -210,16 +210,19 @@ struct SpuThread {
     // Interpreter hook: pc is about to run without native code.
     // The interpreter reached mapped module code that has no compiled entry (a computed
     // jump the recompiler could not see): saved for the next build (spu_capture.cpp).
-    uint32_t last_interp = ~0u;
+    uint32_t last_interp = ~0u, cap_hot_lo = 0, cap_hot_size = 0;
     void record_entry(uint32_t pc);
     void note_interpreted(uint32_t pc) {
         exec_q[pc >> 4] |= 0x10 | (1 << ((pc >> 2) & 3));   // per word (see spu_capture.cpp)
+        if (pc - cap_hot_lo < cap_hot_size) return;          // the slot of the last call: nearly always
         for (auto &c : caps)
             if (pc >= c.lo && pc < c.hi) {
                 if (!(++cap_clock & 0x3fffff)) checkpoint_captures();
                 c.last_use = cap_clock;
+                cap_hot_lo = c.lo, cap_hot_size = c.hi - c.lo;
                 return;
             }
+        cap_hot_size = 0;
         begin_capture(pc);
     }
     void begin_capture(uint32_t pc);
