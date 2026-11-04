@@ -80,7 +80,7 @@ void SpuThread::dump_history() {
 
 std::atomic<uint64_t> g_insns{0}, g_run_ns{0}, g_wait_ns{0}, g_interp{0};
 
-// KZ2_SPU_HOTSPOTS=1: every 1024th instruction is sampled as (thread, pc, hash of
+// KZ2_SPU_HOTSPOTS=1: every 1024th interpreted instruction is sampled as (thread, pc, hash of
 // the 256 code bytes around it - job managers load different code at the same
 // LS address); stats_line dumps the top samples every 6th call.
 namespace {
@@ -201,7 +201,7 @@ void SpuThread::run() {
                 continue;
             }
         }
-        if (!(++executed & 1023) && g_hot_on) hot_sample(*this);
+        ++executed;
         // Long-lived programs (resident job code, e.g. the MP3 decoder) are never replaced,
         // so their captures were never saved and never compiled: checkpoint them every 10 s
         // of interpretation.
@@ -234,7 +234,9 @@ void SpuThread::run() {
         }
         if (!interp_once && pc != last_interp + 4 && code_q[pc >> 4] == CODE) record_entry(pc);
         last_interp = pc;
-        interpreted++;
+        // KZ2_SPU_HOTSPOTS samples interpreted instructions only (compiled-code calls are not code
+        // the interpreter runs, and counting them made compiled tasks look interpreted).
+        if (!(++interpreted & 1023) && g_hot_on) hot_sample(*this);
         interp_once = false;
         note_interpreted(pc);
         uint32_t x = ls32(pc);
