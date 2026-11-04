@@ -17,8 +17,10 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <map>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -45,14 +47,21 @@ enum { TA_ELF = 0x00, TA_CONTEXT = 0x04, TA_CONTEXT_SIZE = 0x08, TA_EXIT_CODE = 
 
 struct Task {
     uint32_t taskset = 0, id = 0, elf = 0, exit_code_addr = 0;
-    std::unique_ptr<spu::SpuThread> spu;      // set when the scheduler starts it
-    std::atomic<bool> done{false};
+    spu::SpuThread *spu = nullptr;            // while it runs (else only diagnostics look at it)
+    std::atomic<bool> started{false}, done{false};
 };
 
 std::mutex g_lock;
 std::condition_variable g_wake;                                        // a task became ready
 std::map<uint32_t, std::vector<std::shared_ptr<Task>>> g_tasksets;   // taskset ea -> tasks
 std::map<uint32_t, bool> g_shutdown;
+
+// About 78 task log lines per frame, each taking the global log lock and flushing to disk
+// (~0.5 fps at the bridge, and most of the log's size). KZ2_TASK_LOG=1 turns them on.
+bool task_log() {
+    static const bool on = getenv("KZ2_TASK_LOG") && atoi(getenv("KZ2_TASK_LOG"));
+    return on;
+}
 
 // Task bitsets are u32[4] big-endian; task i is bit (31 - i % 32) of word i / 32.
 uint32_t *bit_word(uint32_t set_ea, uint32_t task) { return (uint32_t *)mem::ptr(set_ea + 4 * (task / 32)); }
@@ -93,13 +102,38 @@ void finish(Task &t, uint32_t exit_code) {
 
 void task_thread(std::shared_ptr<Task> tp) {
     Task &t = *tp;
+    // A pool worker keeps its SpuThread memory and native table between tasks: about 30 tasks
+    // start per frame, and zeroing warm memory is far cheaper than fresh pages from the OS.
+    // A task with spu already set was built by the scheduler (KZ2_TASK_POOL=0 path).
+    thread_local void *t_mem;
+    thread_local std::unique_ptr<spu::NativeFn[]> t_native;
+    const bool pooled = !t.spu;
+    if (pooled) {
+        if (!t_mem) t_mem = ::operator new(sizeof(spu::SpuThread), std::align_val_t(alignof(spu::SpuThread)));
+        t.spu = new (t_mem) spu::SpuThread();
+        t.spu->native = std::move(t_native);
+    }
     spu::SpuThread &s = *t.spu;
+    struct Cleanup {
+        Task &t;
+        std::unique_ptr<spu::NativeFn[]> &spare;
+        bool pooled;
+        ~Cleanup() {
+            spu::SpuThread *p = t.spu;
+            t.spu = nullptr;
+            if (!pooled) { delete p; return; }
+            if (p->native) memset(p->native.get(), 0, spu::LS_SIZE / 4 * sizeof(spu::NativeFn));
+            spare = std::move(p->native);
+            p->~SpuThread();
+        }
+    } cleanup{t, t_native, pooled};
     uint32_t ts = t.taskset;
     uint32_t info = ts + TS_TASK_INFO + t.id * TI_SIZE;
     char buf[32];
     snprintf(buf, sizeof buf, "task %u (ELF 0x%x)", t.id, t.elf);
     s.name = buf;
-    name_host_thread(s.name);
+    static const bool profiling = getenv("KZ2_PROFILE") != nullptr;
+    if (!pooled || profiling) name_host_thread(s.name);
     if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;
 
@@ -165,11 +199,44 @@ void task_thread(std::shared_ptr<Task> tp) {
     s.gpr[4] = spu::V{{ld32(ts + TS_ARGS), ld32(ts + TS_ARGS + 4), 0, spurs}};
     s.pc = entry;
     bit_set(ts + TS_RUNNING, t.id);
-    LOG("spurs", "%s: start at 0x%x (args %08x %08x %08x %08x)", s.name.c_str(), entry, s.gpr[3].w[0], s.gpr[3].w[1],
-        s.gpr[3].w[2], s.gpr[3].w[3]);
+    if (task_log())
+        LOG("spurs", "%s: start at 0x%x (args %08x %08x %08x %08x)", s.name.c_str(), entry, s.gpr[3].w[0], s.gpr[3].w[1],
+            s.gpr[3].w[2], s.gpr[3].w[3]);
     s.run();
     if (!t.done) finish(t, 0);
-    LOG("spurs", "%s: finished", s.name.c_str());
+    if (task_log()) LOG("spurs", "%s: finished", s.name.c_str());
+}
+
+// Workers that run tasks one after another. The pool only grows: a task can block for long
+// (it waits for a signal), so a queued task with no idle worker gets a new one.
+std::mutex g_pool_lock;
+std::condition_variable g_pool_cv;
+std::deque<std::shared_ptr<Task>> g_pool_q;
+size_t g_pool_idle;
+
+void pool_worker() {
+    name_host_thread("spurs task");
+    std::unique_lock<std::mutex> lk(g_pool_lock);
+    for (;;) {
+        g_pool_idle++;
+        g_pool_cv.wait(lk, [] { return !g_pool_q.empty(); });
+        g_pool_idle--;
+        std::shared_ptr<Task> t = std::move(g_pool_q.front());
+        g_pool_q.pop_front();
+        lk.unlock();
+        task_thread(t);
+        t.reset();
+        lk.lock();
+    }
+}
+
+void pool_submit(std::shared_ptr<Task> t) {
+    std::unique_lock<std::mutex> lk(g_pool_lock);
+    g_pool_q.push_back(std::move(t));
+    const bool spawn = g_pool_q.size() > g_pool_idle;
+    lk.unlock();
+    if (spawn) std::thread(pool_worker).detach();
+    else g_pool_cv.notify_one();
 }
 
 // The policy module's scheduling, natively: any task that is enabled and
@@ -190,7 +257,7 @@ void scheduler_thread(uint32_t ts) {
             std::shared_ptr<Task> t;
             for (auto &c : tasks)
                 if (c->id == id) t = c;
-            if (t && t->spu) continue;                                      // started, about to set running
+            if (t && t->started) continue;                                  // started, about to set running
             uint32_t info = ts + TS_TASK_INFO + id * TI_SIZE;
             if (!t) {                                                       // made ready by guest code
                 t = std::make_shared<Task>();
@@ -200,8 +267,17 @@ void scheduler_thread(uint32_t ts) {
             bit_clear(ts + TS_PENDING_READY, id);
             bit_set(ts + TS_READY, id);
             bit_set(ts + TS_RUNNING, id);
-            t->spu = std::make_unique<spu::SpuThread>();
-            std::thread(task_thread, t).detach();
+            t->started = true;
+            // KZ2_TASK_POOL=0: a new thread and SpuThread per task. KZ2_TASK_POOL_AB=1: alternate
+            // every 8 s, fps per phase in the "delay" log lines.
+            static const bool pool = !getenv("KZ2_TASK_POOL") || atoi(getenv("KZ2_TASK_POOL"));
+            static const bool pool_ab = getenv("KZ2_TASK_POOL_AB") != nullptr;
+            if (pool && (!pool_ab || (host_now_ns() / 8000000000ull) % 2 == 1)) {
+                pool_submit(t);
+            } else {
+                t->spu = new spu::SpuThread();
+                std::thread(task_thread, t).detach();
+            }
         }
         // Tasks made ready by SPU code send no wake-up, and a 1 ms poll cost ~3.5 ms per frame at
         // the bridge (37.6 -> 43.5 fps). All task bitsets share the taskset's first line: sleep
@@ -239,7 +315,7 @@ int32_t create_task(uint32_t ts, uint32_t id_out, uint32_t elf, uint32_t context
         t->taskset = ts, t->id = id, t->elf = elf, t->exit_code_addr = exit_code_addr;
         tasks.push_back(t);
         if (id_out) st32(id_out, id);
-        LOG("spurs", "taskset 0x%x: create task %u (ELF 0x%x)", ts, id, elf);
+        if (task_log()) LOG("spurs", "taskset 0x%x: create task %u (ELF 0x%x)", ts, id, elf);
         if (spurs_is_native_task(ts, elf)) {
             // Replaced natively: no SPU thread; it stays "enabled" until the taskset ends.
             return 0;
@@ -325,7 +401,7 @@ HLE(cellSpursJoinTaskset) {
         bool busy = false;
         {
             std::lock_guard<std::mutex> lk(g_lock);
-            for (auto &t : g_tasksets[ts]) busy |= t->spu && !t->done;
+            for (auto &t : g_tasksets[ts]) busy |= t->started && !t->done;
         }
         if (!busy) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

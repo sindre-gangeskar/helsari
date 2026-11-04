@@ -95,7 +95,8 @@ void gcm_tl(const char *fmt, ...) {
 // on any other thread the delay disappears into a wait. Logs the fps of each phase ("delay" lines).
 void frame_delay(int who) {   // 0 main, 1 rsx (called once per frame by each)
     static const uint64_t delay_ns = getenv("KZ2_DELAY_CYCLE_US") ? (uint64_t)atoi(getenv("KZ2_DELAY_CYCLE_US")) * 1000 : 0;
-    static const bool ab = getenv("KZ2_TASK_POLL_AB") != nullptr;   // see scheduler_thread
+    static const bool ab_pool = getenv("KZ2_TASK_POOL_AB") != nullptr; // see scheduler_thread
+    static const bool ab = ab_pool || getenv("KZ2_TASK_POLL_AB");
     if (!delay_ns && !ab) return;
     static const char *const names[4] = {"none", "main", "rsx", "both"};
     uint64_t now = host_now_ns(), slot = now / 8000000000ull;
@@ -103,7 +104,7 @@ void frame_delay(int who) {   // 0 main, 1 rsx (called once per frame by each)
     if (who == 1) {
         static uint64_t cur_slot, start, flips;
         if (slot != cur_slot) {
-            if (cur_slot && flips) LOG("delay", "%-9s +%llu us: %.1f fps", ab ? (cur_slot % 2 ? "line wake" : "poll 1 ms") : names[cur_slot % 4],
+            if (cur_slot && flips) LOG("delay", "%-9s +%llu us: %.1f fps", ab_pool ? (cur_slot % 2 ? "pool" : "new") : ab ? (cur_slot % 2 ? "line wake" : "poll 1 ms") : names[cur_slot % 4],
                                        (unsigned long long)(delay_ns / 1000), flips * 1e9 / (double)(now - start));
             cur_slot = slot, start = now, flips = 0;
         }
