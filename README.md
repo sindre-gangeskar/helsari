@@ -104,8 +104,7 @@ EBOOT.BIN ──rpcs3 --decrypt──▶ EBOOT.elf ──tools/recomp──▶ b
 
 ## Next technical steps
 
-1. Hold 30 fps in the busiest scenes: faster SPU code generation, then
-   post-processing on the GPU instead of the SPUs.
+1. Hold 60 fps in the busiest scenes. Measured: post-processing is not what limits
+   them (turning most of it off gains nothing), so find what the main thread and the
+   RSX wait for (`tools/timeline.py` reads the F9 timeline).
 2. Remaining rendering differences from the PS3.
-3. Separate the game's simulation tick from its frame rate (the game advances
-   a fixed step per frame and caps itself at 30 fps).
