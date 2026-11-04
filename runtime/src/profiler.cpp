@@ -82,7 +82,9 @@ void profiler(int secs) {
             if (!names.count(te.th32ThreadID)) names[te.th32ThreadID] = thread_name(h);
             // KZ2_PROFILE_SAMPLE=0: CPU times only (suspending threads adds kernel time of its own).
             static const bool sampling = !getenv("KZ2_PROFILE_SAMPLE") || atoi(getenv("KZ2_PROFILE_SAMPLE"));
-            if (sampling && SuspendThread(h) != (DWORD)-1) {
+            // KZ2_PROFILE_ONLY=<name>: sample only these threads, many times more often.
+            static const char *only = getenv("KZ2_PROFILE_ONLY");
+            if (sampling && (!only || names[te.th32ThreadID].find(only) != std::string::npos) && SuspendThread(h) != (DWORD)-1) {
                 CONTEXT c{};
                 c.ContextFlags = CONTEXT_CONTROL;
                 if (GetThreadContext(h, &c)) hits[te.th32ThreadID][c.Rip & ~0xfull]++, samples++;   // 16-byte buckets

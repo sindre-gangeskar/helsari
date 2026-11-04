@@ -1225,7 +1225,12 @@ void apply_state() {
     bool rsx_ccw = reg(0x1834) != 0x0900;
     bool front_ccw = ff_raw ? rsx_ccw : !rsx_ccw;
     uint32_t sc = front_ccw ? 3 : 1;
-    auto &rs = g_raster[sc];
+    // Polygon offset (decals on walls): enable 0x0a68, slope factor 0x0a78, units 0x0a7c. RSX and
+    // D3D both multiply units by the depth format's smallest step. KZ2_NO_DEPTH_BIAS=1: off.
+    static const bool no_bias = getenv("KZ2_NO_DEPTH_BIAS") && atoi(getenv("KZ2_NO_DEPTH_BIAS"));
+    bool bias_on = !no_bias && (reg(0x0a68) & 1);
+    uint32_t rkey[3] = {sc, bias_on ? reg(0x0a78) : 0, bias_on ? reg(0x0a7c) : 0};
+    auto &rs = g_raster[hfast(rkey, sizeof rkey)];
     if (!rs) {
         D3D11_RASTERIZER_DESC d{};
         d.FillMode = D3D11_FILL_SOLID;
@@ -1233,6 +1238,7 @@ void apply_state() {
         d.FrontCounterClockwise = front_ccw;
         d.DepthClipEnable = TRUE;
         d.ScissorEnable = TRUE;
+        if (bias_on) d.SlopeScaledDepthBias = regf(0x0a78), d.DepthBias = (INT)std::lround(regf(0x0a7c));
         g_dev->CreateRasterizerState(&d, &rs);
     }
     g_ctx->RSSetState(rs);

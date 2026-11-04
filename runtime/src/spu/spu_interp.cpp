@@ -191,6 +191,16 @@ void SpuThread::run() {
         }
     } flush{executed, interpreted, started};
     while (running) {
+        // Compiled code straight into compiled code: the usual case, with the rarer checks below
+        // (traps, pending interrupts, the interpreter) only when something needs them.
+        if (native && !interp_once && !interrupts) {
+            NativeFn f = native[pc >> 2];
+            if (f && !traps[pc >> 2]) {
+                executed++;
+                pc = f(*this, pc);
+                continue;
+            }
+        }
         if (!(++executed & 1023) && g_hot_on) hot_sample(*this);
         // Long-lived programs (resident job code, e.g. the MP3 decoder) are never replaced,
         // so their captures were never saved and never compiled: checkpoint them every 10 s

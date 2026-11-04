@@ -718,7 +718,24 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
         gpr[rt] = r;
         break;
     }
-    case CFLTU: { int sc = 173 - (int)((x >> 14) & 0xff); for (int i = 0; i < 4; i++) r.w[i] = sat_u32((double)va.f(i) * pow2(sc)); gpr[rt] = r; break; }
+    case CFLTU: {
+        int sc = 173 - (int)((x >> 14) & 0xff);
+        // As CFLTS: scaling is exact unless it overflows (saturates anyway). Values from 2^31 up
+        // convert after subtracting 2^31; negative and NaN give 0, too large gives all ones.
+        if (sc >= 0 && sc <= 64) {
+            __m128 f = _mm_mul_ps(vf(va), _mm_set1_ps((float)pow2(sc)));
+            const __m128 two31 = _mm_set1_ps(2147483648.0f);
+            __m128i lo = _mm_cvttps_epi32(f);
+            __m128i hi = _mm_xor_si128(_mm_cvttps_epi32(_mm_sub_ps(f, two31)), _mm_set1_epi32((int)0x80000000));
+            __m128i t = _mm_blendv_epi8(lo, hi, _mm_castps_si128(_mm_cmpge_ps(f, two31)));
+            t = _mm_or_si128(t, _mm_castps_si128(_mm_cmpge_ps(f, _mm_set1_ps(4294967296.0f))));
+            gpr[rt] = vi(_mm_and_si128(t, _mm_castps_si128(_mm_cmpgt_ps(f, _mm_setzero_ps()))));
+            break;
+        }
+        for (int i = 0; i < 4; i++) r.w[i] = sat_u32((double)va.f(i) * pow2(sc));
+        gpr[rt] = r;
+        break;
+    }
     case FSCRRD: gpr[rt] = V{}; break;
     case FSCRWR: break;
 
