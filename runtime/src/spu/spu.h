@@ -176,9 +176,17 @@ struct SpuThread {
     // A DMA bringing bytes LS already holds over mapped code (job managers re-send the
     // same job binary before every run): nothing changes, so the mapping stays.
     // Saves an unmap, an image match and a remap per job. KZ2_SPU_RELOAD_CHECK=0: off.
-    bool same_code_reload(uint32_t lsa, const void *src, uint32_t size) {
+    bool same_code_reload(uint32_t lsa, const void *src, uint32_t size, uint32_t ea = 0) {
         static const bool on = [] { const char *e = getenv("KZ2_SPU_RELOAD_CHECK"); return !e || atoi(e) != 0; }();
         if (!on || !size || lsa + size > LS_SIZE) return false;
+        // An EBOOT job still mapped where it is being loaded again: the source is the game's
+        // read-only image, and any write to that LS range would have unmapped it. Same bytes,
+        // nothing to compare. (Only whole-code modules: others have data that may have changed.)
+        if (ea)
+            for (auto &mp : mapped)
+                if (mp.m && !mp.m->protect && !mp.m->image && ea >= mp.m->src_ea && ea - mp.m->src_ea == lsa - mp.m->ls_base &&
+                    lsa >= mp.m->ls_base && lsa + size <= mp.m->ls_base + mp.m->size)   // whole, or one piece of it
+                    return true;
         bool code = false;
         for (uint32_t q = lsa >> 4, e = (lsa + size - 1) >> 4; q <= e && !code; q++) code = code_q[q] == CODE;
         return code && !memcmp(ls + lsa, src, size);

@@ -13,7 +13,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace spu {
 
@@ -81,8 +84,24 @@ bool SpuThread::map_module(const NativeModule *m) {
     if (slot < 0) return false;
     if (!native) native = std::make_unique<NativeFn[]>(LS_SIZE / 4);
     for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = m->entries[i].fn;
-    for (uint32_t q = m->ls_base >> 4; q <= (m->ls_base + m->size - 1) >> 4; q++)
-        code_q[q] = is_code(m, q - (m->ls_base >> 4)) ? CODE : DATA;
+    // code_q for this module: computed once, copied at every map (jobs map hundreds of times a frame).
+    {
+        static std::mutex lock;
+        static std::unordered_map<const NativeModule *, std::vector<uint8_t>> tables;
+        thread_local std::unordered_map<const NativeModule *, const uint8_t *> local;
+        const uint8_t *&t = local[m];
+        uint32_t qn = ((m->ls_base + m->size - 1) >> 4) - (m->ls_base >> 4) + 1;
+        if (!t) {
+            std::lock_guard<std::mutex> g(lock);
+            auto &v = tables[m];
+            if (v.empty()) {
+                v.resize(qn);
+                for (uint32_t q = 0; q < qn; q++) v[q] = is_code(m, q) ? CODE : DATA;
+            }
+            t = v.data();
+        }
+        memcpy(code_q + (m->ls_base >> 4), t, qn);
+    }
     mapped[slot].m = m;
     if (g_maps++ < 20) LOG("spu", "%s: native code for %s mapped at 0x%x", name.c_str(), m->name, m->ls_base);
     return true;
@@ -187,7 +206,7 @@ void SpuThread::unmap_range(uint32_t lsa, uint32_t size) {
             code = is_code(m, (a - m->ls_base) >> 4);
         if (!code) continue;
         for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = nullptr;
-        for (uint32_t q = m->ls_base >> 4; q <= (m->ls_base + m->size - 1) >> 4; q++) code_q[q] = 0;
+        memset(code_q + (m->ls_base >> 4), 0, ((m->ls_base + m->size - 1) >> 4) - (m->ls_base >> 4) + 1);
         mp.m = nullptr;
         code_epoch++;
         if (g_unmaps++ < 20) LOG("spu", "%s: native code for %s unmapped (write to 0x%x+0x%x)", name.c_str(), m->name, lsa, size);

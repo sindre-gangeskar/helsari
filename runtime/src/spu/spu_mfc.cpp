@@ -131,7 +131,7 @@ void SpuThread::mfc_command(uint32_t cmd) {
     }
     switch (cmd) {
     case 0x40: case 0x41: case 0x42:                // GET, GETB, GETF
-        if (same_code_reload(lsa, ea_ptr(ea), size)) { loaded_from(lsa, ea, size); break; }
+        if (same_code_reload(lsa, ea_ptr(ea), size, ea)) { loaded_from(lsa, ea, size); break; }
         memcpy(ls + lsa, ea_ptr(ea), size);
         code_loaded(lsa, ea, size);                 // unmaps what it overwrote; maps a known image
         break;
@@ -241,7 +241,7 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
                 if (mp.m && mp.m->ls_base >= 0x4000) job = mp.m->name;
             gcm_tl("%s list %s ea 0x%x size 0x%x lsa 0x%x job %s", name.c_str(), get ? "GET" : "PUT", eal, sz, la, job);
         }
-        if (get && same_code_reload(la, ea_ptr(eal), sz)) loaded_from(la, eal, sz);
+        if (get && same_code_reload(la, ea_ptr(eal), sz, eal)) loaded_from(la, eal, sz);
         else if (get) ls_written(la, sz), memcpy(ls + la, ea_ptr(eal), sz), loaded_from(la, eal, sz);
         else {
             if (uint32_t pe = gcm_parked_ea(); pe && pe >= eal && pe < eal + sz)
