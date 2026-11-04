@@ -4,6 +4,7 @@
 // offsets to functions with llvm-nm, image base 0x140000000).
 #include "runtime.h"
 
+#include <map>
 #include <windows.h>
 #include <tlhelp32.h>
 
@@ -57,6 +58,7 @@ void profiler(int secs) {
     std::unordered_map<DWORD, std::string> names;
     uint64_t samples = 0;
     ULONGLONG next_report = GetTickCount64() + secs * 1000ull;
+    std::map<DWORD, uint64_t> last_kern, kern;
     for (;;) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te{sizeof te};
@@ -69,8 +71,18 @@ void profiler(int secs) {
             uint64_t t = cpu_time(h), &prev = last_cpu[te.th32ThreadID];
             if (t != prev) busy[te.th32ThreadID] += t > prev ? t - prev : t;   // thread ids get reused
             prev = t;
+            {   // kernel share of that time
+                FILETIME c0, e0, k0, u0;
+                if (GetThreadTimes(h, &c0, &e0, &k0, &u0)) {
+                    uint64_t kn = ((uint64_t)k0.dwHighDateTime << 32) | k0.dwLowDateTime, &pk = last_kern[te.th32ThreadID];
+                    if (kn != pk) kern[te.th32ThreadID] += kn > pk ? kn - pk : kn;
+                    pk = kn;
+                }
+            }
             if (!names.count(te.th32ThreadID)) names[te.th32ThreadID] = thread_name(h);
-            if (SuspendThread(h) != (DWORD)-1) {
+            // KZ2_PROFILE_SAMPLE=0: CPU times only (suspending threads adds kernel time of its own).
+            static const bool sampling = !getenv("KZ2_PROFILE_SAMPLE") || atoi(getenv("KZ2_PROFILE_SAMPLE"));
+            if (sampling && SuspendThread(h) != (DWORD)-1) {
                 CONTEXT c{};
                 c.ContextFlags = CONTEXT_CONTROL;
                 if (GetThreadContext(h, &c)) hits[te.th32ThreadID][c.Rip & ~0xfull]++, samples++;   // 16-byte buckets
@@ -85,8 +97,14 @@ void profiler(int secs) {
             for (auto &[tid, t] : busy) threads.push_back({t, tid});
             std::sort(threads.rbegin(), threads.rend());
             LOG("profile", "CPU time per thread over %d s (100%% = one core):", secs);
-            for (size_t i = 0; i < threads.size() && i < 25; i++)
-                LOG("profile", "  %6.1f%%  %s", threads[i].first / 1e5 / secs, names[threads[i].second].c_str());
+            {
+                uint64_t all = 0, allk = 0;
+                for (auto &[t0, tid] : threads) all += t0, allk += kern[tid];
+                LOG("profile", "  %6.1f%%  (kernel %5.1f%%)  ALL %zu THREADS", all / 1e5 / secs, allk / 1e5 / secs, threads.size());
+            }
+            for (size_t i = 0; i < threads.size() && i < 90; i++)
+                LOG("profile", "  %6.1f%%  (kernel %5.1f%%)  %s", threads[i].first / 1e5 / secs,
+                    kern[threads[i].second] / 1e5 / secs, names[threads[i].second].c_str());
             // Where the busiest threads spend their time, plus any thread whose name
             // contains one of KZ2_PROFILE_THREADS="name,name".
             static const char *want = getenv("KZ2_PROFILE_THREADS");

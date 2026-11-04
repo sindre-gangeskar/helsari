@@ -134,6 +134,7 @@ void SpuThread::mfc_command(uint32_t cmd) {
             gcm_tl("%s puts label 0x%x = 0x%08x", name.c_str(), ea - 0x40300000, __builtin_bswap32(*(uint32_t *)(ls + lsa)));
         mem::track_unarm(ea, size);
         memcpy(ea_ptr(ea), ls + lsa, size);
+        gcm_parked_wake(ea, size);
         break;
     case 0x44: case 0x45: case 0x46:                // GETL
     case 0x24: case 0x25: case 0x26:                // PUTL
@@ -230,6 +231,7 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
             if (uint32_t pe = gcm_parked_ea(); pe && pe >= eal && pe < eal + sz)
                 gcm_tl("%s list PUT releases the parked RSX: ea 0x%x size 0x%x", name.c_str(), eal, sz);
             mem::track_unarm(eal, sz), memcpy(ea_ptr(eal), ls + la, sz);
+            gcm_parked_wake(eal, sz);
         }
         lsa = (lsa + sz + 15) & (LS_SIZE - 16);
         if (ts & 0x80000000u) {

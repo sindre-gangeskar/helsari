@@ -63,14 +63,29 @@ uint64_t take_backoff_ns() { uint64_t v = t_backoff_ns; t_backoff_ns = 0; return
 
 // KZ2_SPIN=<n>: polls before sleeping (default 256: 128 pauses, then 128 yields). The
 // spin phases cost CPU (heat), but 64 dropped the frame rate from 30 to ~20.
+void process_cpu_ms(double *kernel, double *user) {
+    FILETIME c, e, k, u;
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    *kernel = (double)(((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) / 1e4;
+    *user = (double)(((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime) / 1e4;
+}
+static std::atomic<uint64_t> g_idle_poll_ns{0}, g_bo_pause{0}, g_bo_yield{0}, g_bo_sleep{0};
+void add_idle_poll_ns(uint64_t ns) { g_idle_poll_ns.fetch_add(ns, std::memory_order_relaxed); }
+void idle_poll_stats(uint64_t *poll_ns, uint64_t *pauses, uint64_t *yields, uint64_t *sleeps) {
+    *poll_ns = g_idle_poll_ns.load(), *pauses = g_bo_pause.load(), *yields = g_bo_yield.load(), *sleeps = g_bo_sleep.load();
+}
 void host_backoff(uint32_t n) {
     static const uint32_t spin = [] { const char *e = getenv("KZ2_SPIN"); return e ? (uint32_t)atoi(e) : 256u; }();
-    if (n < spin / 2) YieldProcessor();          // a few hundred ns: the other side is about to answer
-    else if (n < spin) {                         // give the core to a ready thread, if any
+    if (n < spin / 2) {                          // a few hundred ns: the other side is about to answer
+        g_bo_pause.fetch_add(1, std::memory_order_relaxed);
+        YieldProcessor();
+    } else if (n < spin) {                       // give the core to a ready thread, if any
+        g_bo_yield.fetch_add(1, std::memory_order_relaxed);
         uint64_t t0 = host_now_ns();
         SwitchToThread();
         t_backoff_ns += host_now_ns() - t0;
     } else {
+        g_bo_sleep.fetch_add(1, std::memory_order_relaxed);
         uint64_t t0 = host_now_ns();
         host_sleep_us(n < 1024 || fast_wake() ? 50 : n < 2048 ? 200 : 1000);   // long idle (~0.25 s): fewer wake-ups
         t_backoff_ns += host_now_ns() - t0;

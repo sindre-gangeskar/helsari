@@ -218,12 +218,15 @@ bool track_range(uint32_t ea, uint32_t size, uint32_t &p0, uint32_t &p1) {
     p0 = (ea - LOCAL_BASE) >> 12, p1 = (uint32_t)((end - 1 - LOCAL_BASE) >> 12);
     return true;
 }
+std::atomic<uint64_t> g_track_protects{0}, g_track_faults{0};   // kernel transitions (flip log)
 void protect_pages(uint32_t p0, uint32_t p1, DWORD prot) {
     DWORD old;
+    g_track_protects.fetch_add(1, std::memory_order_relaxed);
     VirtualProtect(g_mem + LOCAL_BASE + ((uintptr_t)p0 << 12), (uintptr_t)(p1 - p0 + 1) << 12, prot, &old);
 }
 // A guest write to an armed page: unprotect it, mark it written.
 bool track_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
+    g_track_faults.fetch_add(1, std::memory_order_relaxed);
     if (ep->ExceptionRecord->ExceptionInformation[0] != 1) return false;
     uint64_t ea = (uint64_t)(addr - g_mem);
     if (ea < LOCAL_BASE || ea - LOCAL_BASE >= LOCAL_SIZE) return false;
@@ -240,6 +243,7 @@ bool track_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
 } // namespace
 
 bool track_enabled() { return g_track_on; }
+void track_counts(uint64_t *protects, uint64_t *faults) { *protects = g_track_protects.load(), *faults = g_track_faults.load(); }
 
 void track_arm(uint32_t ea, uint32_t size) {
     uint32_t p0, p1;

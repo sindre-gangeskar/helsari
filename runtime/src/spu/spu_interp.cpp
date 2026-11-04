@@ -156,14 +156,19 @@ std::string stats_line(double secs, uint32_t frames) {
     static uint64_t last_maps, last_unmaps, last_tries;
     uint64_t maps = g_maps.load(), unmaps = g_unmaps.load(), tries = g_match_tries.load();
     double f = frames ? frames : 1;
-    char b[320];
+    static uint64_t last_poll, last_pa, last_ye, last_sl;
+    uint64_t poll, pa, ye, sl;
+    idle_poll_stats(&poll, &pa, &ye, &sl);
+    double poll_ms = (poll - last_poll) / 1e6 / f, pa_f = (pa - last_pa) / f, ye_f = (ye - last_ye) / f, sl_f = (sl - last_sl) / f;
+    last_poll = poll, last_pa = pa, last_ye = ye, last_sl = sl;
+    char b[420];
     // busy = time in run() not blocked on events, summed over SPU threads (in cores)
     double busy = (double)(dr - std::min(dr, dw)) / 1e9;
     snprintf(b, sizeof b,
              "SPU %.1fM steps/frame (%.1fM interpreted, the rest compiled-code calls), %.0fM steps/s, %.2f cores busy (%.0fM per busy core), "
-             "native maps %.0f unmaps %.0f match tries %.0f per frame",
+             "native maps %.0f unmaps %.0f match tries %.0f per frame; idle polling %.0f ms/frame (%.0f pauses, %.0f yields, %.0f sleeps)",
              di / 1e6 / f, d_in / 1e6 / f, di / 1e6 / secs, busy / secs, busy > 0 ? di / 1e6 / busy : 0.0, (maps - last_maps) / f,
-             (unmaps - last_unmaps) / f, (tries - last_tries) / f);
+             (unmaps - last_unmaps) / f, (tries - last_tries) / f, poll_ms, pa_f, ye_f, sl_f);
     last_maps = maps, last_unmaps = unmaps, last_tries = tries;
     return b;
 }

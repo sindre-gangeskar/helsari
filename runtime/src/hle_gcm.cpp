@@ -40,6 +40,10 @@ void gcm_tl(const char *fmt, ...) {
 }
 #define tl gcm_tl
 uint32_t gcm_parked_ea() { return g_parked_ea.load(); }
+void gcm_parked_wake(uint32_t ea, uint32_t size) {
+    uint32_t pe = g_parked_ea.load();
+    if (pe && pe - ea < size) WakeByAddressAll(mem::ptr(pe));
+}
 
 #define REG(n) hle_register(#n, hle_##n)
 
@@ -251,7 +255,16 @@ void fifo_thread() {
         if (get == put || parked) {
             if (!idle) tl("rsx %s at 0x%x (ea 0x%x)", parked ? "parked" : "empty", get, ea0), g_parked_ea = parked ? ea0 : 0;
             auto t0 = std::chrono::steady_clock::now();
-            host_backoff(idle++);
+            // Parked: block on the jump word itself; whoever rewrites it wakes us
+            // (gcm_parked_wake). The former 50 us timer sleeps were half a core of kernel time
+            // for a thread doing nothing. The timeout covers writers that do not wake us.
+            // KZ2_RSX_PARK_WAIT=0: timer sleeps.
+            static const bool park_wait = !getenv("KZ2_RSX_PARK_WAIT") || atoi(getenv("KZ2_RSX_PARK_WAIT"));
+            if (parked && park_wait && idle >= 64) {
+                uint32_t raw = *(volatile uint32_t *)mem::ptr(ea0);
+                WaitOnAddress(mem::ptr(ea0), &raw, 4, 1);
+                idle++;
+            } else host_backoff(idle++);
             uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
             g_fifo_idle_us += us;
             if (parked) g_fifo_parked_us += us;
@@ -318,6 +331,7 @@ void vblank_loop(PPUContext *ctx) {
                     ctx->r[3] = c;
                     ppu_invoke(ctx, g_user_handler);
                     tl("handler(0x%x) done", c);
+                    if (uint32_t pe = g_parked_ea.load()) gcm_parked_wake(pe, 4);   // handlers release parked jumps
                 }
         }
         if (g_vblank_handler) { ctx->r[3] = 1; ppu_invoke(ctx, g_vblank_handler); }

@@ -25,6 +25,8 @@
 
 void spurs_connect_events(spu::SpuThread &s, uint32_t spurs);
 
+namespace mem { void track_counts(uint64_t *protects, uint64_t *faults); }
+static inline void YieldProcessorSpurs() { __builtin_ia32_pause(); }
 namespace {
 
 constexpr uint32_t PM_ADDR = 0xa00;
@@ -54,10 +56,26 @@ struct Workload {
     std::atomic<int> running{0};          // instances inside the policy module
     // flip log statistics: time instances spent running SPU code, runs, ready count seen
     std::atomic<uint64_t> busy_ns{0}, runs{0}, idle_ns{0}, backoff_ns{0};
+    std::atomic<uint64_t> short_runs{0}, short_ns{0}, wakes{0}, false_wakes{0}, spin_ns{0};   // runs under 20 us; cv wake-ups
     std::atomic<int> ready_max{0}, running_max{0};
     std::atomic<bool> shutdown{false};
     std::mutex m;
-    std::condition_variable cv;
+    // One wake signal per instance, and only instances that have work are woken: waking
+    // them all for one job cost ~100,000 thread switches a second at the shore, a quarter
+    // of the process's CPU time in the kernel. KZ2_SPURS_WAKE_ALL=1: wake every instance.
+    static constexpr int MAX_INSTANCES = 8;
+    std::condition_variable cv[MAX_INSTANCES];
+    std::atomic<uint32_t> sleeping{0};                   // bit k: instance k waits on cv[k]
+    void wake() {
+        static const bool all = getenv("KZ2_SPURS_WAKE_ALL") && atoi(getenv("KZ2_SPURS_WAKE_ALL"));
+        int r = ready();
+        uint32_t want = shutdown || all ? ~0u : r >= 32 ? ~0u : (1u << r) - 1;
+        uint32_t targets = sleeping.load(std::memory_order_seq_cst) & want;
+        if (!targets) return;
+        { std::lock_guard<std::mutex> wl(m); }           // a waiter is either past its check or asleep
+        for (int k = 0; k < MAX_INSTANCES; k++)
+            if (targets >> k & 1) cv[k].notify_one();
+    }
     std::vector<std::unique_ptr<spu::SpuThread>> spus;   // one per instance
 };
 
@@ -136,6 +154,17 @@ void workload_thread(Workload *w, int k) {
     uint64_t runs = 0;
     IdleBackoff exit_idle;
     while (!w->shutdown) {
+        // Short spin before sleeping: jobs arrive in bursts tens of microseconds apart, and a
+        // kernel sleep and wake-up per job costs more than that (a quarter of the process's
+        // CPU time, and latency along the whole job chain). Measured with 50 us: wake-ups fell
+        // tenfold, but no more fps and 10% more CPU, so off by default. KZ2_SPURS_SPIN_US=<us>: on.
+        static const uint32_t spin_us = getenv("KZ2_SPURS_SPIN_US") ? (uint32_t)atoi(getenv("KZ2_SPURS_SPIN_US")) : 0;
+        if (spin_us && runs) {
+            uint64_t t0 = host_now_ns(), limit = spin_us * 1000ull;
+            while (w->ready() <= k && !w->shutdown && host_now_ns() - t0 < limit)
+                for (int p = 0; p < 8; p++) YieldProcessorSpurs();
+            w->spin_ns.fetch_add(host_now_ns() - t0, std::memory_order_relaxed);
+        }
         {
             std::unique_lock<std::mutex> lk(w->m);
             // Sleep until there is work for this instance. The ready count changes by SPU
@@ -143,7 +172,18 @@ void workload_thread(Workload *w, int k) {
             // thread instead of each instance polling: libc++'s wait_for rounds short
             // timeouts down to 0 ms on Windows, so a 1 ms poll loop mostly spins).
             uint64_t t_idle = host_now_ns();
-            w->cv.wait(lk, [w, k] { return w->ready() > k || w->shutdown; });
+            w->sleeping.fetch_or(1u << k, std::memory_order_seq_cst);
+            bool checked = false;   // the check before sleeping is not a wake-up
+            w->cv[k].wait(lk, [w, k, &checked] {
+                bool go = w->ready() > k || w->shutdown;
+                if (checked) {
+                    w->wakes.fetch_add(1, std::memory_order_relaxed);
+                    if (!go) w->false_wakes.fetch_add(1, std::memory_order_relaxed);
+                }
+                checked = true;
+                return go;
+            });
+            w->sleeping.fetch_and(~(1u << k), std::memory_order_seq_cst);
             w->idle_ns += host_now_ns() - t_idle;
         }
         if (w->shutdown) break;
@@ -171,7 +211,11 @@ void workload_thread(Workload *w, int k) {
             while (u > mu && !w->running_max.compare_exchange_weak(mu, u)) {}
         }
         s.run();
-        w->busy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_run).count();
+        {
+            uint64_t ran = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_run).count();
+            w->busy_ns += ran;
+            if (ran < 20000) w->short_runs.fetch_add(1, std::memory_order_relaxed), w->short_ns.fetch_add(ran, std::memory_order_relaxed);
+        }
         w->backoff_ns += take_backoff_ns();   // of busy: sleeping in polling loops (empty queue, locks)
         if (log) LOG("spurs", "%s: exited at 0x%x", s.name.c_str(), s.pc);
         exit_idle.step(clock::now() - t_run < std::chrono::microseconds(30));   // found nothing to do
@@ -278,34 +322,51 @@ HLE(cellSpursWorkloadAttributeSetName) {
 // instances only noticed new work at the ready monitor's next poll - ~0.3-0.5 ms per
 // hand-off, hundreds of times a frame in a chain of dependent post-processing jobs.
 // KZ2_SPURS_WAKE_ON_WRITE=0: monitor only.
-namespace { std::atomic<uint32_t> g_spurs_lines[8]; }
+namespace { std::atomic<uint32_t> g_spurs_lines[8]; Workload *g_wl_list[64]; std::atomic<int> g_wl_count{0}; }
 extern "C" void line_notify(uint64_t ea) {
     line_wake(ea);
     uint32_t line = (uint32_t)ea & ~127u;
     bool ours = false;
     for (auto &l : g_spurs_lines) if (l.load(std::memory_order_relaxed) == line) ours = true;
     if (!ours) return;
-    std::lock_guard<std::mutex> lk(g_lock);
-    for (auto &[id, w] : g_workloads)
-        if ((w->spurs & ~127u) == line && w->ready() > w->running) {
-            { std::lock_guard<std::mutex> wl(w->m); }   // a waiter is either past its check or asleep
-            w->cv.notify_all();
-        }
+    // No lock: this runs on every atomic commit to the line, from about 25 threads. The
+    // list only grows and workloads stay allocated.
+    int n = g_wl_count.load(std::memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        Workload *w = g_wl_list[i];
+        if ((w->spurs & ~127u) == line && w->ready() > w->running) w->wake();
+    }
 }
 
 // Per workload since the last call: "name busy ms/frame (runs/frame, ready max r,
 // instances used u/n)". Resets.
 std::string spurs_stats_line(double frames) {
     std::string out;
+    {
+        static double last_k, last_u;
+        double k, u;
+        process_cpu_ms(&k, &u);
+        char pb[160];
+        static uint64_t last_p, last_f;
+        uint64_t tp, tf;
+        mem::track_counts(&tp, &tf);
+        snprintf(pb, sizeof pb, "process CPU kernel %.0f ms, user %.0f ms, page protects %.0f, write faults %.0f; ",
+                 (k - last_k) / frames, (u - last_u) / frames, (tp - last_p) / frames, (tf - last_f) / frames);
+        last_p = tp, last_f = tf;
+        last_k = k, last_u = u;
+        out = pb;
+    }
+    size_t first = out.size();
     std::lock_guard<std::mutex> lk(g_lock);
     for (auto &[id, w] : g_workloads) {
         uint64_t b = w->busy_ns.exchange(0), r = w->runs.exchange(0), idl = w->idle_ns.exchange(0), bo = w->backoff_ns.exchange(0);
         int rm = w->ready_max.exchange(0), um = w->running_max.exchange(0);
         if (!b && !r) continue;
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s%s run %.1f ms (of it backoff sleeps %.1f), between runs %.1f ms (%.0f runs, ready max %d, instances %d/%zu)",
-                 out.empty() ? "" : "; ", w->name.c_str(), b / 1e6 / frames, bo / 1e6 / frames, idl / 1e6 / frames, r / frames, rm,
-                 um, w->spus.size());
+        uint64_t sr = w->short_runs.exchange(0), sn = w->short_ns.exchange(0), wk = w->wakes.exchange(0), fw = w->false_wakes.exchange(0), sp = w->spin_ns.exchange(0);
+        char buf[320];
+        snprintf(buf, sizeof buf, "%s%s run %.1f ms (of it backoff sleeps %.1f), between runs %.1f ms (%.0f runs, %.0f under 20 us = %.1f ms; %.0f wake-ups, %.0f false, spin %.1f ms; ready max %d, instances %d/%zu)",
+                 out.size() == first ? "" : "; ", w->name.c_str(), b / 1e6 / frames, bo / 1e6 / frames, idl / 1e6 / frames, r / frames,
+                 sr / frames, sn / 1e6 / frames, wk / frames, fw / frames, sp / 1e6 / frames, rm, um, w->spus.size());
         out += buf;
     }
     return out;
@@ -316,10 +377,12 @@ std::string spurs_stats_line(double frames) {
 void ready_monitor() {
     name_host_thread("spurs ready monitor");
     for (;;) {
-        host_sleep_us(fast_wake() ? 100 : 1000);
+        // Commits wake instances directly (line_notify): this only catches what they miss.
+        static const uint32_t period = getenv("KZ2_SPURS_MONITOR_US") ? (uint32_t)atoi(getenv("KZ2_SPURS_MONITOR_US")) : 1000;
+        host_sleep_us(period);
         std::lock_guard<std::mutex> lk(g_lock);
         for (auto &[id, w] : g_workloads)
-            if (w->ready() > w->running) w->cv.notify_all();
+            if (w->ready() > w->running) w->wake();
     }
 }
 
@@ -339,6 +402,8 @@ HLE(cellSpursAddWorkloadWithAttribute) {
         std::lock_guard<std::mutex> lk(g_lock);
         p->id = g_next_wid++;
         g_workloads[p->id] = std::move(w);
+        int wn = g_wl_count.load();
+        if (wn < 64) g_wl_list[wn] = p, g_wl_count.store(wn + 1, std::memory_order_release);
     }
     st32(ARG32(1), p->id);
     static const bool wake_on_write = !getenv("KZ2_SPURS_WAKE_ON_WRITE") || atoi(getenv("KZ2_SPURS_WAKE_ON_WRITE"));
@@ -376,7 +441,7 @@ HLE(cellSpursReadyCountStore) {
     static std::atomic<int> logged{0};
     if (logged++ < 30) LOG("spurs", "ready count of workload %u '%s' = %d", w->id, w->name.c_str(), (int32_t)ARG32(2));
     { mem::LineGuard g(w->spurs); __atomic_store_n(w->ready_byte(), (uint8_t)ARG32(2), __ATOMIC_SEQ_CST); }
-    w->cv.notify_all();
+    w->wake();
     RET(0);
 }
 HLE(cellSpursGetWorkloadInfo) {
@@ -393,7 +458,7 @@ HLE(cellSpursGetWorkloadInfo) {
     RET(0);
 }
 HLE(cellSpursShutdownWorkload) {
-    if (Workload *w = find(ARG32(1))) { w->shutdown = true; w->cv.notify_all(); }
+    if (Workload *w = find(ARG32(1))) { w->shutdown = true; w->wake(); }
     RET(0);
 }
 HLE(cellSpursWaitForWorkloadShutdown) {
