@@ -23,7 +23,7 @@ import struct
 
 OPS_HEADER = os.path.join(os.path.dirname(__file__), '..', '..', 'runtime', 'src', 'spu', 'spu_ops.h')
 LS_MASK = 0x3fffc
-CHUNK_INSNS = 1500             # instructions per generated function (larger: slow, memory-hungry compiles)
+CHUNK_INSNS = 4000             # instructions per generated function (larger: slow, memory-hungry compiles)
 JOB_LS_BASE = 0x4000          # job managers DMA job binaries here (observed for jm_post)
 MAX_JOB_SIZE = 0x8000         # larger "jobs" between the ELFs are data
 
