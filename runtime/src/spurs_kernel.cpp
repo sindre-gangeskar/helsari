@@ -156,9 +156,9 @@ void workload_thread(Workload *w, int k) {
     while (!w->shutdown) {
         // Short spin before sleeping: jobs arrive in bursts tens of microseconds apart, and a
         // kernel sleep and wake-up per job costs more than that (a quarter of the process's
-        // CPU time, and latency along the whole job chain). Measured with 50 us: wake-ups fell
-        // tenfold, but no more fps and 10% more CPU, so off by default. KZ2_SPURS_SPIN_US=<us>: on.
-        static const uint32_t spin_us = getenv("KZ2_SPURS_SPIN_US") ? (uint32_t)atoi(getenv("KZ2_SPURS_SPIN_US")) : 0;
+        // CPU time, and latency along the whole job chain). 50 us: no gain while SPU code was slow,
+        // but with faster code busy scenes went from ~38 to ~45 fps. KZ2_SPURS_SPIN_US=0: off.
+        static const uint32_t spin_us = getenv("KZ2_SPURS_SPIN_US") ? (uint32_t)atoi(getenv("KZ2_SPURS_SPIN_US")) : 50;
         if (spin_us && runs) {
             uint64_t t0 = host_now_ns(), limit = spin_us * 1000ull;
             while (w->ready() <= k && !w->shutdown && host_now_ns() - t0 < limit)
