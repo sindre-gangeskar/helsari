@@ -48,7 +48,7 @@ struct FpKey {
 struct FpInfo { std::string hlsl; uint64_t hash; int mrt_count; };
 FpInfo translate_fp(const FpKey &key);
 struct FpScan { uint64_t hash; std::vector<uint32_t> consts; uint16_t tex_mask; };  // const offsets from program start; texture units sampled
-FpScan scan_fp(uint32_t addr);
+const FpScan &scan_fp(uint32_t addr);
 uint32_t fp_const_word(uint32_t ea);  // read one halfword-swapped program word
 
 uint64_t fnv(const void *p, size_t n, uint64_t h = 1469598103934665603ull);

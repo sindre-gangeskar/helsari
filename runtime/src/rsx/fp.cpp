@@ -7,7 +7,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <set>
+#include <unordered_map>
 
 namespace rsx {
 namespace {
@@ -78,7 +80,7 @@ std::string cmp_cc(bool lt, bool eq, bool gt, const std::string &v) {
 }
 } // namespace
 
-FpScan scan_fp(uint32_t addr) {
+static FpScan scan_fp_full(uint32_t addr, uint32_t &size) {
     // Instruction words only (inline constants excluded) identify the shader;
     // constant values are uploaded per draw.
     FpScan r{1469598103934665603ull, {}, 0};
@@ -95,7 +97,30 @@ FpScan scan_fp(uint32_t addr) {
         }
         if (bits(w[0], 0, 1)) break;
     }
+    size = a - addr;
     return r;
+}
+
+// Called for every draw (twice), so the scan is remembered per address. The program is
+// compared with its saved copy, skipping the inline constants the game patches per draw:
+// a memcmp instead of hashing and re-decoding it. RSX thread only.
+const FpScan &scan_fp(uint32_t addr) {
+    struct Saved { FpScan r; uint32_t size = 0; std::vector<uint8_t> code; };
+    static std::unordered_map<uint32_t, Saved> saved;
+    Saved &e = saved[addr];
+    const uint8_t *mem_now = (const uint8_t *)mem::ptr(addr);
+    if (e.size) {
+        bool same = true;
+        uint32_t pos = 0;
+        for (uint32_t c : e.r.consts) {
+            if (memcmp(e.code.data() + pos, mem_now + pos, c - pos)) { same = false; break; }
+            pos = c + 16;
+        }
+        if (same && !memcmp(e.code.data() + pos, mem_now + pos, e.size - pos)) return e.r;
+    }
+    e.r = scan_fp_full(addr, e.size);
+    e.code.assign(mem_now, mem_now + e.size);
+    return e.r;
 }
 
 uint32_t fp_const_word(uint32_t ea) { return fpword(ea); }

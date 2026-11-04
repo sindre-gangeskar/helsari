@@ -1338,7 +1338,7 @@ ID3D11VertexShader *vertex_shader() {
 }
 
 PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t remap[16], const uint8_t gamma[16]) {
-    FpScan sc = scan_fp(fp_ea);
+    const FpScan &sc = scan_fp(fp_ea);
     uint32_t control = reg(0x1d60);
     uint32_t alpha = (reg(0x0304) & 1) ? reg(0x0308) : 0;
     // SET_SHADER_PACKER (0x1fc4): sRGB framebuffer writes. KZ2_NO_SRGB_OUT=1 ignores it.
@@ -1861,7 +1861,8 @@ void draw() {
     // Window-origin "bottom" (0x1d88 bit 12) maps to D3D top-down here; verified against
     // the font atlas, which must come out upright for text lookups to work.
     origin_bottom = !origin_bottom;
-    if (getenv("KZ2_FLIP_Y")) origin_bottom = !origin_bottom;
+    static const bool flip_y = getenv("KZ2_FLIP_Y") != nullptr;
+    if (flip_y) origin_bottom = !origin_bottom;
     vx[10] = origin_bottom ? 1.f : 0.f;
     memcpy(&vx[24], vattr, sizeof vattr);
     memcpy(&vx[24 + 64], g_vattr, sizeof g_vattr);
@@ -2543,7 +2544,8 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         g_vs_dumped.clear();
         LOG("rsx", "capture: logging draws of frame %u, dumping its surfaces at the end", g_frame);
     }
-    if (getenv("KZ2_TRACE_DRAWS") && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
+    static const bool trace_draws = getenv("KZ2_TRACE_DRAWS") != nullptr;
+    if (trace_draws && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
     g_draws_this_frame = 0;
     if (g_scene_draws) {
         g_scene_min = std::min(g_scene_min, g_scene_draws), g_scene_max = std::max(g_scene_max, g_scene_draws);

@@ -21,6 +21,7 @@
 
 void dualsense_merge(XINPUT_GAMEPAD &g);   // dualsense.cpp
 
+static const bool g_trace_pad = getenv("KZ2_TRACE_PAD") != nullptr;
 namespace {
 uint16_t axis(SHORT v, bool invert) {
     int x = (v + 32768) >> 8;
@@ -121,7 +122,7 @@ HLE(cellPadGetInfo2) {
     // CellPadInfo2: max_connect, now_connect, system_info, then 7-entry
     // arrays of port_status, port_setting, device_capability, device_type.
     uint32_t p = ARG32(0);
-    if (getenv("KZ2_TRACE_PAD")) {
+    if (g_trace_pad) {
         static int calls;
         if (++calls % 600 == 1) LOG("pad", "GetInfo2 #%d", calls);
     }
@@ -147,7 +148,7 @@ HLE(cellPadGetData) {
     keyboard(s.Gamepad);
     script(s.Gamepad);
     WORD b = s.Gamepad.wButtons;
-    if (getenv("KZ2_TRACE_PAD")) {
+    if (g_trace_pad) {
         static int calls;
         static WORD last;
         if (++calls % 600 == 1 || b != last) LOG("pad", "GetData #%d buttons=0x%04x lr=0x%llx", calls, b, (unsigned long long)ctx->lr);

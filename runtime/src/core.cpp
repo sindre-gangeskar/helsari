@@ -34,7 +34,9 @@ uint64_t host_now_ns() {
     static const uint64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (uint64_t)f.QuadPart; }();
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
-    return (uint64_t)((unsigned __int128)c.QuadPart * 1000000000u / freq);
+    // Whole seconds and remainder: plain 64-bit math (a 128-bit division is a slow library call).
+    uint64_t t = (uint64_t)c.QuadPart;
+    return t / freq * 1000000000u + t % freq * 1000000000u / freq;
 }
 
 void host_sleep_us(uint32_t us) {
@@ -216,7 +218,8 @@ extern "C" uint64_t ppu_timebase(void) {
     static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
-    return (uint64_t)((unsigned __int128)c.QuadPart * 79800000ull / (uint64_t)freq.QuadPart);
+    uint64_t t = (uint64_t)c.QuadPart, f = (uint64_t)freq.QuadPart;
+    return t / f * 79800000ull + t % f * 79800000ull / f;
 }
 
 extern "C" void ppu_lswi(PPUContext *ctx, int rd, uint32_t ea, int nb) {
@@ -312,7 +315,8 @@ bool hle_dispatch(PPUContext *ctx, uint32_t addr) {
     const ImportEntry &im = g_imports[i];
     int n = (*g_hle_calls)[i]++;
     if (g_hle[i]) {
-        if (getenv("KZ2_TRACE_HLE") && n < 20)
+        static const bool trace_hle = getenv("KZ2_TRACE_HLE") != nullptr;
+        if (trace_hle && n < 20)
             LOG("hle", "%s(%llx, %llx, %llx, %llx)", im.name, ARG(0), ARG(1), ARG(2), ARG(3));
         thread::note_call(im.name, ctx, true);
         g_hle[i](ctx);
