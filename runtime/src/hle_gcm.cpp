@@ -183,11 +183,14 @@ FILE *g_frame_dump;
 
 void method(uint32_t m, uint32_t arg) {
     g_rsx.methods++;
-    g_method_hist[(m >> 2) & 0x3fff]++;
+    // Diagnostics for the watchdog, on every RSX method: relaxed, one writer. (Plain atomic
+    // operations are full memory barriers and were a third of the RSX code's own time.)
+    auto &hist = g_method_hist[(m >> 2) & 0x3fff];
+    hist.store(hist.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     if (g_frame_dump) fprintf(g_frame_dump, "%04x %08x\n", m, arg);
-    g_cur_method = m, g_cur_arg = arg;
+    g_cur_method.store(m, std::memory_order_relaxed), g_cur_arg.store(arg, std::memory_order_relaxed);
     rsx::method(m, arg);
-    g_cur_method = 0xffffffff;
+    g_cur_method.store(0xffffffff, std::memory_order_relaxed);
     if (m == GCM_FLIP_METHOD) {
         static int want = getenv("KZ2_DUMP_FRAME") ? atoi(getenv("KZ2_DUMP_FRAME")) : -1;
         g_frame++;

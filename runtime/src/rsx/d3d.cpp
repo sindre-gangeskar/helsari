@@ -47,6 +47,19 @@ uint64_t fnv(const void *p, size_t n, uint64_t h) {
     return h;
 }
 
+// In-memory keys only (shader, state and texture lookups, computed per draw): eight bytes at a
+// step. The disk shader cache names files with fnv, which stays as it is.
+static inline uint64_t hfast(const void *p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t *b = (const uint8_t *)p;
+    for (; n >= 8; n -= 8, b += 8) {
+        uint64_t w;
+        memcpy(&w, b, 8);
+        h = (h ^ w) * 0x9e3779b97f4a7c15ull, h ^= h >> 32;
+    }
+    for (; n; n--, b++) h = (h ^ *b) * 1099511628211ull;
+    return h;
+}
+
 namespace {
 template <class T> void release(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
@@ -942,7 +955,7 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         if (ds != g_depth_surfaces.end()) write_back_surface(ea, ds->second);
     }
 
-    uint64_t key = fnv(&ea, 4, fnv(&fmtreg, 4, fnv(&rect, 4, fnv(&pitch, 4))));
+    uint64_t key = hfast(&ea, 4, hfast(&fmtreg, 4, hfast(&rect, 4, hfast(&pitch, 4))));
     Tex &t = g_textures[key];
     t.last_used = g_flip_time;
     if (leak_mode() == 4) return t.srv;   // leak hunting: no texture creation or updates
@@ -960,8 +973,8 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     uint64_t t_hash = host_now_ns();
     uint64_t hv = 1469598103934665603ull;
     const uint8_t *p = (const uint8_t *)mem::ptr(ea);
-    if (size <= 65536) hv = fnv(p, size);
-    else for (uint32_t k = 0; k < 1024; k++) hv = fnv(p + (uint64_t)size * k / 1024, 64, hv);
+    if (size <= 65536) hv = hfast(p, size);
+    else for (uint32_t k = 0; k < 1024; k++) hv = hfast(p + (uint64_t)size * k / 1024, 64, hv);
     t.checked_frame = g_frame;
     g_hash_ns += host_now_ns() - t_hash, g_hash_n++;
     if (t.srv && t.content == hv) return t.srv;
@@ -1040,7 +1053,7 @@ std::unordered_map<uint64_t, ID3D11SamplerState *> g_samplers;
 ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     uint32_t b = 0x1a00 + unit * 32;
     uint32_t addr = reg(b + 8), filt = reg(b + 0x14), ctl0 = reg(b + 0x0c);
-    uint64_t key = fnv(&ctl0, 4, fnv(&filt, 4, ((uint64_t)addr << 32) | shadow));
+    uint64_t key = hfast(&ctl0, 4, hfast(&filt, 4, ((uint64_t)addr << 32) | shadow));
     auto it = g_samplers.find(key);
     if (it != g_samplers.end()) return it->second;
     auto wrap = [](uint32_t m) {
@@ -1157,7 +1170,7 @@ void apply_state() {
     uint32_t mrt_be = mrt_state ? reg(0x012c) : 0, mrt_mask = mrt_state ? reg(0x0370) : 0;
     if (mrt_mask) mrt_mask_seen = true;
     uint32_t key_mrt[3] = {mrt_state, mrt_be, mrt_mask_seen ? mrt_mask : 0xffffffffu};
-    uint64_t bk = fnv(key_mrt, sizeof key_mrt, fnv(&be, 4, fnv(&sf, 4, fnv(&df, 4, fnv(&eq, 4, fnv(&mask, 4))))));
+    uint64_t bk = hfast(key_mrt, sizeof key_mrt, hfast(&be, 4, hfast(&sf, 4, hfast(&df, 4, hfast(&eq, 4, hfast(&mask, 4))))));
     auto &bs = g_blend[bk];
     if (!bs) {
         D3D11_BLEND_DESC d{};
@@ -1187,7 +1200,7 @@ void apply_state() {
     // depth / stencil
     uint32_t dz[] = {reg(0x0a74) & 1, reg(0x0a6c), reg(0x0a70) & 1, reg(0x0328) & 1, reg(0x032c), reg(0x0330),
                      reg(0x0338), reg(0x033c), reg(0x0340), reg(0x0344)};
-    auto &ds = g_depth[fnv(dz, sizeof dz)];
+    auto &ds = g_depth[hfast(dz, sizeof dz)];
     if (!ds) {
         D3D11_DEPTH_STENCIL_DESC d{};
         static bool nodepth = getenv("KZ2_NO_DEPTH_STENCIL");
@@ -1309,7 +1322,7 @@ ID3D11VertexShader *vertex_shader() {
     uint32_t start = reg(0x1ea0) & 511;
     uint64_t h = 1469598103934665603ull;
     for (uint32_t i = start; i < 512; i++) {
-        h = fnv(&vp_ucode[i * 4], 16, h);
+        h = hfast(&vp_ucode[i * 4], 16, h);
         if (vp_ucode[i * 4 + 3] & 1) break;
     }
     // Attribute formats are compiled into the shader (a decode per attribute, see
@@ -1321,7 +1334,7 @@ ID3D11VertexShader *vertex_shader() {
         if (cpu_vertex) afmt[a] = 8;
         else if ((reg(0x1ff0) & (1 << a)) && size && type >= 1 && type <= 7) afmt[a] = (uint8_t)(type | size << 4);
     }
-    h = fnv(afmt, 16, h);
+    h = hfast(afmt, 16, h);
     g_vs_hash = h;
     auto it = g_vs.find(h);
     if (it != g_vs.end()) { g_cur_win = g_vs_win[h]; return it->second; }
@@ -1344,7 +1357,7 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
     // SET_SHADER_PACKER (0x1fc4): sRGB framebuffer writes. KZ2_NO_SRGB_OUT=1 ignores it.
     static const bool no_srgb = getenv("KZ2_NO_SRGB_OUT") && atoi(getenv("KZ2_NO_SRGB_OUT"));
     uint32_t srgb_out = !no_srgb && reg(0x1fc4) != 0;
-    uint64_t h = fnv(&srgb_out, 4, fnv(gamma, 16, fnv(remap, 32, fnv(texdim, 16, fnv(&control, 4, fnv(&alpha, 4, sc.hash))))));
+    uint64_t h = hfast(&srgb_out, 4, hfast(gamma, 16, hfast(remap, 32, hfast(texdim, 16, hfast(&control, 4, hfast(&alpha, 4, sc.hash))))));
     auto it = g_ps.find(h);
     if (it != g_ps.end()) return &it->second;
     FpKey key{fp_ea, control, {}, alpha, {}, {}, srgb_out != 0};
@@ -1603,9 +1616,11 @@ void draw() {
     if (b.color[0] && b.color[1] && b.color[2] && b.color[3]) g_scene_draws++;
 
     // vertices + indices
-    std::vector<uint32_t> src_idx;
+    static std::vector<uint32_t> src_idx;      // kept between draws: no allocation per draw
+    src_idx.clear();
     uint32_t vmin = ~0u, vmax = 0;
-    std::vector<uint32_t> list;
+    static std::vector<uint32_t> list;
+    list.clear();
     // Fast path for the common case, one indexed triangle list (libgcm cuts it into
     // back-to-back ranges): read the big-endian indices straight into the final list,
     // then rebase them, instead of building intermediate index vectors. A restart
@@ -1628,7 +1643,26 @@ void draw() {
             const uint8_t *p = (const uint8_t *)mem::ptr(ea);
             list.resize((size_t)total);
             fast = true;
-            for (size_t i = 0; i < total; i++) {
+            // Eight indices at a time: swap bytes, widen, track min and max, look for restarts.
+            size_t i0 = 0;
+            {
+                const __m256i rv = _mm256_set1_epi32((int)rval);
+                const __m128i sw16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+                const __m256i sw32 = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                                                      3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+                __m256i vlo = _mm256_set1_epi32(-1), vhi = _mm256_setzero_si256();
+                for (; i0 + 8 <= total; i0 += 8) {
+                    __m256i x = type ? _mm256_cvtepu16_epi32(_mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 2 * i0)), sw16))
+                                     : _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i *)(p + 4 * i0)), sw32);
+                    if (restart && _mm256_movemask_epi8(_mm256_cmpeq_epi32(x, rv))) { fast = false; break; }
+                    _mm256_storeu_si256((__m256i *)(list.data() + i0), x);
+                    vlo = _mm256_min_epu32(vlo, x), vhi = _mm256_max_epu32(vhi, x);
+                }
+                alignas(32) uint32_t lo8[8], hi8[8];
+                _mm256_store_si256((__m256i *)lo8, vlo), _mm256_store_si256((__m256i *)hi8, vhi);
+                for (int k = 0; k < 8; k++) vmin = std::min(vmin, lo8[k]), vmax = std::max(vmax, hi8[k]);
+            }
+            for (size_t i = i0; fast && i < total; i++) {
                 uint32_t v;
                 if (type) v = (uint32_t)p[2 * i] << 8 | p[2 * i + 1];
                 else { memcpy(&v, p + 4 * i, 4); v = __builtin_bswap32(v); }
@@ -2083,7 +2117,7 @@ void draw() {
     // Hand queued work to the GPU regularly, so it draws while we translate the next
     // commands: otherwise the driver submits only when a readback forces it, and the
     // CPU then waits for the GPU to do the whole frame's work at once.
-    static const int flush_every = getenv("KZ2_FLUSH_EVERY") ? atoi(getenv("KZ2_FLUSH_EVERY")) : 64;
+    static const int flush_every = getenv("KZ2_FLUSH_EVERY") ? atoi(getenv("KZ2_FLUSH_EVERY")) : 256;
     static int since_flush;
     if (flush_every > 0 && ++since_flush >= flush_every) g_ctx->Flush(), since_flush = 0;
     lap(6);
