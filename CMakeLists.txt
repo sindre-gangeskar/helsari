@@ -111,7 +111,7 @@ add_executable(kz2
   runtime/src/rsx/vp.cpp
   runtime/src/rsx/fp.cpp
   runtime/src/rsx/d3d.cpp)
-set_target_properties(kz2 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+set_target_properties(kz2 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON OUTPUT_NAME helsari2)
 
 # Recompiled SPU code (EBOOT modules and the runtime-captured cache).
 add_library(kz2_spu STATIC ${GENERATED_SPU_SOURCES} ${SPU_RT_SOURCES})

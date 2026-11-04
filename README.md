@@ -36,14 +36,14 @@ set LLVM=C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/L
 cmake -B build -G Ninja "-DCMAKE_C_COMPILER=%LLVM%/clang.exe" "-DCMAKE_CXX_COMPILER=%LLVM%/clang++.exe" ^
       -DKZ2_DUMP="E:/PS3 Dumps/_BCES00081-[Killzone2]" -DRPCS3_EXE="E:/RPCS3/rpcs3.exe"
 ninja -C build
-build\kz2.exe
+build\helsari2.exe
 ```
 
 Configuring runs the recompiler (`tools/recomp`); the build then compiles the
 generated code. SPU code the game loads at run time is captured to
 `build/spu_cache/` and compiled natively on the next build, so the first runs
 are slower; so are entry points of compiled programs that are only reached
-through computed jumps (`spu_cache/entries.txt`). `kz2.exe --dump <dir>` overrides
+through computed jumps (`spu_cache/entries.txt`). `helsari2.exe --dump <dir>` overrides
 the dump location; saves go to `build/data/`.
 
 ## Debugging
@@ -78,7 +78,7 @@ are documented where they are read in `runtime/src`.
 ## How it works
 
 ```
-EBOOT.BIN ──rpcs3 --decrypt──▶ EBOOT.elf ──tools/recomp──▶ build/generated/ ──clang──▶ kz2.exe
+EBOOT.BIN ──rpcs3 --decrypt──▶ EBOOT.elf ──tools/recomp──▶ build/generated/ ──clang──▶ helsari2.exe
                                                                                 ▲
                                                                runtime/ (OS, libraries, RSX, SPU)
 ```

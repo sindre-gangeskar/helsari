@@ -122,7 +122,7 @@ void window_thread() {
     RegisterClassW(&wc);
     RECT r{0, 0, 1280, 720};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hwnd = CreateWindowW(L"kz2recomp", L"Killzone 2 (recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
+    g_hwnd = CreateWindowW(L"kz2recomp", L"Helsari 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
                            CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -157,7 +157,7 @@ void flip(uint32_t id) {
         PROCESS_MEMORY_COUNTERS_EX pmc{};
         K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof pmc);
         wchar_t title[128];
-        swprintf(title, 128, L"Killzone 2 (recomp) - %.1f fps (%.0f ms) - RAM %.1f GB", frames / title_secs,
+        swprintf(title, 128, L"Helsari 2 - %.1f fps (%.0f ms) - RAM %.1f GB", frames / title_secs,
                  title_secs * 1000 / frames, pmc.PrivateUsage / 1073741824.0);
         SetWindowTextW(g_hwnd, title);
         title_last = now, title_n = n;

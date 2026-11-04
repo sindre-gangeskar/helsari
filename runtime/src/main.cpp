@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
     CreateMutexA(nullptr, FALSE, "Local\\kz2-recomp-instance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         fprintf(stderr, "kz2: another instance is already running\n");
-        MessageBoxA(nullptr, "Killzone 2 is already running.", "kz2", MB_OK | MB_ICONINFORMATION);
+        MessageBoxA(nullptr, "Helsari 2 is already running.", "Helsari 2", MB_OK | MB_ICONINFORMATION);
         return 1;
     }
     // 1 ms timer resolution (the default 15.6 ms tick stretches every short sleep and timed wait).
