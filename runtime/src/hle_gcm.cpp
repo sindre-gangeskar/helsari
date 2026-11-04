@@ -317,8 +317,8 @@ void vblank_loop(PPUContext *ctx) {
     auto next_vblank = std::chrono::steady_clock::now();
     for (;;) {
         // KZ2_VBLANK_US=<us>: the emulated refresh period. The game waits for two per frame,
-        // so this sets its frame cap: 16000 about 31 fps (default), 8000 about 62 fps.
-        static const int vblank_us = getenv("KZ2_VBLANK_US") ? atoi(getenv("KZ2_VBLANK_US")) : 16000;
+        // so this sets its frame cap: 8000 about 62 fps (default), 16000 about 31 fps.
+        static const int vblank_us = getenv("KZ2_VBLANK_US") ? atoi(getenv("KZ2_VBLANK_US")) : 8000;
         next_vblank += std::chrono::microseconds(vblank_us);
         // Until the next vblank, service user commands as the RSX raises them.
         for (;;) {
