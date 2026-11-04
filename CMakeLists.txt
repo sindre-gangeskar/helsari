@@ -97,6 +97,8 @@ add_executable(kz2
   runtime/src/kernel.cpp
   runtime/src/syscalls.cpp
   runtime/src/fs.cpp
+  runtime/src/menu_patch.cpp
+  runtime/src/pc_options.cpp
   runtime/src/hle_sys.cpp
   runtime/src/hle_gcm.cpp
   runtime/src/hle_io.cpp

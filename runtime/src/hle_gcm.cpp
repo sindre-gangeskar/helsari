@@ -155,6 +155,7 @@ void gcm_parked_wake(uint32_t ea, uint32_t size) {
 #define REG(n) hle_register(#n, hle_##n)
 
 namespace spu { std::string stats_line(double secs, uint32_t frames); }
+void pc_options_start();   // pc_options.cpp
 std::string spurs_stats_line(double frames);
 std::string fiber_stats();   // fibers.cpp
 
@@ -231,6 +232,7 @@ void window_thread() {
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowW(L"kz2recomp", L"Helsari 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
                            CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    pc_options_start();
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 }
@@ -432,6 +434,9 @@ void fifo_thread() {
     }
 }
 
+// KZ2_VBLANK_US=<us> sets the period directly. Default: a 60 fps cap.
+std::atomic<int> g_vblank_us{getenv("KZ2_VBLANK_US") ? atoi(getenv("KZ2_VBLANK_US")) : 8333};
+
 // Runs on a guest thread so handlers can be invoked with a valid context.
 void vblank_loop(PPUContext *ctx) {
     using clock = std::chrono::steady_clock;
@@ -443,9 +448,9 @@ void vblank_loop(PPUContext *ctx) {
     // cap. KZ2_VBLANK_ON_FLIP=0: flips only on ticks.
     static const bool on_flip = !getenv("KZ2_VBLANK_ON_FLIP") || atoi(getenv("KZ2_VBLANK_ON_FLIP"));
     for (;;) {
-        // KZ2_VBLANK_US=<us>: the emulated refresh period. The game waits for two per frame,
-        // so this sets its frame cap: 8000 about 62 fps (default), 16000 about 31 fps.
-        static const int vblank_us = getenv("KZ2_VBLANK_US") ? atoi(getenv("KZ2_VBLANK_US")) : 8000;
+        // The emulated refresh period. The game waits for two per frame, so this sets its frame
+        // cap (FPS CAP menu entry, gcm_pc_command).
+        const int vblank_us = g_vblank_us.load(std::memory_order_relaxed);
         next_vblank += std::chrono::microseconds(vblank_us);
         // Until the next vblank, service user commands as the RSX raises them.
         for (;;) {
@@ -545,6 +550,33 @@ void rsx_dump_methods() {
             }
             s = *end == ',' ? end + 1 : end;
         }
+    }
+}
+
+// Commands from our menu entries: "fps=30", "fps=60", "fps=120", "fps=OFF".
+void gcm_pc_command(const std::string &cmd) {
+    if (!cmd.compare(0, 4, "fps=")) {
+        const std::string v = cmd.substr(4);
+        const int fps = v == "OFF" ? 500 : atoi(v.c_str());
+        if (fps > 0) g_vblank_us = 500000 / fps;
+        LOG("gcm", "fps cap %s (refresh period %d us)", v.c_str(), g_vblank_us.load());
+    }
+}
+
+// Window size and mode from the GRAPHICS menu. The swapchain follows the client area (d3d.cpp).
+void gcm_set_window(int width, int height, bool borderless) {
+    if (!g_hwnd) return;
+    if (borderless) {
+        MONITORINFO mi{sizeof mi};
+        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(g_hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+    } else {
+        RECT r{0, 0, width, height};
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
     }
 }
 

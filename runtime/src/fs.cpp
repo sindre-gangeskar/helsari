@@ -2,14 +2,24 @@
 
 #include "runtime.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <vector>
 
 namespace stdfs = std::filesystem;
+
+namespace menu_patch {   // menu_patch.cpp
+void build(uint64_t real_size, const std::function<void(uint64_t, void *, size_t)> &rd);
+uint64_t extra_size();
+size_t read_appended(uint64_t pos, void *dst, size_t n);
+void apply(uint64_t pos, uint8_t *data, size_t n);
+}
 
 namespace fs {
 namespace {
@@ -20,7 +30,12 @@ struct File {
     std::vector<FILE *> parts;
     std::vector<uint64_t> starts;  // logical offset of each part
     uint64_t size = 0, pos = 0;
+    uint64_t patched_from = 0;     // game archive: its real size, past which menu_patch serves reads
 };
+
+bool is_game_archive(const std::string &path) {
+    return path.size() >= 14 && path.compare(path.size() - 14, 14, "data_ps3.psarc") == 0;
+}
 struct Dir { std::vector<std::pair<std::string, bool>> entries; size_t pos = 0; };
 
 std::mutex g_lock;
@@ -102,6 +117,25 @@ int32_t open(const std::string &path, int32_t flags, uint32_t *fd) {
             at += parts[i];
         }
         f.size = at;
+        if (is_game_archive(path)) {
+            static std::mutex build_lock;
+            std::lock_guard<std::mutex> lk(build_lock);
+            menu_patch::build(at, [&](uint64_t pos, void *dst, size_t n) {
+                uint8_t *out = (uint8_t *)dst;
+                while (n) {
+                    size_t i = f.parts.size() - 1;
+                    while (i && f.starts[i] > pos) i--;
+                    uint64_t end = i + 1 < f.parts.size() ? f.starts[i + 1] : at;
+                    size_t chunk = (size_t)std::min<uint64_t>(n, end - pos);
+                    _fseeki64(f.parts[i], (int64_t)(pos - f.starts[i]), SEEK_SET);
+                    size_t r = fread(out, 1, chunk, f.parts[i]);
+                    if (!r) { memset(out, 0, n); return; }
+                    out += r, pos += r, n -= r;
+                }
+            });
+            f.patched_from = at;
+            f.size = at + menu_patch::extra_size();
+        }
     } else {
         if ((flags & O_CREAT) && (flags & O_EXCL) && exists) return EEXIST;
         if (!exists && !(flags & O_CREAT)) {
@@ -135,9 +169,17 @@ int32_t read(uint32_t fd, uint32_t buf, uint64_t n, uint64_t *got) {
     if (!f) return EBADF;
     uint64_t done = 0;
     while (done < n && f->pos < f->size) {
+        if (f->patched_from && f->pos >= f->patched_from) {
+            mem::ensure(buf + (uint32_t)done, (uint32_t)(n - done));
+            size_t r = menu_patch::read_appended(f->pos, mem::ptr(buf + (uint32_t)done), (size_t)(n - done));
+            if (!r) break;
+            done += r, f->pos += r;
+            continue;
+        }
         size_t i = f->parts.size() - 1;
         while (i && f->starts[i] > f->pos) i--;
         uint64_t part_end = i + 1 < f->parts.size() ? f->starts[i + 1] : f->size;
+        if (f->patched_from) part_end = std::min(part_end, f->patched_from);
         uint64_t chunk = std::min(n - done, part_end - f->pos);
         _fseeki64(f->parts[i], (int64_t)(f->pos - f->starts[i]), SEEK_SET);
         mem::ensure(buf + (uint32_t)done, (uint32_t)chunk);
@@ -145,6 +187,7 @@ int32_t read(uint32_t fd, uint32_t buf, uint64_t n, uint64_t *got) {
         snprintf(what, sizeof what, "read '%s' at 0x%llx", f->path.c_str(), (unsigned long long)f->pos);
         mem::watch_host_write(buf + (uint32_t)done, (uint32_t)chunk, what);
         size_t r = fread(mem::ptr(buf + (uint32_t)done), 1, (size_t)chunk, f->parts[i]);
+        if (f->patched_from) menu_patch::apply(f->pos, (uint8_t *)mem::ptr(buf + (uint32_t)done), r);
         if (mem::hook_watched(buf + (uint32_t)done, (uint32_t)chunk))
             LOG("hook", "fs %s: 0x%zx of 0x%llx bytes -> 0x%x, first %08x %08x", what, r, (unsigned long long)chunk,
                 buf + (uint32_t)done, ld32(buf + (uint32_t)done), ld32(buf + (uint32_t)done + 4));
@@ -199,6 +242,7 @@ int32_t stat(const std::string &path, uint32_t out) {
     if (!parts.empty()) {
         uint64_t total = 0;
         for (auto s : parts) total += s;
+        if (is_game_archive(path)) total += menu_patch::extra_size();
         put_stat(out, false, total);
         return 0;
     }

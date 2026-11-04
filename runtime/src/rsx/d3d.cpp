@@ -2697,7 +2697,8 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
                                             (unsigned long long)g_occ_reports, (unsigned long long)g_occ_visible);
         g_occ_reports = g_occ_visible = 0;
     }
-    g_swap->Present(0, 0);
+    extern bool pc_vsync();        // GRAPHICS menu (pc_options.cpp)
+    g_swap->Present(pc_vsync() ? 1 : 0, 0);
     g_present_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
