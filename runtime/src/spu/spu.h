@@ -124,7 +124,7 @@ struct SpuThread {
     }
     void set_ls32(uint32_t a, uint32_t v) {
         a &= LS_SIZE - 4;
-        if (code_q[a >> 4] == CODE) ls_written(a, 4);
+        if (__builtin_expect(code_q[a >> 4] == CODE, 0)) ls_written_cold(a, 4);
         v = __builtin_bswap32(v);
         memcpy(ls + a, &v, 4);
     }
@@ -139,7 +139,7 @@ struct SpuThread {
     }
     void stq(uint32_t a, const V &v) {
         a &= LS_SIZE - 16;
-        if (code_q[a >> 4] == CODE) ls_written(a, 16);
+        if (__builtin_expect(code_q[a >> 4] == CODE, 0)) ls_written_cold(a, 16);
         _mm_store_si128((__m128i *)(ls + a), _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)v.w), bswap32_mask()));
     }
 
@@ -184,6 +184,7 @@ struct SpuThread {
         return code && !memcmp(ls + lsa, src, size);
     }
     // LS [lsa, lsa+size) is about to be written by anything other than a code load.
+    __attribute__((noinline, cold)) void ls_written_cold(uint32_t lsa, uint32_t size) { ls_written(lsa, size); }
     void ls_written(uint32_t lsa, uint32_t size) {
         code_dirty = true;
         mark_fresh(lsa, size);

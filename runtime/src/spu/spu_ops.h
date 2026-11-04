@@ -320,27 +320,27 @@ SPU_COLD inline __m128 f_mul_slow(__m128 a, __m128 b) { return v_spr_slow(_mm_mu
 SPU_COLD inline __m128 f_madd_slow(__m128 a, __m128 b, __m128 c) { return v_spr_slow(_mm_add_ps(f_mul_slow(a, b), v_spf_slow(c))); }
 SPU_COLD inline __m128 f_msub_slow(__m128 a, __m128 b, __m128 c) { return v_spr_slow(_mm_sub_ps(f_mul_slow(a, b), v_spf_slow(c))); }
 SPU_COLD inline __m128 f_nmsub_slow(__m128 a, __m128 b, __m128 c) { return v_spr_slow(_mm_sub_ps(v_spf_slow(c), f_mul_slow(a, b))); }
-inline __m128 f_add(__m128 a, __m128 b) {
+__attribute__((always_inline)) inline __m128 f_add(__m128 a, __m128 b) {
     __m128 r = _mm_add_ps(a, b);
     return __builtin_expect(f_big(f_max(f_max(a, b), r)), 0) ? f_add_slow(a, b) : r;
 }
-inline __m128 f_sub(__m128 a, __m128 b) {
+__attribute__((always_inline)) inline __m128 f_sub(__m128 a, __m128 b) {
     __m128 r = _mm_sub_ps(a, b);
     return __builtin_expect(f_big(f_max(f_max(a, b), r)), 0) ? f_sub_slow(a, b) : r;
 }
-inline __m128 f_mul(__m128 a, __m128 b) {
+__attribute__((always_inline)) inline __m128 f_mul(__m128 a, __m128 b) {
     __m128 r = _mm_mul_ps(a, b);
     return __builtin_expect(f_big(f_max(f_max(a, b), r)), 0) ? f_mul_slow(a, b) : r;
 }
-inline __m128 f_madd(__m128 a, __m128 b, __m128 c) {
+__attribute__((always_inline)) inline __m128 f_madd(__m128 a, __m128 b, __m128 c) {
     __m128 m = _mm_mul_ps(a, b), r = _mm_add_ps(m, c);
     return __builtin_expect(f_big(f_max(f_max(f_max(f_max(a, b), m), c), r)), 0) ? f_madd_slow(a, b, c) : r;
 }
-inline __m128 f_msub(__m128 a, __m128 b, __m128 c) {
+__attribute__((always_inline)) inline __m128 f_msub(__m128 a, __m128 b, __m128 c) {
     __m128 m = _mm_mul_ps(a, b), r = _mm_sub_ps(m, c);
     return __builtin_expect(f_big(f_max(f_max(f_max(f_max(a, b), m), c), r)), 0) ? f_msub_slow(a, b, c) : r;
 }
-inline __m128 f_nmsub(__m128 a, __m128 b, __m128 c) {
+__attribute__((always_inline)) inline __m128 f_nmsub(__m128 a, __m128 b, __m128 c) {
     __m128 m = _mm_mul_ps(a, b), r = _mm_sub_ps(c, m);
     return __builtin_expect(f_big(f_max(f_max(f_max(f_max(a, b), m), c), r)), 0) ? f_nmsub_slow(a, b, c) : r;
 }
@@ -405,12 +405,28 @@ inline V shr_bytes(const V &a, int n) {
 
 // cbd/chd/cwd/cdd: a shufb control that inserts a preferred-slot element of
 // `size` bytes at offset t (byte: 03, half: 02 03, word: 00..03, dword: 00..07)
+struct InsertMasks { uint32_t m[4][16][4]; };   // size index (1, 2, 4, 8 bytes), aligned offset, words
+constexpr InsertMasks make_insert_masks() {
+    InsertMasks x{};
+    const uint8_t pat[4][8] = {{3}, {2, 3}, {0, 1, 2, 3}, {0, 1, 2, 3, 4, 5, 6, 7}};
+    for (int si = 0; si < 4; si++) {
+        int size = 1 << si;
+        for (int t = 0; t < 16; t++) {
+            uint8_t b[16] = {};
+            for (int i = 0; i < 16; i++) b[i] = (uint8_t)(0x10 + i);
+            int at = t & (0xf & ~(size - 1));
+            for (int i = 0; i < size; i++) b[at + i] = pat[si][i];
+            for (int w = 0; w < 4; w++)
+                x.m[si][t][w] = (uint32_t)b[4 * w] << 24 | (uint32_t)b[4 * w + 1] << 16 | (uint32_t)b[4 * w + 2] << 8 | b[4 * w + 3];
+        }
+    }
+    return x;
+}
+inline constexpr InsertMasks g_insert_masks = make_insert_masks();
 inline V insert_mask(uint32_t t, int size) {
-    V r{{0x10111213u, 0x14151617u, 0x18191a1bu, 0x1c1d1e1fu}};
-    t &= 0xf & ~(size - 1);
-    static const uint8_t pat1[1] = {3}, pat2[2] = {2, 3}, pat4[4] = {0, 1, 2, 3}, pat8[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-    const uint8_t *p = size == 1 ? pat1 : size == 2 ? pat2 : size == 4 ? pat4 : pat8;
-    for (int i = 0; i < size; i++) r.set_b(t + i, p[i]);
+    int si = size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3;
+    V r;
+    memcpy(r.w, g_insert_masks.m[si][t & 0xf], 16);
     return r;
 }
 
@@ -548,15 +564,21 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
     case SHUFB: {
         // Selector byte c: 0x00-0x1f picks byte c of a:b, 10xxxxxx gives 0x00, 110xxxxx 0xff,
         // 111xxxxx 0x80. Two pshufb lookups (a, b) blended on bit 4, then the constants.
-        __m128i A = be_bytes(va), B = be_bytes(vb), C = be_bytes(gpr[rt]);
-        __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0f));
+        // Registers hold each word in host order, so big-endian byte n is host byte n ^ 3 and
+        // the lookup needs no byte swaps: the index is just c ^ 3.
+        __m128i A = iv(va), B = iv(vb), C = iv(gpr[rt]);
+#if defined(__AVX512VBMI__) && defined(__AVX512VL__)
+        __m128i sel = _mm_permutex2var_epi8(A, _mm_xor_si128(C, _mm_set1_epi8(3)), B);   // low 5 bits: 16 bytes of A, then B
+#else
+        __m128i idx = _mm_and_si128(_mm_xor_si128(C, _mm_set1_epi8(3)), _mm_set1_epi8(0x0f));
         __m128i bit4 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
         __m128i sel = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), bit4);
+#endif
         __m128i hi = _mm_cmplt_epi8(C, _mm_setzero_si128());   // c >= 0x80
         __m128i c0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xc0)), _mm_set1_epi8((char)0xc0));
         __m128i e0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xe0)), _mm_set1_epi8((char)0xe0));
         __m128i k = _mm_blendv_epi8(_mm_and_si128(c0, _mm_set1_epi8((char)0xff)), _mm_set1_epi8((char)0x80), e0);
-        gpr[(x >> 21) & 0x7f] = from_be(_mm_blendv_epi8(sel, k, hi));
+        gpr[(x >> 21) & 0x7f] = vi(_mm_blendv_epi8(sel, k, hi));
         break;
     }
 
