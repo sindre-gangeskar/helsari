@@ -385,22 +385,25 @@ inline V from_be(__m128i b) {
     _mm_storeu_si128((__m128i *)r.w, _mm_shuffle_epi8(b, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)));
     return r;
 }
+inline __m128i iota_h() { return _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12); }
 inline __m128i iota8() { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 // d[i] = s[(i + n) & 15]
 inline V rot_bytes(const V &a, int n) {
-    return from_be(_mm_shuffle_epi8(be_bytes(a), _mm_and_si128(_mm_add_epi8(iota8(), _mm_set1_epi8((char)n)), _mm_set1_epi8(15))));
+    // Big-endian byte i is host byte i ^ 3: iota_h is each host byte's big-endian index, and
+    // ^ 3 turns the result back into a host index, so no byte swaps are needed.
+    return vi(_mm_shuffle_epi8(iv(a), _mm_xor_si128(_mm_and_si128(_mm_add_epi8(iota_h(), _mm_set1_epi8((char)n)), _mm_set1_epi8(15)), _mm_set1_epi8(3))));
 }
 // d[i] = i + n < 16 ? s[i + n] : 0   (n in 0..31; pshufb zeroes lanes whose index has bit 7 set)
 inline V shl_bytes(const V &a, int n) {
-    __m128i idx = _mm_add_epi8(iota8(), _mm_set1_epi8((char)n));
+    __m128i idx = _mm_add_epi8(iota_h(), _mm_set1_epi8((char)n));
     idx = _mm_or_si128(idx, _mm_cmpgt_epi8(idx, _mm_set1_epi8(15)));
-    return from_be(_mm_shuffle_epi8(be_bytes(a), idx));
+    return vi(_mm_shuffle_epi8(iv(a), _mm_xor_si128(idx, _mm_set1_epi8(3))));
 }
 // d[i] = i - n >= 0 ? s[i - n] : 0   (n in 0..31)
 inline V shr_bytes(const V &a, int n) {
-    __m128i idx = _mm_sub_epi8(iota8(), _mm_set1_epi8((char)n));
+    __m128i idx = _mm_sub_epi8(iota_h(), _mm_set1_epi8((char)n));
     idx = _mm_or_si128(idx, _mm_cmplt_epi8(idx, _mm_setzero_si128()));
-    return from_be(_mm_shuffle_epi8(be_bytes(a), idx));
+    return vi(_mm_shuffle_epi8(iv(a), _mm_xor_si128(idx, _mm_set1_epi8(3))));
 }
 
 // cbd/chd/cwd/cdd: a shufb control that inserts a preferred-slot element of
@@ -523,7 +526,7 @@ template <Op OP> SPU_INLINE uint32_t step_r(SpuThread &t, V *gpr, uint32_t x, ui
     case CNTB: for (int i = 0; i < 16; i++) r.set_b(i, (uint8_t)__builtin_popcount(va.b(i))); gpr[rt] = r; break;
     case FSMB: for (int i = 0; i < 16; i++) r.set_b(i, (va.w[0] >> (15 - i)) & 1 ? 0xff : 0); gpr[rt] = r; break;
     case FSMH: for (int i = 0; i < 8; i++) r.set_h(i, (va.w[0] >> (7 - i)) & 1 ? 0xffff : 0); gpr[rt] = r; break;
-    case FSM: for (int i = 0; i < 4; i++) r.w[i] = (va.w[0] >> (3 - i)) & 1 ? 0xffffffffu : 0; gpr[rt] = r; break;
+    case FSM: { const __m128i bits = _mm_setr_epi32(8, 4, 2, 1); gpr[rt] = vi(_mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32((int)va.w[0]), bits), bits)); break; }
     case GBB: { uint32_t v = 0; for (int i = 0; i < 16; i++) v = (v << 1) | (va.b(i) & 1); r.w[0] = v; gpr[rt] = r; break; }
     case GBH: { uint32_t v = 0; for (int i = 0; i < 8; i++) v = (v << 1) | (va.h(i) & 1); r.w[0] = v; gpr[rt] = r; break; }
     case GB: { uint32_t v = 0; for (int i = 0; i < 4; i++) v = (v << 1) | (va.w[i] & 1); r.w[0] = v; gpr[rt] = r; break; }
