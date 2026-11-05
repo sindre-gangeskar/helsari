@@ -24,6 +24,8 @@
 
 bool mouse_look_active(); // mouse.cpp
 int keybind_generation(); // keybinds.cpp
+enum PromptSet { PROMPTS_PC, PROMPTS_XBOX, PROMPTS_PLAYSTATION };
+PromptSet keybind_prompts(); // keybinds.cpp
 void keybind_note_square_prompt(); // keybinds.cpp
 void keybind_paint_hud(unsigned char *rgba, int width, int height); // keybinds.cpp
 bool mouse_turning();     // mouse.cpp
@@ -765,6 +767,7 @@ ID3D11ShaderResourceView *hud_pc_atlas(uint32_t ea) {
     static ID3D11Texture2D *texture;
     static std::vector<uint8_t> original;
     static int painted = -1, checked_frame = -1;
+    const int paint = keybind_generation() * 4 + (int)keybind_prompts();
     static uint32_t checked_ea;
     static bool is_atlas;
     if (ea != checked_ea || checked_frame != (int)g_frame) {
@@ -810,8 +813,8 @@ ID3D11ShaderResourceView *hud_pc_atlas(uint32_t ea) {
         d.SampleDesc.Count = 1, d.Usage = D3D11_USAGE_DEFAULT, d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &texture)) || FAILED(g_dev->CreateShaderResourceView(texture, nullptr, &view))) return nullptr;
     }
-    if (painted != keybind_generation()) {
-        painted = keybind_generation();
+    if (painted != paint) {
+        painted = paint;
         std::vector<uint8_t> copy = original;
         keybind_paint_hud(copy.data(), W, H);
         g_ctx->UpdateSubresource(texture, 0, nullptr, copy.data(), W * 4, 0);
@@ -2270,7 +2273,7 @@ void draw() {
         const uint32_t atlas = ea_for((reg(0x1a04) & 3) == 2, reg(0x1a00));
         if (ID3D11ShaderResourceView *pc = hud_pc_atlas(atlas))
         {
-            if (mouse_look_active())
+            if (keybind_prompts() != PROMPTS_PLAYSTATION)
                 srv[0] = pc;
             // One icon, from the square button's cell of the sheet.
             if (list.size() == 6)

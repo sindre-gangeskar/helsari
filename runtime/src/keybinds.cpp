@@ -88,6 +88,7 @@ namespace
     std::atomic<bool> g_refresh{false}; // the menu has to show the new key
     std::atomic<int> g_generation{0};
     std::atomic<uint64_t> g_square_prompt_ns{0}; // when the HUD last drew its square button
+    std::atomic<bool> g_pad_dualsense{false};
 
     bool down(int vk) { return GetAsyncKeyState(vk) & 0x8000; }
 
@@ -128,8 +129,33 @@ namespace
     std::string bound(int action) { return key_name(g_keys[action].load(std::memory_order_relaxed)); }
 
     // What to show for a <buttonimage name=...>. Empty: it is not a button, keep the game's image.
+    std::string xbox_prompt(const char *name)
+    {
+        static const struct
+        {
+            const char *name, *label;
+        } XBOX[] = {{"ok", "A"}, {"cross", "A"}, {"cancel", "B"}, {"circle", "B"}, {"square", "X"}, {"triangle", "Y"}, {"L1", "LB"}, {"R1", "RB"},
+                    {"L2", "LT"}, {"R2", "RT"}, {"L3", "LS"}, {"R3", "RS"}, {"LAnalog", "LS"}, {"RAnalog", "RS"}, {"lstick", "LS"}, {"rstick", "RS"},
+                    {"start", "MENU"}, {"select", "VIEW"}, {"left", "LEFT"}, {"right", "RIGHT"}, {"up", "UP"}, {"down", "DOWN"},
+                    {"updown", "UP / DOWN"}, {"leftright", "LEFT / RIGHT"}, {"leftrightupdown", "D-PAD"}};
+        for (const auto &x : XBOX)
+            if (!strcmp(name, x.name))
+                return x.label;
+        return "";
+    }
+
     std::string prompt(const char *name, bool play)
     {
+        if (keybind_prompts() == PROMPTS_XBOX)
+            return xbox_prompt(name);
+        if (!strcmp(name, "lstick")) // pushed to move, and to peek out of cover
+            return bound(A_FORWARD);
+        if (!strcmp(name, "rstick"))
+            return "MOUSE";
+        if (!strcmp(name, "cross"))
+            name = "ok";
+        if (!strcmp(name, "circle"))
+            name = "cancel";
         const auto is = [&](const char *n) { return !strcmp(name, n); };
         if (is("ok"))
             return play ? bound(A_JUMP) : "ENTER";
@@ -326,6 +352,15 @@ void keybind_apply(XINPUT_GAMEPAD &g)
 
 int keybind_generation() { return g_generation.load(std::memory_order_relaxed); }
 
+PromptSet keybind_prompts()
+{
+    if (mouse_look_active())
+        return PROMPTS_PC;
+    return g_pad_dualsense.load(std::memory_order_relaxed) ? PROMPTS_PLAYSTATION : PROMPTS_XBOX;
+}
+
+void keybind_note_pad(bool dualsense) { g_pad_dualsense = dualsense; }
+
 void keybind_note_square_prompt() { g_square_prompt_ns = host_now_ns(); }
 
 // The button cells of the game's HUD icon atlas (1024x512), read off the atlas, each repainted as
@@ -337,10 +372,14 @@ void keybind_paint_hud(unsigned char *rgba, int width, int height)
         int x, y, w, h;
         const char *name;
     } CELLS[] = {
-        {0, 248, 38, 38, "square"}, {39, 248, 38, 38, "ok"}, {78, 248, 38, 38, "triangle"}, {117, 248, 38, 38, "cancel"}, {566, 172, 44, 44, "cancel"},
-        {516, 211, 46, 24, "L1"}, {516, 239, 46, 24, "L1"}, {516, 269, 46, 24, "R1"}, {516, 297, 46, 24, "R1"},
-        {516, 324, 56, 28, "R1"}, {516, 352, 46, 28, "L2"}, {516, 381, 46, 28, "R2"},
-        {650, 278, 32, 26, "L3"}, {694, 278, 32, 26, "R3"},
+        // Measured from the sheet's pixels, with a pixel of margin.
+        {0, 248, 38, 38, "square"}, {39, 248, 37, 36, "ok"}, {78, 248, 36, 36, "triangle"}, {115, 248, 37, 36, "cancel"}, {566, 172, 44, 44, "cancel"},
+        {516, 211, 45, 24, "L1"}, {513, 239, 51, 24, "L1"}, {516, 269, 45, 24, "R1"}, {513, 297, 51, 24, "R1"},
+        {516, 323, 56, 28, "R1"}, {516, 352, 46, 28, "L2"}, {516, 381, 46, 29, "R2"},
+        {651, 242, 32, 29, "lstick"}, {695, 242, 29, 29, "rstick"}, {651, 271, 32, 40, "L3"}, {694, 271, 32, 40, "R3"},
+        {567, 244, 38, 29, "left"}, {606, 244, 38, 29, "right"}, {567, 276, 29, 37, "up"}, {599, 276, 29, 37, "down"},
+        {515, 411, 48, 29, "select"}, {519, 440, 39, 30, "start"},
+        // Estimates, read off the image.
         {950, 261, 62, 25, "L2"}, {950, 288, 62, 25, "R2"}, {950, 315, 62, 25, "R2"}, {950, 342, 62, 25, "L2"},
         {950, 369, 62, 25, "L1"}, {950, 396, 62, 25, "R1"}, {950, 423, 62, 25, "R1"}, {950, 450, 62, 25, "L1"},
     };
@@ -395,7 +434,7 @@ void keybind_paint_hud(unsigned char *rgba, int width, int height)
 
 extern "C" void f_002d1888(PPU_CTX)
 {
-    if (!mouse_look_active())
+    if (keybind_prompts() == PROMPTS_PLAYSTATION)
     {
         f_002d1888_guest(ctx);
         return;

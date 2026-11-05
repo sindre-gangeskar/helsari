@@ -127,12 +127,16 @@ HLE(cellPadGetData) {
     static bool first_read = true;
     if (first_read && pad_there) mouse_note_controller();
     first_read = false;
+    const XINPUT_GAMEPAD before_dualsense = s.Gamepad;
     dualsense_merge(s.Gamepad);
+    const bool from_dualsense = memcmp(&before_dualsense, &s.Gamepad, sizeof before_dualsense) != 0;
     {   // A real controller in use (before the keyboard is added in): the look goes back to the game.
         const XINPUT_GAMEPAD &pad = s.Gamepad;
         const int dead = 8000;
-        if (pad.wButtons || pad.bLeftTrigger > 40 || pad.bRightTrigger > 40 || abs(pad.sThumbLX) > dead || abs(pad.sThumbLY) > dead || abs(pad.sThumbRX) > dead || abs(pad.sThumbRY) > dead)
+        if (pad.wButtons || pad.bLeftTrigger > 40 || pad.bRightTrigger > 40 || abs(pad.sThumbLX) > dead || abs(pad.sThumbLY) > dead || abs(pad.sThumbRX) > dead || abs(pad.sThumbRY) > dead) {
+            keybind_note_pad(from_dualsense);
             mouse_note_controller();
+        }
     }
     keyboard(s.Gamepad);
     script(s.Gamepad);
