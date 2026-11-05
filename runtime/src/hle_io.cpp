@@ -1,6 +1,7 @@
 // sys_io (pad via XInput), cellAudio (timing + notify events), and
 // network/PSN which report "offline".
 #include "kernel.h"
+#include "keybinds.h"
 
 #include <windows.h>
 #include <xinput.h>
@@ -29,41 +30,13 @@ uint16_t axis(SHORT v, bool invert) {
     return (uint16_t)(invert ? 255 - x : x);
 }
 
-// Keyboard stands in for a pad while our window has focus:
-// arrows = d-pad, WASD = left stick, IJKL = right stick, Space/Z = cross,
-// X/Esc = circle, C = square, V = triangle, Q/E = L1/R1, 1/3 = L2/R2,
-// Enter = start, Backspace = select.
-bool key(int vk) { return GetAsyncKeyState(vk) & 0x8000; }
 bool window_focused() {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
     return pid == GetCurrentProcessId();
 }
 void keyboard(XINPUT_GAMEPAD &g) {
-    if (!window_focused()) return;
-    static const struct { int vk; WORD bit; } map[] = {
-        {VK_UP, XINPUT_GAMEPAD_DPAD_UP}, {VK_DOWN, XINPUT_GAMEPAD_DPAD_DOWN},
-        {VK_LEFT, XINPUT_GAMEPAD_DPAD_LEFT}, {VK_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT},
-        {VK_SPACE, XINPUT_GAMEPAD_A}, {'Z', XINPUT_GAMEPAD_A}, {'X', XINPUT_GAMEPAD_B},
-        {VK_ESCAPE, XINPUT_GAMEPAD_B}, {'C', XINPUT_GAMEPAD_X}, {'V', XINPUT_GAMEPAD_Y},
-        {'Q', XINPUT_GAMEPAD_LEFT_SHOULDER}, {'E', XINPUT_GAMEPAD_RIGHT_SHOULDER},
-        {VK_RETURN, XINPUT_GAMEPAD_START}, {VK_BACK, XINPUT_GAMEPAD_BACK},
-    };
-    for (auto &m : map) if (key(m.vk)) g.wButtons |= m.bit;
-    // Mouse and keyboard play: fire, aim, sprint.
-    if (key(VK_LBUTTON)) g.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
-    if (key(VK_RBUTTON)) g.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;   // zoom, in the Standard scheme
-    if (key(VK_SHIFT)) g.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
-    if (key('1')) g.bLeftTrigger = 255;
-    if (key('3')) g.bRightTrigger = 255;
-    auto stick = [](SHORT &x, SHORT &y, int l, int r, int u, int d) {
-        if (key(l)) x = -32768;
-        if (key(r)) x = 32767;
-        if (key(u)) y = 32767;
-        if (key(d)) y = -32768;
-    };
-    stick(g.sThumbLX, g.sThumbLY, 'A', 'D', 'W', 'S');
-    stick(g.sThumbRX, g.sThumbRY, 'J', 'L', 'I', 'K');
+    if (window_focused()) keybind_apply(g);
 }
 
 // KZ2_PAD_SCRIPT="45:a,50:start,52.5:down" holds each button for 0.2 s at
@@ -148,7 +121,12 @@ HLE(cellPadGetData) {
     memset(mem::ptr(d), 0, 4 + 2 * 64);
     if (port != 0) { RET(0); return; }
     XINPUT_STATE s{};
-    if (XInputGetState(0, &s) != ERROR_SUCCESS) s = {};
+    const bool pad_there = XInputGetState(0, &s) == ERROR_SUCCESS;
+    if (!pad_there) s = {};
+    // A controller plugged in at the start: its prompts, until the keyboard or mouse is used.
+    static bool first_read = true;
+    if (first_read && pad_there) mouse_note_controller();
+    first_read = false;
     dualsense_merge(s.Gamepad);
     {   // A real controller in use (before the keyboard is added in): the look goes back to the game.
         const XINPUT_GAMEPAD &pad = s.Gamepad;

@@ -23,6 +23,9 @@
 #include <unordered_map>
 
 bool mouse_look_active(); // mouse.cpp
+int keybind_generation(); // keybinds.cpp
+void keybind_note_square_prompt(); // keybinds.cpp
+void keybind_paint_hud(unsigned char *rgba, int width, int height); // keybinds.cpp
 bool mouse_turning();     // mouse.cpp
 float pc_viewmodel_sway(); // GAMEPLAY menu (pc_options.cpp)
 namespace rsx {
@@ -752,6 +755,70 @@ void run_pass(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, uint32
 // Diagnostics for environment reflections: a black cube map (F11), and the six faces
 // of each cube map used in the captured frame (cube_<ea>_<face>.bmp, D3D face order
 // +X -X +Y -Y +Z -Z, each as seen from the centre).
+// The game's HUD icon atlas with its button cells repainted (keybinds.cpp). Null for any other texture
+// of that size: it is known by its contents, since its address can differ. The game's DXT5 blocks
+// are decoded here once; only the bound keys change after that.
+ID3D11ShaderResourceView *hud_pc_atlas(uint32_t ea) {
+    constexpr int W = 1024, H = 512;
+    constexpr uint64_t ATLAS_HASH = 0xa80cb0421082def4ull;
+    static ID3D11ShaderResourceView *view;
+    static ID3D11Texture2D *texture;
+    static std::vector<uint8_t> original;
+    static int painted = -1, checked_frame = -1;
+    static uint32_t checked_ea;
+    static bool is_atlas;
+    if (ea != checked_ea || checked_frame != (int)g_frame) {
+        checked_ea = ea, checked_frame = (int)g_frame;
+        uint64_t h = 14695981039346656037ull;
+        const uint8_t *src = g_mem + ea;
+        for (size_t i = 0; i < (size_t)W * H; i += 64) h = (h ^ src[i]) * 1099511628211ull;
+        is_atlas = h == ATLAS_HASH;
+    }
+    if (!is_atlas) return nullptr;
+    if (original.empty()) {
+        original.resize((size_t)W * H * 4);
+        const uint8_t *p = g_mem + ea;
+        const auto c565 = [](uint16_t c, int *o) { o[0] = (c >> 11 & 31) * 255 / 31; o[1] = (c >> 5 & 63) * 255 / 63; o[2] = (c & 31) * 255 / 31; };
+        for (int by = 0; by < H; by += 4)
+            for (int bx = 0; bx < W; bx += 4, p += 16) {
+                const int a0 = p[0], a1 = p[1];
+                uint64_t abits = 0;
+                for (int i = 0; i < 6; i++) abits |= (uint64_t)p[2 + i] << (8 * i);
+                int al[8] = {a0, a1};
+                if (a0 > a1) for (int i = 1; i < 7; i++) al[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+                else { for (int i = 1; i < 5; i++) al[i + 1] = ((5 - i) * a0 + i * a1) / 5; al[6] = 0; al[7] = 255; }
+                const uint16_t c0 = (uint16_t)(p[8] | p[9] << 8), c1 = (uint16_t)(p[10] | p[11] << 8);
+                const uint32_t idx = p[12] | p[13] << 8 | p[14] << 16 | (uint32_t)p[15] << 24;
+                int pal[4][3];
+                c565(c0, pal[0]); c565(c1, pal[1]);
+                for (int k = 0; k < 3; k++) {
+                    pal[2][k] = c0 > c1 ? (2 * pal[0][k] + pal[1][k]) / 3 : (pal[0][k] + pal[1][k]) / 2;
+                    pal[3][k] = c0 > c1 ? (pal[0][k] + 2 * pal[1][k]) / 3 : 0;
+                }
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++) {
+                        uint8_t *out = &original[((size_t)(by + y) * W + bx + x) * 4];
+                        const int *c = pal[(idx >> (2 * (4 * y + x))) & 3];
+                        out[0] = (uint8_t)c[0], out[1] = (uint8_t)c[1], out[2] = (uint8_t)c[2];
+                        out[3] = (uint8_t)al[(abits >> (3 * (4 * y + x))) & 7];
+                    }
+            }
+    }
+    if (!texture) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = W, d.Height = H, d.MipLevels = 1, d.ArraySize = 1, d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.SampleDesc.Count = 1, d.Usage = D3D11_USAGE_DEFAULT, d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &texture)) || FAILED(g_dev->CreateShaderResourceView(texture, nullptr, &view))) return nullptr;
+    }
+    if (painted != keybind_generation()) {
+        painted = keybind_generation();
+        std::vector<uint8_t> copy = original;
+        keybind_paint_hud(copy.data(), W, H);
+        g_ctx->UpdateSubresource(texture, 0, nullptr, copy.data(), W * 4, 0);
+    }
+    return view;
+}
+
 ID3D11ShaderResourceView *black_cube() {
     static ID3D11ShaderResourceView *srv;
     if (!srv) {
@@ -2196,6 +2263,34 @@ void draw() {
     for (auto &s : srv) {
         for (auto *c : b.color) if (s && c && s == c->srv) s = snapshot(*c);
         if (s && b.depth && s == b.depth->srv) s = snapshot(*b.depth);
+    }
+    // On PC input the HUD's button icons come from our copy of their atlas.
+    if (reg(0x1a18) == 0x04000200u && reg(0x1a04) == 0x00018829u)
+    {
+        const uint32_t atlas = ea_for((reg(0x1a04) & 3) == 2, reg(0x1a00));
+        if (ID3D11ShaderResourceView *pc = hud_pc_atlas(atlas))
+        {
+            if (mouse_look_active())
+                srv[0] = pc;
+            // One icon, from the square button's cell of the sheet.
+            if (list.size() == 6)
+            {
+                float corner[64] = {};
+                fetch_vertex(corner, vmin);
+                if (fabsf(corner[8]) < 0.002f && fabsf(corner[9] - 0.4844f) < 0.002f)
+                    keybind_note_square_prompt();
+                // Which cells get drawn, to find prompts still showing a PS3 icon.
+                static std::unordered_map<uint64_t, bool> cells;
+                const uint64_t cell = ((uint64_t)(uint32_t)(corner[8] * 4096.f) << 32) | (uint32_t)(corner[9] * 4096.f);
+                if (!cells[cell])
+                {
+                    cells[cell] = true;
+                    float far_corner[64] = {};
+                    fetch_vertex(far_corner, vmin + 2);
+                    LOG("hudatlas", "cell px %.0f %.0f .. %.0f %.0f on screen at %.0f %.0f size %.0f %.0f", corner[8] * 1024.f, corner[9] * 512.f, far_corner[8] * 1024.f, far_corner[9] * 512.f, corner[0], corner[1], far_corner[0] - corner[0], far_corner[1] - corner[1]);
+                }
+            }
+        }
     }
     g_ctx->PSSetShaderResources(0, 16, srv);
     g_ctx->PSSetSamplers(0, 16, smp);

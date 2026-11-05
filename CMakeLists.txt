@@ -100,6 +100,7 @@ add_executable(kz2
   runtime/src/menu_patch.cpp
   runtime/src/pc_options.cpp
   runtime/src/mouse.cpp
+  runtime/src/keybinds.cpp
   runtime/src/hle_sys.cpp
   runtime/src/hle_gcm.cpp
   runtime/src/hle_io.cpp

@@ -1,7 +1,9 @@
-// The GRAPHICS and GAMEPLAY sections of the game's own options menu. menu_patch.cpp adds their lists and rows to
+// The GRAPHICS, GAMEPLAY and KEYBINDINGS sections of the game's own options menu. menu_patch.cpp adds their lists and rows to
 // the page layout; the page's script is compiled and cannot be edited, so this runs Lua in the live
 // script when the page opens (adds the section, shows the values) and takes the rows' clicks at the
 // game's URL dispatcher. Settings persist in settings.ini.
+#include "keybinds.h"
+
 #include "runtime.h"
 
 #include <atomic>
@@ -54,6 +56,8 @@ namespace
         {
             fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nviewmodel_sway=%.2f\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
                     g_borderless, (int)g_vsync.load(), SWAY[g_sway.load()]);
+            for (int i = 0; i < KEYBIND_COUNT; i++)
+                fprintf(f, "key_%s=%d\n", keybind_id(i), keybind_key(i));
             fclose(f);
         }
     }
@@ -87,6 +91,12 @@ namespace
             else if (sscanf(line, "vsync=%d", &a) == 1)
             {
                 g_vsync = a != 0;
+            }
+            else if (sscanf(line, "key_%63[^=]=%d", s, &a) == 2)
+            {
+                for (int i = 0; i < KEYBIND_COUNT; i++)
+                    if (!strcmp(s, keybind_id(i)))
+                        keybind_set(i, a);
             }
             else if (sscanf(line, "viewmodel_sway=%f", &v) == 1)
             {
@@ -172,6 +182,13 @@ namespace
         "local t = gBrowser:GetTagByName(n)\n"
         "if t then t:SetValue(v) end\n"
         "end\n";
+    std::string show_keys()
+    {
+        std::string out;
+        for (int i = 0; i < KEYBIND_COUNT; i++)
+            out += set_text(("tK" + std::to_string(i)).c_str(), keybind_row(i));
+        return out;
+    }
     std::string show_values()
     {
         char res[48], sway[48];
@@ -180,7 +197,7 @@ namespace
         return LUA_SET +
                set_text("tF", std::string("FRAMERATE LIMIT: ") + FPS[g_fps]) + set_text("tR", res) +
                set_text("tM", g_borderless ? "WINDOW MODE: BORDERLESS" : "WINDOW MODE: WINDOWED") +
-               set_text("tV", g_vsync ? "VSYNC: ON" : "VSYNC: OFF") + set_text("tS", sway);
+               set_text("tV", g_vsync ? "VSYNC: ON" : "VSYNC: OFF") + set_text("tS", sway) + show_keys();
     }
 
     bool menu_on() { return !getenv("KZ2_MENU_PATCH") || atoi(getenv("KZ2_MENU_PATCH")); }
@@ -234,14 +251,16 @@ extern "C" void f_0047b900(PPU_CTX)
     {
         std::lock_guard<std::mutex> lk(g_lock);
         // Only pages that have our list: the main menu has an options table of its own but no rows yet.
-        lua_run(ctx, L, "if gOptionsTable and gBrowser and gBrowser:GetTagByName(\"lG\") and gBrowser:GetTagByName(\"lP\") then\n"
+        lua_run(ctx, L, "if gOptionsTable and gBrowser and gBrowser:GetTagByName(\"lG\") and gBrowser:GetTagByName(\"lP\") and gBrowser:GetTagByName(\"lK\") then\n"
                         "local l = gOptionsTable.links\n"
                         "local n = getn(l)\n"
-                        "if l[n].sub_menu_list ~= \"lP\" then\n"
+                        "if l[n].sub_menu_list ~= \"lK\" then\n"
                         "l[n+1] = { title = \"GRAPHICS\", link = \"static://script.ingameoptionsscript.ShowOptionsSubMenu(\"..(n+1)..\")\", "
                         "sub_menu_list = \"lG\", description = \"Change the graphics settings\", links = {} }\n"
                         "l[n+2] = { title = \"GAMEPLAY\", link = \"static://script.ingameoptionsscript.ShowOptionsSubMenu(\"..(n+2)..\")\", "
                         "sub_menu_list = \"lP\", description = \"Change the gameplay settings\", links = {} }\n"
+                        "l[n+3] = { title = \"KEYBINDINGS\", link = \"static://script.ingameoptionsscript.ShowOptionsSubMenu(\"..(n+3)..\")\", "
+                        "sub_menu_list = \"lK\", description = \"Change the keyboard and mouse controls\", links = {} }\n"
                         // Showing the options panel shows every list in it, then the game hides its own by
                         // name. Lua finds functions by name at each call, so this covers the compiled callers.
                         "local hide = HideAllSettingOptions\n"
@@ -249,10 +268,12 @@ extern "C" void f_0047b900(PPU_CTX)
                         "hide()\n"
                         "gBrowser:GetTagByName(\"lG\"):SetVisible(false)\n"
                         "gBrowser:GetTagByName(\"lP\"):SetVisible(false)\n"
+                        "gBrowser:GetTagByName(\"lK\"):SetVisible(false)\n"
                         "end\n"
                         "end\n"
                         "gBrowser:GetTagByName(\"lG\"):SetVisible(false)\n"
-                        "gBrowser:GetTagByName(\"lP\"):SetVisible(false)\n" +
+                        "gBrowser:GetTagByName(\"lP\"):SetVisible(false)\n"
+                        "gBrowser:GetTagByName(\"lK\"):SetVisible(false)\n" +
                             show_values() + "end\n");
     }
     f_0047b900_guest(ctx);
@@ -272,7 +293,13 @@ extern "C" void f_0047ccc0(PPU_CTX)
     const std::string row = url.substr(prefix.size());
     LOG("menu", "row selected: %s", row.c_str());
     std::lock_guard<std::mutex> lk(g_lock);
-    if (row == "fps")
+    // A key was just taken: this press only came to bring us onto the script's thread.
+    if (keybind_take_refresh())
+    {
+    }
+    else if (row[0] == 'k')
+        keybind_begin_capture(atoi(row.c_str() + 1));
+    else if (row == "fps")
         g_fps = (g_fps + 1) % FPS_N, apply_fps();
     else if (row == "res")
         g_res = (g_res + 1) % RES_N, apply_window();

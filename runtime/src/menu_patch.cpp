@@ -2,6 +2,7 @@
 // The dump stays untouched and no game data is stored: when the archive is opened, the pages to
 // change are read from it and patched in memory, then appended past its real end, and reads of
 // its table of contents are redirected there. KZ2_MENU_PATCH=0: no changes.
+#include "keybinds.h"
 #include "runtime.h"
 
 #include <algorithm>
@@ -61,19 +62,30 @@ namespace menu_patch
         // The game loads its pages from these caches, one per language; the .jsp files are not read.
         bool is_page_cache(const std::string &name) { return name.find("cachedjspingamesp.core") != std::string::npos; }
 
-        // The GRAPHICS and GAMEPLAY lists for the options page. pc_options.cpp hides them when the page
-        // opens, adds the section entries, shows the values and takes the rows' clicks. Short names and
-        // no label text, since the room here is small (see patch_page): the labels are set when shown.
-        const char *const GRAPHICS_LIST =
-            R"x(<_l name="lG" c="_Normal" p="16,14,620,203" a="true" bn="DOWN_BUTTON" bp="UP_BUTTON" g="900" /> )x"
-            R"x(<_i name="iF" c="_Medium" p=",,620,29" g="901" h="static://hs/fps" /> <_t name="tF" c="_Medium" >-</_t> <_i: name="!" g="901" /> )x"
-            R"x(<_i name="iR" c="_Medium" p=",29,620,29" g="902" h="static://hs/res" /> <_t name="tR" c="_Medium" >-</_t> <_i: name="!" g="902" /> )x"
-            R"x(<_i name="iM" c="_Medium" p=",58,620,29" g="903" h="static://hs/mode" /> <_t name="tM" c="_Medium" >-</_t> <_i: name="!" g="903" /> )x"
-            R"x(<_i name="iV" c="_Medium" p=",87,620,29" g="904" h="static://hs/vsync" /> <_t name="tV" c="_Medium" >-</_t> <_i: name="!" g="904" /> )x"
-            R"x(<_l: name="!" g="900" /> )x"
-            R"x(<_l name="lP" c="_Normal" p="16,14,620,203" a="true" bn="DOWN_BUTTON" bp="UP_BUTTON" g="905" /> )x"
-            R"x(<_i name="iS" c="_Medium" p=",,620,29" g="906" h="static://hs/sway" /> <_t name="tS" c="_Medium" >-</_t> <_i: name="!" g="906" /> )x"
-            R"x(<_l: name="!" g="905" /> )x";
+        // The GRAPHICS, GAMEPLAY and KEYBINDINGS lists for the options page. pc_options.cpp hides them
+        // when the page opens, adds the section entries, shows the values and takes the rows' clicks.
+        // Short names and no label text, since room is short (see patch_page): the labels are set when shown.
+        std::string pc_lists()
+        {
+            const auto row = [](const std::string &n, int y, int g, const std::string &url, int h)
+            {
+                const std::string id = std::to_string(g);
+                return "<_i name=\"i" + n + "\" c=\"_Medium\" p=\"," + std::to_string(y) + ",620," + std::to_string(h) + "\" g=\"" + id + "\" h=\"static://hs/" + url +
+                       "\" /> <_t name=\"t" + n + "\" c=\"_Medium\" >-</_t> <_i: name=\"!\" g=\"" + id + "\" /> ";
+            };
+            const auto list = [](const char *name, int height, int g)
+            {
+                return std::string("<_l name=\"") + name + "\" c=\"_Normal\" p=\"16,14,620," + std::to_string(height) + "\" a=\"true\" bn=\"DOWN_BUTTON\" bp=\"UP_BUTTON\" g=\"" + std::to_string(g) + "\" /> ";
+            };
+            const auto end = [](int g) { return "<_l: name=\"!\" g=\"" + std::to_string(g) + "\" /> "; };
+            std::string out = list("lG", 203, 900) + row("F", 0, 901, "fps", 29) + row("R", 29, 902, "res", 29) + row("M", 58, 903, "mode", 29) + row("V", 87, 904, "vsync", 29) + end(900);
+            out += list("lP", 203, 905) + row("S", 0, 906, "sway", 29) + end(905);
+            constexpr int ROW = 26;
+            out += list("lK", KEYBIND_COUNT * ROW, 910);
+            for (int i = 0; i < KEYBIND_COUNT; i++)
+                out += row("K" + std::to_string(i), i * ROW, 911 + i, "k" + std::to_string(i), ROW);
+            return out + end(910);
+        }
 
         // What to change in a page cache. Returns false if it is left alone. A page must keep its exact
         // length (growing one crashed the game), so what we add is paid for by turning the script's CRLF
@@ -90,27 +102,44 @@ namespace menu_patch
             const size_t tag = f.find("<_s name=\"optionsmenuscript\"", row);
             if (tag == std::string::npos || tag > page_end)
                 return false;
-            const std::string add = GRAPHICS_LIST;
-            size_t need = add.size(), have = 0;
-            for (size_t i = tag; i + 1 < page_end; i++)
-                have += f[i] == '\r' && f[i + 1] == '\n';
-            if (have < need)
+            std::string add = pc_lists();
+            // Room first from text no script reads: the language table's select_button and page_title
+            // fields, then from CRLF line ends, which does not change what the script means.
+            std::string body = f.substr(tag, page_end - tag);
+            size_t need = add.size();
+            for (const char *field : {"select_button = \"", "page_title = \""})
+                for (size_t at = body.find(field); need && at != std::string::npos; at = body.find(field, at))
+                {
+                    const size_t quote = body.find('"', at + strlen(field));
+                    if (quote == std::string::npos)
+                        break;
+                    size_t from = at, to = quote + 1;
+                    if (body.compare(to, 2, ", ") == 0)
+                        to += 2;
+                    else if (from >= 2 && body.compare(from - 2, 2, ", ") == 0)
+                        from -= 2;
+                    const size_t size = to - from;
+                    body.erase(from, size);
+                    need = size >= need ? 0 : need - size;
+                    at = from;
+                    if (size > add.size() + need) // never: a field is far smaller than the lists
+                        break;
+                }
+            for (size_t i = 0; need && i + 1 < body.size(); i++)
+                if (body[i] == '\r' && body[i + 1] == '\n')
+                {
+                    body.erase(i, 1);
+                    need--;
+                }
+            if (need)
             {
-                LOG("menu", "not enough line ends to free (%zu of %zu)", have, need);
+                LOG("menu", "not enough room in the options page: %zu bytes short", need);
                 return false;
             }
-            // The script text, with line ends freed: from its start, as many as needed.
-            std::string body;
-            body.reserve(page_end - tag);
-            for (size_t i = tag; i < page_end; i++)
-            {
-                if (need && f[i] == '\r' && f[i + 1] == '\n')
-                {
-                    need--;
-                    continue;
-                }
-                body += f[i];
-            }
+            // A removed field can free more than was needed: spaces between tags keep the length.
+            const size_t total = add.size() + body.size();
+            if (total < page_end - tag)
+                add += std::string(page_end - tag - total, ' ');
             const std::string between = f.substr(row, tag - row);
             f.replace(row, page_end - row, add + between + body);
             return true;

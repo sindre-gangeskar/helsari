@@ -3,6 +3,8 @@
 // (entity matrices, controller pitch) is written every rendered frame instead, and the view is
 // corrected to match. Using a controller hands everything back to the game until the mouse moves.
 // The viewmodel has its own part of this in rsx/d3d.cpp. KZ2_MOUSE_OFF: the hooks only pass through.
+#include "keybinds.h"
+
 #include "runtime.h"
 
 #include <windows.h>
@@ -42,7 +44,7 @@ namespace
     float g_sensitivity = 1.0f;
     std::atomic<long long> g_total_x{0}, g_total_y{0}; // every count since the start, for the view
     std::atomic<uint64_t> g_last_move_ns{0}, g_last_look_ns{0}, g_last_onfoot_ns{0};
-    std::atomic<bool> g_mouse_active{false};
+    std::atomic<bool> g_mouse_active{true}; // PC input; hle_io turns it off when a controller is there
     std::atomic<uint32_t> g_look_entity{0}, g_look_controller{0};
     std::atomic<float> g_turn_factor{1.f};
     // How far the game's heading and pitch are from the view, once the mouse is still.
@@ -337,6 +339,7 @@ bool mouse_active() { return g_captured.load(std::memory_order_relaxed); }
 // Window thread: true if the message is handled here.
 bool mouse_message(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *result)
 {
+    keybind_message(m, w, l);
     switch (m)
     {
     case WM_INPUT:
@@ -463,7 +466,19 @@ void mouse_note_controller()
     g_mouse_active = false;
 }
 
-// For the viewmodel in rsx/d3d.cpp.
+// A key was pressed.
+void mouse_note_pc_input()
+{
+    g_mouse_active = true;
+}
+
+// The look code is running: in play, not in a menu.
+bool mouse_in_play()
+{
+    return host_now_ns() - g_last_look_ns.load(std::memory_order_relaxed) < ON_FOOT_NS;
+}
+
+// For the viewmodel in rsx/d3d.cpp and the prompts.
 bool mouse_look_active()
 {
     return !g_mouse_off && g_mouse_active.load(std::memory_order_relaxed);
