@@ -2,15 +2,19 @@
       <img src=".github/assets/images/helsari_logo.webp" alt="Helsari Logo" width="80%"/>
 </p>  
 <p align="center" width="100%">
-      Unofficial Static Recompilation project for Killzone 2 and Killzone 3
-</p>  
-
-<p align="center" width="100%">
-      <img src=".github/assets/images/helsari_message_board.webp" alt="Helsari Message Board" width="80%"/>
-</p>
-<p align="center" width="100%">
       <img src=".github/assets/images/helsari_note.webp" alt="Helsari Note" width="80%"/>
 </p>
+<p align="center" width="100%">
+      <strong>Unofficial Static Recompilation project for Killzone 2 and Killzone 3</strong>
+</p>  
+<div align="center">
+  <p>Mouse & Keyboard Support</p>
+  <p>PC Options</p>
+  <p>Graphics Settings</p>
+  <p>Unlocked Framerate</p>
+</div>
+
+
 
 ## Components
 
