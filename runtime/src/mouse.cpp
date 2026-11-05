@@ -17,6 +17,8 @@
 extern "C" void f_00080a78_guest(PPU_CTX); // look input: (this, float *outY, float *outX, settings)
 extern "C" void f_006623d8_guest(PPU_CTX); // view data from a camera struct: position +4, forward +16, up +28
 
+namespace rsx { int pc_field_of_view(); } // GRAPHICS menu (pc_options.cpp)
+
 namespace
 {
     constexpr uint32_t TICK_TIME_EA = 0xf2a1d4; // the length of a game tick, read by the look code's callers
@@ -602,6 +604,26 @@ extern "C" void f_006623d8(PPU_CTX)
             late_view((uint32_t)ctx->r[4], lr);
         else if (lr == VIEW_NEAR)
             weapon_view((uint32_t)ctx->r[4]);
+    }
+    // GRAPHICS menu: a wider view for the world's cameras, not the weapon's. The frustum's edges at the near
+    // plane (+48 left, +52 right, +56 top, +60 bottom) are scaled for this call only. The extra fades away
+    // as the game zooms in, so aiming stays as it is.
+    const uint32_t camera = (uint32_t)ctx->r[4], view_lr = (uint32_t)ctx->lr;
+    const int fov = ::rsx::pc_field_of_view();
+    if (fov && (view_lr == VIEW_FIRST || view_lr == VIEW_MAIN) && on_foot(host_now_ns()))
+    {
+        constexpr float HIP = 0.7364f, ZOOM = 0.3992f; // right edge / near: the game's own, hip and zoomed
+        const float near_plane = guest_float(camera + 40), edge = near_plane > 0.f ? guest_float(camera + 52) / near_plane : 0.f;
+        float amount = (edge - ZOOM) / (HIP - ZOOM);
+        amount = amount < 0.f ? 0.f : amount > 1.f ? 1.f : amount;
+        const float wider = 1.f + (tanf((float)fov * 0.5f * 3.14159265f / 180.f) / HIP - 1.f) * amount;
+        const float saved[4] = {guest_float(camera + 48), guest_float(camera + 52), guest_float(camera + 56), guest_float(camera + 60)};
+        for (int i = 0; i < 4; i++)
+            guest_float_set(camera + 48 + i * 4, saved[i] * wider);
+        f_006623d8_guest(ctx);
+        for (int i = 0; i < 4; i++)
+            guest_float_set(camera + 48 + i * 4, saved[i]);
+        return;
     }
     f_006623d8_guest(ctx);
 }

@@ -55,6 +55,9 @@ namespace
     const char *const SCREEN_FX[] = {"MOTION BLUR + DEPTH OF FIELD", "MOTION BLUR ONLY", "OFF"};
     constexpr int SCREEN_FX_N = 3;
     std::atomic<int> g_screen_fx{0};
+    const int FOV_VALUES[] = {0, 80, 85, 90, 95, 100, 105, 110}; // horizontal degrees; 0 is the game's own, 72.7
+    constexpr int FOV_N = 8;
+    std::atomic<int> g_fov{0};
     std::atomic<int> g_sway{3};
     std::atomic<uint32_t> g_L{0}; // Lua state of the page's script
     std::mutex g_lock;
@@ -63,8 +66,8 @@ namespace
     {
         if (FILE *f = fopen(SETTINGS_FILE, "w"))
         {
-            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nviewmodel_sway=%.2f\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
-                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), SWAY[g_sway.load()]);
+            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
+                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), FOV_VALUES[g_fov.load()], SWAY[g_sway.load()]);
             for (int i = 0; i < KEYBIND_COUNT; i++)
                 fprintf(f, "key_%s=%d\n", keybind_id(i), keybind_key(i));
             fclose(f);
@@ -104,6 +107,12 @@ namespace
             else if (sscanf(line, "screen_fx=%d", &a) == 1)
             {
                 g_screen_fx = a >= 0 && a < SCREEN_FX_N ? a : 0;
+            }
+            else if (sscanf(line, "field_of_view=%d", &a) == 1)
+            {
+                for (int i = 0; i < FOV_N; i++)
+                    if (FOV_VALUES[i] == a)
+                        g_fov = i;
             }
             else if (sscanf(line, "key_%63[^=]=%d", s, &a) == 2)
             {
@@ -208,14 +217,18 @@ namespace
     }
     std::string show_values()
     {
-        char res[48], sway[48];
+        char res[48], sway[48], fov[48];
+        if (FOV_VALUES[g_fov.load()])
+            snprintf(fov, sizeof fov, "FIELD OF VIEW: %d", FOV_VALUES[g_fov.load()]);
+        else
+            snprintf(fov, sizeof fov, "FIELD OF VIEW: 73 (ORIGINAL)");
         snprintf(res, sizeof res, "RESOLUTION: %d X %d", RES[g_res].w, RES[g_res].h);
         snprintf(sway, sizeof sway, "VIEWMODEL SWAY MULTIPLIER: %.2fX", SWAY[g_sway.load()]);
         return LUA_SET +
                set_text("tF", std::string("FRAMERATE LIMIT: ") + FPS[g_fps]) + set_text("tR", res) +
                set_text("tM", g_borderless ? "WINDOW MODE: BORDERLESS" : "WINDOW MODE: WINDOWED") +
                set_text("tV", g_vsync ? "VSYNC: ON" : "VSYNC: OFF") +
-               set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tS", sway) + show_keys();
+               set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) + show_keys();
     }
 
     bool menu_on() { return !getenv("KZ2_MENU_PATCH") || atoi(getenv("KZ2_MENU_PATCH")); }
@@ -225,6 +238,7 @@ namespace
 namespace rsx
 {
     bool pc_vsync() { return g_vsync.load(std::memory_order_relaxed); }
+    int pc_field_of_view() { return FOV_VALUES[g_fov.load(std::memory_order_relaxed)]; }
     bool pc_motion_blur() { return g_screen_fx.load(std::memory_order_relaxed) != 2; }
     bool pc_depth_of_field() { return g_screen_fx.load(std::memory_order_relaxed) == 0; }
 }
@@ -329,6 +343,8 @@ extern "C" void f_0047ccc0(PPU_CTX)
         g_vsync = !g_vsync;
     else if (row == "fx")
         g_screen_fx = (g_screen_fx.load() + 1) % SCREEN_FX_N;
+    else if (row == "fov")
+        g_fov = (g_fov.load() + 1) % FOV_N;
     else if (row == "sway")
         g_sway = (g_sway.load() + 1) % SWAY_N;
     save();
