@@ -13,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 extern "C"
 {
@@ -28,6 +29,14 @@ extern "C"
 }
 void gcm_pc_command(const std::string &cmd);                 // hle_gcm.cpp
 void gcm_set_window(int width, int height, bool borderless); // hle_gcm.cpp
+bool mouse_in_play();
+bool mouse_menu_update();              // mouse.cpp
+bool mouse_menu_point(int &x, int &y);
+bool mouse_menu_clicked();
+void mouse_menu_press(bool accept);
+void mouse_menu_step(bool down);
+bool mouse_menu_pressing();
+
 namespace rsx
 {
     void set_output_size(uint32_t width); // rsx/d3d.cpp
@@ -132,7 +141,7 @@ namespace
 
     void apply_fps()
     {
-        if (!getenv("KZ2_VBLANK_US"))
+        if (!getenv("HELSARI_VBLANK_US"))
             gcm_pc_command(std::string("fps=") + FPS[g_fps]);
     }
     void apply_window()
@@ -231,7 +240,176 @@ namespace
                set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) + show_keys();
     }
 
-    bool menu_on() { return !getenv("KZ2_MENU_PATCH") || atoi(getenv("KZ2_MENU_PATCH")); }
+    // The mouse in menus. A menu row is a widget with this vtable; +4 is 3 while it is on screen and 2 in a
+    // hidden list; +0x10 its id, +0x1c y, +0x20 x, +0x24 width (or -1), +0x28 height as floats; +0x30 to +0x3c
+    // its list's screen rectangle. The script side has no way to ask where a tag is.
+    struct MenuRow
+    {
+        uint32_t id, at;
+        int x0, y0, x1, y1;
+        int list_x0, list_y0, list_x1, list_y1, index; // its list's rectangle, its place in it
+    };
+
+    std::vector<MenuRow> menu_rows()
+    {
+        const auto as_float = [](uint32_t be) { const uint32_t u = __builtin_bswap32(be); float f; memcpy(&f, &u, 4); return f; };
+        std::vector<MenuRow> rows;
+        for (uint64_t ea = 0x30000000; ea < 0x60000000 && rows.size() < 200;)
+        {
+            MEMORY_BASIC_INFORMATION mb{};
+            uint8_t *host = (uint8_t *)mem::ptr((uint32_t)ea);
+            if (!VirtualQuery(host, &mb, sizeof mb))
+                break;
+            const uint64_t left = (uint8_t *)mb.BaseAddress + mb.RegionSize - host;
+            if (mb.State == MEM_COMMIT && !(mb.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            {
+                const uint32_t *w = (const uint32_t *)host, vt = __builtin_bswap32(0x00f98d54u), shown = __builtin_bswap32(3u);
+                for (uint64_t i = 0; i + 24 < left / 4 && rows.size() < 200; i++)
+                    if (w[i] == vt && w[i + 1] == shown)
+                    {
+                        const int list_x0 = (int)__builtin_bswap32(w[i + 12]), list_y0 = (int)__builtin_bswap32(w[i + 13]), list_x1 = (int)__builtin_bswap32(w[i + 14]), list_y1 = (int)__builtin_bswap32(w[i + 15]);
+                        const float y = as_float(w[i + 7]), x = as_float(w[i + 8]), wide = as_float(w[i + 9]), high = as_float(w[i + 10]);
+                        if (list_x1 <= list_x0 || high <= 0.f)
+                            continue;
+                        MenuRow r{__builtin_bswap32(w[i + 4]), (uint32_t)ea + (uint32_t)i * 4, list_x0 + (int)x, list_y0 + (int)y, wide > 0.f ? list_x0 + (int)(x + wide) : list_x1, list_y0 + (int)(y + high),
+                                  list_x0, list_y0, list_x1, list_y1, (int)(y / high + 0.5f)};
+                        if (r.y1 > list_y0 && r.y0 < list_y1)
+                            rows.push_back(r);
+                    }
+            }
+            ea += left ? left : 0x1000;
+        }
+        return rows;
+    }
+
+    // Every update of a page: the row under the cursor gets the highlight, by pressing up or down as the game
+    // expects, so its own navigation does the rest (sounds, descriptions, scrolling). +0x5c of a row has its top
+    // byte set while it is its list's highlighted row. Only a list with a highlighted row has the focus: a click
+    // on another goes back, which is how the game returns to the column it came from.
+    // HELSARI_MENU_PROBE: on each click, what the page's script sees, and the flags of the visible rows.
+    void menu_probe(PPUContext *ctx, uint32_t L, const std::vector<MenuRow> &rows)
+    {
+        std::string ids;
+        for (const MenuRow &r : rows)
+        {
+            ids += std::to_string(r.id) + ",";
+            LOG("menu", "probe row id %x at %08x index %d flags %08x list rect %d %d %d %d", r.id, r.at, r.index, ld32(r.at + 0x5c), r.list_x0, r.list_y0, r.list_x1, r.list_y1);
+        }
+        lua_run(ctx, L, "pc_probe = 'browser ' .. type(gBrowser)\n"
+                        "if gBrowser then\n"
+                        "local s = gBrowser:GetSelectedTag()\n"
+                        "pc_probe = pc_probe .. ' selected ' .. type(s)\n"
+                        "if s then pc_probe = pc_probe .. ' id ' .. tostring(s:GetId()) .. ' name ' .. tostring(s:GetName()) .. ' type ' .. tostring(s:GetTypeName()) end\n"
+                        "for _, id in ipairs({" + ids + "}) do\n"
+                        "local t = gBrowser:GetTagById(id)\n"
+                        "pc_probe = pc_probe .. ' | ' .. id .. ' ' .. type(t)\n"
+                        "if t then pc_probe = pc_probe .. ' ' .. tostring(t:GetName()) .. ' ' .. tostring(t:GetTypeName()) .. ' focus ' .. tostring(t:HasFocus()) .. ' selected ' .. tostring(t:IsSelected()) end\n"
+                        "end\n"
+                        "end\n");
+        PPUContext saved = *ctx;
+        const uint64_t sp = (saved.r[1] - 256) & ~15ull;
+        st64(sp, saved.r[1]);
+        const uint32_t name = (uint32_t)sp + 112;
+        memcpy(mem::ptr(name), "pc_probe", 9);
+        ctx->r[1] = sp;
+        ctx->r[3] = L;
+        f_003f0388(ctx);
+        const int64_t top = (int32_t)ctx->r[3];
+        ctx->r[3] = L, ctx->r[4] = (uint64_t)LUA_GLOBALSINDEX, ctx->r[5] = name;
+        f_003f12a0(ctx);
+        ctx->r[3] = L, ctx->r[4] = (uint64_t)-1ll, ctx->r[5] = 0;
+        f_003f0980(ctx);
+        const uint32_t text = (uint32_t)ctx->r[3];
+        std::string out = text ? (const char *)mem::ptr(text) : "(no text: the script stopped early)";
+        for (size_t i = 0; i < out.size(); i += 1500)
+            LOG("menu", "probe: %s", out.substr(i, 1500).c_str());
+        ctx->r[3] = L, ctx->r[4] = (uint64_t)top;
+        f_003f0600(ctx);
+        *ctx = saved;
+    }
+
+    void menu_mouse(PPUContext *ctx, uint32_t L)
+    {
+        static const bool off = getenv("HELSARI_NO_MENU_MOUSE") != nullptr;
+        if (off || !mouse_menu_update())
+            return;
+        int x, y;
+        const bool moved = mouse_menu_point(x, y), clicked = mouse_menu_clicked();
+        static uint64_t last_scan, next_press;
+        static std::vector<MenuRow> rows;
+        static uint32_t target_at;      // the row the highlight is on its way to, 0 for none
+        static int target_index, presses;
+        static bool click_waiting;
+        const uint64_t now = host_now_ns();
+        if (moved || clicked)
+        {
+            if (clicked || now - last_scan > 100000000ull)
+                rows = menu_rows(), last_scan = now;
+            const MenuRow *row = nullptr;
+            for (const MenuRow &r : rows)
+                if (x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
+                    row = &r;
+            static const bool probe = getenv("HELSARI_MENU_PROBE") != nullptr;
+            if (probe && clicked)
+            {
+                menu_probe(ctx, L, rows);
+                return;
+            }
+            if (row)
+            {
+                target_at = row->at, target_index = row->index, presses = 0;
+                click_waiting = click_waiting || clicked;
+            }
+            else
+            {
+                target_at = 0;
+                click_waiting = false;
+            }
+        }
+        if (!target_at || now < next_press || mouse_menu_pressing())
+            return;
+        if (ld32(target_at) != 0x00f98d54u || ld32(target_at + 4) != 3u)
+        {
+            target_at = 0, click_waiting = false; // another page by now
+            return;
+        }
+        const auto highlighted = [](const MenuRow &r) { return (ld32(r.at + 0x5c) >> 24) != 0; };
+        const MenuRow *row = nullptr, *current = nullptr;
+        for (const MenuRow &r : rows)
+            if (r.at == target_at)
+                row = &r;
+        if (!row)
+        {
+            target_at = 0, click_waiting = false;
+            return;
+        }
+        for (const MenuRow &r : rows)
+            if (r.list_x0 == row->list_x0 && r.list_y0 == row->list_y0 && r.list_x1 == row->list_x1 && r.list_y1 == row->list_y1 && highlighted(r))
+                current = &r;
+        if (!current)
+        {
+            if (click_waiting)
+                mouse_menu_press(false), next_press = now + 200000000ull;
+            target_at = 0, click_waiting = false;
+            return;
+        }
+        if (current->index == target_index)
+        {
+            if (click_waiting)
+                mouse_menu_press(true), next_press = now + 200000000ull;
+            target_at = 0, click_waiting = false;
+            return;
+        }
+        if (presses++ > 40)
+        {
+            target_at = 0, click_waiting = false;
+            return;
+        }
+        mouse_menu_step(target_index > current->index);
+        next_press = now + 90000000ull;
+    }
+
+    bool menu_on() { return !getenv("HELSARI_MENU_PATCH") || atoi(getenv("HELSARI_MENU_PATCH")); }
 
 } // namespace
 
@@ -281,6 +459,8 @@ extern "C" void f_0047b900(PPU_CTX)
     const uint32_t state = ld32(M + 12), L = state == 3 ? ld32(M + 20) : 0, G = L ? ld32(L + 16) : 0;
     if (G)
         g_L = L; // a script of the page in use: any of them can reach the page's tags
+    if (G && call == "OnUpdatePage")
+        menu_mouse(ctx, L);
     if (G && call == "OnEnterPage")
     {
         std::lock_guard<std::mutex> lk(g_lock);
@@ -344,7 +524,9 @@ extern "C" void f_0047ccc0(PPU_CTX)
     else if (row == "fx")
         g_screen_fx = (g_screen_fx.load() + 1) % SCREEN_FX_N;
     else if (row == "fov")
+    {
         g_fov = (g_fov.load() + 1) % FOV_N;
+    }
     else if (row == "sway")
         g_sway = (g_sway.load() + 1) % SWAY_N;
     save();

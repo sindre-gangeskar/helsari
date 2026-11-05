@@ -188,7 +188,7 @@ HLE(cellGameGetParamInt) {
     RET(0);
 }
 HLE(cellGameGetParamString) {
-    const char *s = ARG32(0) == 100 ? "Killzone 2" : ARG32(0) == 102 ? "BCES00081" : ARG32(0) == 104 ? "01.00" : "";
+    const char *s = ARG32(0) == 100 ? "Helsari" : ARG32(0) == 102 ? "BCES00081" : ARG32(0) == 104 ? "01.00" : "";
     mem::write_cstr(ARG32(1), s, ARG32(2) ? ARG32(2) : 1);
     RET(0);
 }

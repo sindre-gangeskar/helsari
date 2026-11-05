@@ -34,7 +34,7 @@ std::atomic<uint32_t> g_shm_next{0x08000001};
 uint32_t syscall_dispatch(PPUContext *ctx, uint64_t n) {
     uint32_t id;
     int32_t r;
-    static const bool trace_mm = getenv("KZ2_TRACE_MMAPPER") != nullptr;   // memory/mmapper calls
+    static const bool trace_mm = getenv("HELSARI_TRACE_MMAPPER") != nullptr;   // memory/mmapper calls
     if (trace_mm && n >= 324 && n <= 352)
         LOG("sys", "syscall %llu (%llx, %llx, %llx, %llx)", (unsigned long long)n, ARG(0), ARG(1), ARG(2), ARG(3));
     switch (n) {
@@ -68,8 +68,8 @@ uint32_t syscall_dispatch(PPUContext *ctx, uint64_t n) {
         // Windows sleeps in whole timer ticks (1 ms at best), but games poll with
         // usleep(30): a high-resolution timer sleeps that short without spinning.
         // The main thread polls for finished SPU work with sleeps of about 0.5 ms, tuned for
-        // PS3 speeds: capped so it notices sooner. KZ2_MAIN_USLEEP_CAP=<us>, 0: no cap.
-        static const uint32_t main_cap = getenv("KZ2_MAIN_USLEEP_CAP") ? (uint32_t)atoi(getenv("KZ2_MAIN_USLEEP_CAP")) : 50;
+        // PS3 speeds: capped so it notices sooner. HELSARI_MAIN_USLEEP_CAP=<us>, 0: no cap.
+        static const uint32_t main_cap = getenv("HELSARI_MAIN_USLEEP_CAP") ? (uint32_t)atoi(getenv("HELSARI_MAIN_USLEEP_CAP")) : 50;
         uint32_t us = (uint32_t)std::min<uint64_t>(ARG(0), 0xffffffffu);
         if (main_cap && us > main_cap && thread::current_id() == 0x1000000) us = main_cap;
         host_sleep_us(us);

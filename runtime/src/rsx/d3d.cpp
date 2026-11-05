@@ -105,18 +105,18 @@ uint64_t g_scene_sum;
 // stretches it) and WPOS is mapped back to pixel space.
 float g_aa_sx = 1, g_aa_sy = 1; // host pixels per pixel of the current target, as the game sees it
 // Internal resolution: GPU-local targets render at this many times their size, following the
-// Resolution option (pc_options.cpp); KZ2_RES_SCALE overrides it. Targets in main memory (the SPUs read
+// Resolution option (pc_options.cpp); HELSARI_RES_SCALE overrides it. Targets in main memory (the SPUs read
 // those) and square ones (shadow maps) keep their size. g_aa_sx and g_aa_sy include it, so viewports,
 // scissors and wpos follow. A change takes effect at the next flip, with new surfaces.
-const int g_res_forced = getenv("KZ2_RES_SCALE") ? atoi(getenv("KZ2_RES_SCALE")) : 0;
+const int g_res_forced = getenv("HELSARI_RES_SCALE") ? atoi(getenv("HELSARI_RES_SCALE")) : 0;
 std::atomic<uint32_t> g_res_wanted{g_res_forced > 0 ? (uint32_t)std::min(g_res_forced, 4) : 1u};
 uint32_t g_res_setting = g_res_wanted.load();
 uint32_t g_res_scale = 1;
 // Frame capture: draws of g_log_frame are logged, surfaces dumped when g_dump_frame begins.
 std::atomic<bool> g_capture_req{false};
 std::atomic<bool> g_no_cube{false};   // F11 diagnostic: cube maps read as black
-int g_log_frame = getenv("KZ2_LOG_DRAWS") ? atoi(getenv("KZ2_LOG_DRAWS")) : -1;
-int g_dump_frame = getenv("KZ2_DUMP_RT") ? atoi(getenv("KZ2_DUMP_RT")) : -1;
+int g_log_frame = getenv("HELSARI_LOG_DRAWS") ? atoi(getenv("HELSARI_LOG_DRAWS")) : -1;
+int g_dump_frame = getenv("HELSARI_DUMP_RT") ? atoi(getenv("HELSARI_DUMP_RT")) : -1;
 int g_step_dumps;   // per-draw dumps taken in the current capture
 
 /* ---------------- shaders ---------------- */
@@ -140,8 +140,8 @@ std::unordered_map<uint64_t, PsEntry> g_ps;
 ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
     ID3DBlob *code = nullptr, *err = nullptr;
     // Disk cache of compiled shaders (shader_cache/<target>_<source hash>.bin): later
-    // runs load bytecode instead of compiling. KZ2_NO_SHADER_CACHE=1: always compile.
-    static const bool no_cache = getenv("KZ2_NO_SHADER_CACHE") && atoi(getenv("KZ2_NO_SHADER_CACHE"));
+    // runs load bytecode instead of compiling. HELSARI_NO_SHADER_CACHE=1: always compile.
+    static const bool no_cache = getenv("HELSARI_NO_SHADER_CACHE") && atoi(getenv("HELSARI_NO_SHADER_CACHE"));
     char cpath[96];
     snprintf(cpath, sizeof cpath, "shader_cache/%s_%016llx.bin", target,
              (unsigned long long)fnv(target, strlen(target), fnv(src.data(), src.size())));
@@ -176,7 +176,7 @@ ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
         std::filesystem::create_directories("shader_cache", ec);
         if (FILE *f = fopen(cpath, "wb")) { fwrite(code->GetBufferPointer(), 1, code->GetBufferSize(), f); fclose(f); }
     }
-    if (getenv("KZ2_DUMP_SHADERS")) {
+    if (getenv("HELSARI_DUMP_SHADERS")) {
         std::filesystem::create_directories("shaders");
         char path[64];
         snprintf(path, sizeof path, "shaders/%s_%016llx.hlsl", target, (unsigned long long)hash);
@@ -487,9 +487,9 @@ struct Bound {
     bool proxied[5] = {};                  // colour 0-3, depth
 };
 
-// KZ2_GPU_TIMING=1: GPU time per render target, logged every 120 frames. Each frame's timestamps
+// HELSARI_GPU_TIMING=1: GPU time per render target, logged every 120 frames. Each frame's timestamps
 // are read a few frames later, when the GPU has reached them.
-const bool g_gpu_timing = getenv("KZ2_GPU_TIMING") != nullptr;
+const bool g_gpu_timing = getenv("HELSARI_GPU_TIMING") != nullptr;
 struct GpuFrame {
     ID3D11Query *disjoint = nullptr;
     std::vector<std::pair<ID3D11Query *, uint64_t>> marks;
@@ -580,7 +580,7 @@ Bound bind_surfaces() {
     uint32_t aa = (fmt >> 12) & 0xf;                 // 3: diagonal 2x, 4/5: square 4x
     // No multisampling. Diagonal 2x (3), the main scene, renders at one sample per pixel; the game
     // still reads it as double width (see surface_width). Square 4x (4, 5) is not there to smooth
-    // edges: Killzone 2 draws its cheaper particles at 320x180 4x into a 640x360 layer, sharing it with
+    // edges: The game draws its cheaper particles at 320x180 4x into a 640x360 layer, sharing it with
     // the ones drawn at 640x360, so those targets keep the size of their samples.
     const float samples = aa == 4 || aa == 5 ? 2.f : 1.f;
     g_res_scale = dma_location(reg(0x0194)) == 0 && b.w != b.h ? g_res_setting : 1;
@@ -609,7 +609,7 @@ Bound bind_surfaces() {
     }
     if (zfmt) {
         uint32_t ea = ea_for(dma_location(reg(0x0198)), reg(0x0214));          // CONTEXT_DMA_ZETA
-        // A scaled pass can use the memory of an unscaled square target as its depth (Killzone 2's
+        // A scaled pass can use the memory of an unscaled square target as its depth (the game's
         // half-size passes reuse the shadow map's). On the PS3 that is only memory; here the two
         // would fight over one surface's size, so the scaled pass has its own, the size of its colour
         // target, under a key no real address has: nothing reads this depth back as a texture.
@@ -623,7 +623,7 @@ Bound bind_surfaces() {
         if (b.depth) b.depth->pitch = reg(0x022c), b.depth->res = g_res_scale; // SURFACE_PITCH_Z
     }
     // Surfaces keep their largest size, so one address reused for a smaller buffer
-    // (Killzone 2: the 1024x1024 shadow map as the 640x360 depth for depth of field,
+    // (the game: the 1024x1024 shadow map as the 640x360 depth for depth of field,
     // next to a 2560x720 G-buffer target) gives views of different sizes, which
     // D3D11 refuses to bind together. Those surfaces render through sw x shh proxies.
     Surface *all[5] = {b.color[0], b.color[1], b.color[2], b.color[3], b.depth};
@@ -663,13 +663,13 @@ std::unordered_map<uint64_t, Tex> g_textures;
 double g_flip_time = 0;            // seconds since start, updated at each flip
 IDXGIAdapter3 *g_adapter3;         // for video memory use in the fps log
 
-// Leak hunting (KZ2_LEAK_BISECT=1): every 8 s the renderer drops one piece of
+// Leak hunting (HELSARI_LEAK_BISECT=1): every 8 s the renderer drops one piece of
 // its work, and the flip logs memory, so the growth rate per mode shows which
 // part makes the driver allocate. 0 normal, 1 no DrawIndexed, 2 no vertex/index
 // ring uploads, 3 no constant uploads, 4 no texture creation/updates, 5 no
 // per-draw work at all, 6 also no readbacks.
 int leak_mode() {
-    static const bool on = getenv("KZ2_LEAK_BISECT") != nullptr;
+    static const bool on = getenv("HELSARI_LEAK_BISECT") != nullptr;
     return on ? (int)(g_flip_time / 8) % 7 : 0;
 }
 
@@ -701,10 +701,10 @@ DXGI_FORMAT decode(uint32_t ea, uint32_t fmt, uint32_t w, uint32_t h, uint32_t p
     }
     // One or two components per big-endian word: swap each word into a
     // matching D3D format (Y16_X16: Y in the high half, so X lands in R).
-    // X16: one 16-bit value that the RSX returns in every channel (Killzone 2 reads its
+    // X16: one 16-bit value that the RSX returns in every channel (the game reads its
     // quarter-size depth through remap 0xee, i.e. from the blue channel); replicated
-    // into R16G16B16A16. KZ2_X16_RED_ONLY=1: old behaviour (value in red only).
-    static const bool x16_red = getenv("KZ2_X16_RED_ONLY") && atoi(getenv("KZ2_X16_RED_ONLY"));
+    // into R16G16B16A16. HELSARI_X16_RED_ONLY=1: old behaviour (value in red only).
+    static const bool x16_red = getenv("HELSARI_X16_RED_ONLY") && atoi(getenv("HELSARI_X16_RED_ONLY"));
     if (base == 0x94 && !x16_red) {
         if (!pitch || !linear) pitch = w * 2;
         uint32_t lw = log2u(w), lh = log2u(h);
@@ -832,8 +832,8 @@ void write_back_surface(uint32_t ea, Surface &s) {
     // Mapping a copy waits for the GPU to finish everything queued before it: at high resolution most of
     // a frame. What the SPUs read (main memory) need not be that fresh, so its copies go on a queue and
     // guest memory gets the newest one finished, a frame or two old. The GPU and CPU then work at the
-    // same time, not in turns. KZ2_SYNC_READBACK=1: wait, always fresh.
-    static const bool sync_readback = getenv("KZ2_SYNC_READBACK") != nullptr;
+    // same time, not in turns. HELSARI_SYNC_READBACK=1: wait, always fresh.
+    static const bool sync_readback = getenv("HELSARI_SYNC_READBACK") != nullptr;
     if (!sync_readback && ea < mem::LOCAL_BASE && !s.depth) {
         constexpr int RING = 3;
         D3D11_MAPPED_SUBRESOURCE m;
@@ -1075,7 +1075,7 @@ ID3D11ShaderResourceView *depth_as_color(Surface &s) {
 
 // A 32-bit colour surface read through a texture format with another
 // layout: rebuild each pixel's RSX word (A<<24 | R<<16 | G<<8 | B) and decode
-// it as the texture format would. Killzone 2 packs two half floats per pixel
+// it as the texture format would. The game packs two half floats per pixel
 // into an A8R8G8B8 G-buffer target and reads them back as Y16_X16_FLOAT.
 bool reinterpretable(uint32_t base) { return base == 0x9f || base == 0x95 || base == 0x9c; }
 ID3D11ShaderResourceView *reinterpret_view(Surface &s, uint32_t base) {
@@ -1176,8 +1176,8 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
                 LOG("rsx", "   texture %08x fmt %02x %ux%u (depth surface %ux%u): %s", ea, base, w, h, ds->second.w,
                     ds->second.h, how);
         };
-        // KZ2_SUBRECT_GPU=0: read such regions back through guest memory, as before.
-        static const bool subrect = !getenv("KZ2_SUBRECT_GPU") || atoi(getenv("KZ2_SUBRECT_GPU"));
+        // HELSARI_SUBRECT_GPU=0: read such regions back through guest memory, as before.
+        static const bool subrect = !getenv("HELSARI_SUBRECT_GPU") || atoi(getenv("HELSARI_SUBRECT_GPU"));
         if (subrect && (fmt & 0x20) && s != g_surfaces.end() && !s->second.depth && pitch == s->second.pitch &&
             covers(s->second) && !holds(s->second) &&
             same_layout(s->second.fmt, base) && color_format(s->second.fmt) != DXGI_FORMAT_UNKNOWN) {
@@ -1210,7 +1210,7 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     uint32_t size = image_size(fmt, w, h, pitch);
     if (t.srv && t.checked_frame == g_frame) return t.srv;
     // Local-memory textures: page write tracking says whether anything wrote the
-    // image since we last looked - no need to read it (KZ2_TEX_TRACK=0: always hash).
+    // image since we last looked - no need to read it (HELSARI_TEX_TRACK=0: always hash).
     // The pages are armed before hashing, so a write during the hash is seen next time.
     uint32_t span = cube ? 6 * image_size(fmt, w, h, pitch) + 6 * 128 : image_size(fmt, w, h, pitch) * 2;   // + mips
     if (ea >= mem::LOCAL_BASE && mem::track_enabled()) {
@@ -1232,8 +1232,8 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
 
     int faces = cube ? 6 : 1;
     // Mip levels follow level 0 in memory, each face holding its full chain (faces
-    // 128-byte aligned). Linear (pitched) textures: level 0 only. KZ2_NO_MIPS=1: level 0.
-    static const bool no_mips = getenv("KZ2_NO_MIPS") && atoi(getenv("KZ2_NO_MIPS"));
+    // 128-byte aligned). Linear (pitched) textures: level 0 only. HELSARI_NO_MIPS=1: level 0.
+    static const bool no_mips = getenv("HELSARI_NO_MIPS") && atoi(getenv("HELSARI_NO_MIPS"));
     uint32_t levels = (no_mips || (fmt & 0x20)) ? 1 : std::min(mips, log2u(std::max(w, h)) + 1);
     uint32_t face_stride = 0;
     if (cube) {
@@ -1253,9 +1253,9 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         lofs += image_size(fmt, lw, lh, (fmt & 0x20) ? pitch : 0);
         lw = std::max(1u, lw / 2), lh = std::max(1u, lh / 2);
         if (lv) continue;
-        // Diagnostic only (KZ2_DEBUG_IDENTITY_LUT): an all-zero 64x64 A8R8G8B8 texture
+        // Diagnostic only (HELSARI_DEBUG_IDENTITY_LUT): an all-zero 64x64 A8R8G8B8 texture
         // (the colour-grading table) becomes an identity ramp, to see what else renders.
-        static const bool identity_lut = getenv("KZ2_DEBUG_IDENTITY_LUT") != nullptr;
+        static const bool identity_lut = getenv("HELSARI_DEBUG_IDENTITY_LUT") != nullptr;
         if (identity_lut && w == 64 && h == 64 && (fmt & ~0x60u) == 0x85 &&
             std::all_of(data[k].begin(), data[k].end(), [](uint8_t b) { return b == 0; })) {
             for (uint32_t y = 0; y < h; y++)
@@ -1329,9 +1329,9 @@ ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     if (d.MaxLOD < d.MinLOD) d.MaxLOD = d.MinLOD;
     d.MipLODBias = (float)((int32_t)(filt << 19) >> 19) / 256.f;
     // Anisotropic filtering: TEXTURE_CONTROL0 bits 4-6 = 1x 2x 4x 6x 8x 10x 12x 16x
-    // (mipmapped linear minification only). KZ2_NO_ANISO=1 disables.
+    // (mipmapped linear minification only). HELSARI_NO_ANISO=1 disables.
     static const uint8_t aniso_of[8] = {1, 2, 4, 6, 8, 10, 12, 16};
-    static const bool no_aniso = getenv("KZ2_NO_ANISO") && atoi(getenv("KZ2_NO_ANISO"));
+    static const bool no_aniso = getenv("HELSARI_NO_ANISO") && atoi(getenv("HELSARI_NO_ANISO"));
     uint32_t aniso = aniso_of[(ctl0 >> 4) & 7];
     if (!no_aniso && !shadow && aniso > 1 && mipmapped && min_lin)
         d.Filter = D3D11_FILTER_ANISOTROPIC, d.MaxAnisotropy = aniso;
@@ -1340,10 +1340,10 @@ ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     d.AddressW = wrap((addr >> 16) & 0xf);
     // RSX zfunc 0..7 (never, less, equal, lequal, greater, notequal, gequal, always) = D3D11 func - 1.
     // The RSX compares the stored depth against the lookup's z (texel OP ref); D3D11
-    // compares ref OP texel. Mirror the operator: Killzone 2's shadow maps use GEQUAL
+    // compares ref OP texel. Mirror the operator: The game's shadow maps use GEQUAL
     // (lit where stored >= z); taken as-is every shadow test was inverted.
-    // KZ2_SHADOW_CMP_RAW=1: pass the function through unmirrored.
-    static const bool cmp_raw = getenv("KZ2_SHADOW_CMP_RAW") && atoi(getenv("KZ2_SHADOW_CMP_RAW"));
+    // HELSARI_SHADOW_CMP_RAW=1: pass the function through unmirrored.
+    static const bool cmp_raw = getenv("HELSARI_SHADOW_CMP_RAW") && atoi(getenv("HELSARI_SHADOW_CMP_RAW"));
     static const uint8_t mirror[8] = {0, 4, 2, 6, 1, 5, 3, 7};
     uint32_t zf = addr >> 28;
     d.ComparisonFunc = shadow ? (D3D11_COMPARISON_FUNC)((cmp_raw ? zf : mirror[zf]) + 1) : D3D11_COMPARISON_NEVER;
@@ -1409,11 +1409,11 @@ void apply_state() {
     uint32_t be = reg(0x0310) & 1, sf = reg(0x0314), df = reg(0x0318), eq = reg(0x0320), mask = reg(0x0324);
     // Blending and write masks are per render target on the RSX: target 0 uses BLEND_ENABLE
     // and COLOR_MASK, targets 1-3 SET_BLEND_ENABLE_MRT (0x12c, bits 1-3) and
-    // SET_COLOR_MASK_MRT (0x370: A,R,G,B bits from 4 * target). Killzone 2 packs normals as
+    // SET_COLOR_MASK_MRT (0x370: A,R,G,B bits from 4 * target). The game packs normals as
     // raw half floats into target 2: a decal blending into the albedo must not blend those
     // bytes (random normals: sparkling noise on walls). The MRT mask counts only once the
-    // game has set it. KZ2_MRT_STATE=0: target 0's state for all.
-    static const bool mrt_state = !getenv("KZ2_MRT_STATE") || atoi(getenv("KZ2_MRT_STATE"));
+    // game has set it. HELSARI_MRT_STATE=0: target 0's state for all.
+    static const bool mrt_state = !getenv("HELSARI_MRT_STATE") || atoi(getenv("HELSARI_MRT_STATE"));
     static bool mrt_mask_seen;
     uint32_t mrt_be = mrt_state ? reg(0x012c) : 0, mrt_mask = mrt_state ? reg(0x0370) : 0;
     if (mrt_mask) mrt_mask_seen = true;
@@ -1438,7 +1438,7 @@ void apply_state() {
                 uint32_t m = mrt_mask >> (4 * k);
                 // Decals: blending on, this target's colour written but not its alpha, which the shader
                 // still sets to the same value as target 0's. Unblended, it fills the decal's whole quad.
-                static const bool decal_blend = !getenv("KZ2_DECAL_BLEND") || atoi(getenv("KZ2_DECAL_BLEND"));
+                static const bool decal_blend = !getenv("HELSARI_DECAL_BLEND") || atoi(getenv("HELSARI_DECAL_BLEND"));
                 if (decal_blend && be && (m & 0xf) == 0xe) t.BlendEnable = TRUE;
                 t.RenderTargetWriteMask = ((m >> 1) & 1 ? 1 : 0) | ((m >> 2) & 1 ? 2 : 0) | ((m >> 3) & 1 ? 4 : 0) | (m & 1 ? 8 : 0);
             }
@@ -1455,7 +1455,7 @@ void apply_state() {
     auto &ds = g_depth[hfast(dz, sizeof dz)];
     if (!ds) {
         D3D11_DEPTH_STENCIL_DESC d{};
-        static bool nodepth = getenv("KZ2_NO_DEPTH_STENCIL");
+        static bool nodepth = getenv("HELSARI_NO_DEPTH_STENCIL");
         if (nodepth) dz[0] = dz[3] = 0;
         d.DepthEnable = dz[0];
         d.DepthFunc = cmp(dz[1]);
@@ -1473,13 +1473,13 @@ void apply_state() {
     // two-sided materials to flip normals): we rasterise vertically mirrored relative to
     // the RSX (see origin_bottom), which reverses winding - an RSX counter-clockwise
     // front face (0x1834 = 0x901) appears clockwise here, and vice versa.
-    static const bool ff_raw = getenv("KZ2_FRONT_FACE_RAW") != nullptr;   // experiment: no mirror correction
+    static const bool ff_raw = getenv("HELSARI_FRONT_FACE_RAW") != nullptr;   // experiment: no mirror correction
     bool rsx_ccw = reg(0x1834) != 0x0900;
     bool front_ccw = ff_raw ? rsx_ccw : !rsx_ccw;
     uint32_t sc = front_ccw ? 3 : 1;
     // Polygon offset (decals on walls): enable 0x0a68, slope factor 0x0a78, units 0x0a7c. RSX and
-    // D3D both multiply units by the depth format's smallest step. KZ2_NO_DEPTH_BIAS=1: off.
-    static const bool no_bias = getenv("KZ2_NO_DEPTH_BIAS") && atoi(getenv("KZ2_NO_DEPTH_BIAS"));
+    // D3D both multiply units by the depth format's smallest step. HELSARI_NO_DEPTH_BIAS=1: off.
+    static const bool no_bias = getenv("HELSARI_NO_DEPTH_BIAS") && atoi(getenv("HELSARI_NO_DEPTH_BIAS"));
     bool bias_on = !no_bias && (reg(0x0a68) & 1);
     uint32_t rkey[3] = {sc, bias_on ? reg(0x0a78) : 0, bias_on ? reg(0x0a7c) : 0};
     auto &rs = g_raster[hfast(rkey, sizeof rkey)];
@@ -1585,7 +1585,7 @@ ID3D11VertexShader *vertex_shader() {
     }
     // Attribute formats are compiled into the shader (a decode per attribute, see
     // vp.cpp fetch_code): 0 constant, RSX type | size << 4, 8 host float4 (CPU fetch).
-    static const bool cpu_vertex = getenv("KZ2_CPU_VERTEX") && atoi(getenv("KZ2_CPU_VERTEX"));
+    static const bool cpu_vertex = getenv("HELSARI_CPU_VERTEX") && atoi(getenv("HELSARI_CPU_VERTEX"));
     uint8_t afmt[16] = {};
     for (int a = 0; a < 16; a++) {
         uint32_t fmt = reg(0x1740 + a * 4), type = fmt & 0xf, size = (fmt >> 4) & 0xf;
@@ -1612,8 +1612,8 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
     const FpScan &sc = scan_fp(fp_ea);
     uint32_t control = reg(0x1d60);
     uint32_t alpha = (reg(0x0304) & 1) ? reg(0x0308) : 0;
-    // SET_SHADER_PACKER (0x1fc4): sRGB framebuffer writes. KZ2_NO_SRGB_OUT=1 ignores it.
-    static const bool no_srgb = getenv("KZ2_NO_SRGB_OUT") && atoi(getenv("KZ2_NO_SRGB_OUT"));
+    // SET_SHADER_PACKER (0x1fc4): sRGB framebuffer writes. HELSARI_NO_SRGB_OUT=1 ignores it.
+    static const bool no_srgb = getenv("HELSARI_NO_SRGB_OUT") && atoi(getenv("HELSARI_NO_SRGB_OUT"));
     uint32_t srgb_out = !no_srgb && reg(0x1fc4) != 0;
     uint64_t h = hfast(&srgb_out, 4, hfast(gamma, 16, hfast(remap, 32, hfast(texdim, 16, hfast(&control, 4, hfast(&alpha, 4, sc.hash))))));
     auto it = g_ps.find(h);
@@ -1623,13 +1623,13 @@ PsEntry *pixel_shader(uint32_t fp_ea, const uint8_t texdim[16], const uint16_t r
     memcpy(key.remap, remap, 32);
     memcpy(key.gamma, gamma, 16);
     FpInfo fi = translate_fp(key);
-    // Debug: KZ2_DEBUG_PS=<hash prefix> replaces that shader's colour output with
-    // KZ2_DEBUG_EXPR (an HLSL float4 over its registers), alpha 1 - to see intermediates.
-    if (const char *dbg = getenv("KZ2_DEBUG_PS")) {
+    // Debug: HELSARI_DEBUG_PS=<hash prefix> replaces that shader's colour output with
+    // HELSARI_DEBUG_EXPR (an HLSL float4 over its registers), alpha 1 - to see intermediates.
+    if (const char *dbg = getenv("HELSARI_DEBUG_PS")) {
         char hs[17];
         snprintf(hs, sizeof hs, "%016llx", (unsigned long long)h);
         if (*dbg && !strncmp(hs, dbg, strlen(dbg))) {
-            const char *ex = getenv("KZ2_DEBUG_EXPR");
+            const char *ex = getenv("HELSARI_DEBUG_EXPR");
             std::string expr = ex ? ex : "float4(r[3].x, saturate(-r[0].x / 100), saturate(-i.o8.z / 100), 1)";
             size_t at = fi.hlsl.find("  return o;");
             if (at != std::string::npos) fi.hlsl.insert(at, "  o.c0 = " + expr + ";\n");
@@ -1788,8 +1788,8 @@ inline void lap(int i) { uint64_t n = host_now_ns(); g_seg_ns[i] += n - g_seg_t;
    GET_REPORT (0x1800) writes the count since the clear. Each enabled stretch is one
    D3D11 occlusion query; a report's queries are resolved without stalling the GPU
    (polled every draw, forced at the flip), and the value is written to the report
-   area when known. Killzone 2 fades light sprites (coronas) by these counts; answering
-   "always visible" drew them through walls. KZ2_REPORT_VISIBLE=1: the old answer. */
+   area when known. The game fades light sprites (coronas) by these counts; answering
+   "always visible" drew them through walls. HELSARI_REPORT_VISIBLE=1: the old answer. */
 std::vector<ID3D11Query *> g_occ_since_clear;   // ended stretches since the last clear
 ID3D11Query *g_occ_active = nullptr;            // current stretch, while counting is on
 bool g_occ_enabled = false;
@@ -1860,10 +1860,10 @@ void draw() {
     if (g_ranges.empty()) { g_skip[0]++; return; }
     g_draws_this_frame++;
     if (leak_mode() >= 5) return;
-    // debug: KZ2_SKIP_DRAWS=a,b,c skips those draw indices in every frame
+    // debug: HELSARI_SKIP_DRAWS=a,b,c skips those draw indices in every frame
     static std::vector<int> skip = [] {
         std::vector<int> v;
-        if (const char *e = getenv("KZ2_SKIP_DRAWS"))
+        if (const char *e = getenv("HELSARI_SKIP_DRAWS"))
             for (const char *p = e; *p;) { v.push_back(atoi(p)); while (*p && *p != ',') p++; if (*p) p++; }
         return v;
     }();
@@ -1882,8 +1882,8 @@ void draw() {
     // Fast path for the common case, one indexed triangle list (libgcm cuts it into
     // back-to-back ranges): read the big-endian indices straight into the final list,
     // then rebase them, instead of building intermediate index vectors. A restart
-    // marker in the stream falls back to the general path. KZ2_SLOW_INDEX=1: always general.
-    static const bool slow_index = getenv("KZ2_SLOW_INDEX") && atoi(getenv("KZ2_SLOW_INDEX"));
+    // marker in the stream falls back to the general path. HELSARI_SLOW_INDEX=1: always general.
+    static const bool slow_index = getenv("HELSARI_SLOW_INDEX") && atoi(getenv("HELSARI_SLOW_INDEX"));
     bool fast = false;
     if (g_indexed && g_prim == 5 && !slow_index) {
         bool chained = true;
@@ -1958,8 +1958,8 @@ void draw() {
     uint32_t vattr[16][4] = {};
     // GPU vertex fetch: copy the raw guest bytes of each attribute's vertex range
     // (overlapping ranges - interleaved attributes - merged into one copy); the vertex
-    // shader decodes them (vp.cpp fetch). KZ2_CPU_VERTEX=1: decode on the CPU instead.
-    static const bool cpu_vertex = getenv("KZ2_CPU_VERTEX") && atoi(getenv("KZ2_CPU_VERTEX"));
+    // shader decodes them (vp.cpp fetch). HELSARI_CPU_VERTEX=1: decode on the CPU instead.
+    static const bool cpu_vertex = getenv("HELSARI_CPU_VERTEX") && atoi(getenv("HELSARI_CPU_VERTEX"));
     if (leak_mode() != 2 && !cpu_vertex) {
         ScopedUs timer{g_fetch_us};
         g_fetch_verts += nv;
@@ -2066,7 +2066,7 @@ void draw() {
     uint8_t texdim[16] = {};
     ID3D11ShaderResourceView *srv[16] = {};
     ID3D11SamplerState *smp[16] = {};
-    // Games leave textures enabled that the program never samples (Killzone 2 keeps
+    // Games leave textures enabled that the program never samples (the game keeps
     // its G-buffer bound while rendering into it); binding one costs a decode, a
     // readback or a snapshot copy of a render target, so bind only sampled units.
     uint16_t sampled = scan_fp(fp_ea).tex_mask;
@@ -2098,7 +2098,7 @@ void draw() {
         texdim[t] = d;
         if ((reg(0x1a04 + t * 32) >> 8) & 0x40) texdim[t] |= TEX_UNNORM;
         // Convolution filter (min 7 / mag 4): a hardware kernel over neighbouring
-        // texels, done in the shader (see fp.cpp). Killzone 2 resolves its 2x
+        // texels, done in the shader (see fp.cpp). The game resolves its 2x
         // multisampled frame with the quincunx kernel.
         uint32_t filt = reg(0x1a14 + t * 32);
         if (((filt >> 16) & 0xff) == 7 || ((filt >> 24) & 0xff) == 4) {
@@ -2111,8 +2111,8 @@ void draw() {
     lap(2);
     uint16_t remap[16];
     for (int t = 0; t < 16; t++) remap[t] = (reg(0x1a0c + t * 32) & 0x80000000) ? reg(0x1a10 + t * 32) & 0xffff : 0xaae4;
-    uint8_t gamma[16];   // per-channel sRGB decode (TEXTURE_ADDRESS bits 20-23); KZ2_NO_TEX_GAMMA=1 ignores it
-    static const bool no_gamma = getenv("KZ2_NO_TEX_GAMMA") != nullptr;
+    uint8_t gamma[16];   // per-channel sRGB decode (TEXTURE_ADDRESS bits 20-23); HELSARI_NO_TEX_GAMMA=1 ignores it
+    static const bool no_gamma = getenv("HELSARI_NO_TEX_GAMMA") != nullptr;
     for (int t = 0; t < 16; t++)
         gamma[t] = (!no_gamma && (reg(0x1a0c + t * 32) & 0x80000000)) ? (reg(0x1a08 + t * 32) >> 20) & 0xf : 0;
     PsEntry *ps = pixel_shader(fp_ea, texdim, remap, gamma);
@@ -2138,9 +2138,9 @@ void draw() {
     float gun_saved[8 * 4];
     bool gun_edited = false;
     const float gun_near = vp_consts[3 * 4 + 2] - vp_consts[3 * 4 + 3];
-    // KZ2_GUN_TRACE=1: every frame while zoomed, the game's own pose of the weapon's first mesh.
+    // HELSARI_GUN_TRACE=1: every frame while zoomed, the game's own pose of the weapon's first mesh.
     {
-        static const bool gun_trace = getenv("KZ2_GUN_TRACE") != nullptr;
+        static const bool gun_trace = getenv("HELSARI_GUN_TRACE") != nullptr;
         static int traced_frame = -1, traced[2];
         const int input = mouse_look_active() ? 0 : 1;
         if (gun_trace && gun_near < -0.008f && gun_near > -0.05f && traced_frame != (int)g_frame && mouse_turn_factor() < 0.99f && traced[input] < 1500)
@@ -2150,7 +2150,7 @@ void draw() {
             LOG("guntrace", "%s %.2f live %.4f %.4f %.4f fwd %.4f %.4f %.4f", input ? "pad" : "pc", host_now_ns() / 1e6, m[12], m[13], m[14], m[2], m[6], m[10]);
         }
     }
-    static const bool gun_raw = getenv("KZ2_GUN_RAW") != nullptr;   // the game's own pose, untouched
+    static const bool gun_raw = getenv("HELSARI_GUN_RAW") != nullptr;   // the game's own pose, untouched
     // Screen-space overlays can have the same near value: the weapon is the one close to the camera, plus
     // its mask, far by its transform, which writes only depth and stencil. Left out, the mask stays at the
     // game's own 15 Hz pose and shows as a trail along the weapon.
@@ -2174,9 +2174,9 @@ void draw() {
         static bool turning;
         static uint64_t last_turn_ns, last_zoom_ns;
         static float zoom_factor;
-        static const float rot_ms = getenv("KZ2_GUN_ROT_MS") ? (float)atof(getenv("KZ2_GUN_ROT_MS")) : 120.f;
-        static const float pos_ms = getenv("KZ2_GUN_POS_MS") ? (float)atof(getenv("KZ2_GUN_POS_MS")) : 40.f;
-        static const float fwd_ms = getenv("KZ2_GUN_FWD_MS") ? (float)atof(getenv("KZ2_GUN_FWD_MS")) : 150.f;
+        static const float rot_ms = getenv("HELSARI_GUN_ROT_MS") ? (float)atof(getenv("HELSARI_GUN_ROT_MS")) : 120.f;
+        static const float pos_ms = getenv("HELSARI_GUN_POS_MS") ? (float)atof(getenv("HELSARI_GUN_POS_MS")) : 40.f;
+        static const float fwd_ms = getenv("HELSARI_GUN_FWD_MS") ? (float)atof(getenv("HELSARI_GUN_FWD_MS")) : 150.f;
         if (frame != (int)g_frame)
         {
             frame = (int)g_frame;
@@ -2270,7 +2270,7 @@ void draw() {
         f.last = now;
         f.frame = frame;
         {
-            static const bool drawn_trace = getenv("KZ2_GUN_TRACE") != nullptr;
+            static const bool drawn_trace = getenv("HELSARI_GUN_TRACE") != nullptr;
             static int drawn_frame = -1, drawn_count;
             if (drawn_trace && drawn_frame != frame && zoom_factor < 0.99f && drawn_count < 3000)
             {
@@ -2342,9 +2342,9 @@ void draw() {
     float vx[24 + 128] = {regf(0x0a30), regf(0x0a34), regf(0x0a38), regf(0x0a3c), regf(0x0a20), regf(0x0a24),
                     regf(0x0a28), regf(0x0a2c), (float)b.w, (float)b.h, 0, 0};
     // SET_USER_CLIP_PLANE_CONTROL (0x1478): 4 bits per plane, 1 = clip where d >= 0
-    // (keep d < 0), 2 = clip where d < 0. Killzone 2 cuts mirrored geometry at the
-    // mirror plane this way. KZ2_NO_CLIP_PLANES=1 ignores them.
-    static const bool no_clip = getenv("KZ2_NO_CLIP_PLANES") && atoi(getenv("KZ2_NO_CLIP_PLANES"));
+    // (keep d < 0), 2 = clip where d < 0. The game cuts mirrored geometry at the
+    // mirror plane this way. HELSARI_NO_CLIP_PLANES=1 ignores them.
+    static const bool no_clip = getenv("HELSARI_NO_CLIP_PLANES") && atoi(getenv("HELSARI_NO_CLIP_PLANES"));
     for (int i = 0; i < 6; i++) {
         uint32_t m = no_clip ? 0 : (reg(0x1478) >> (4 * i)) & 0xf;
         vx[16 + (i < 3 ? 1 + i : 5 + (i - 3))] = m == 1 ? -1.f : m == 2 ? 1.f : 0.f;
@@ -2354,7 +2354,7 @@ void draw() {
     // Window-origin "bottom" (0x1d88 bit 12) maps to D3D top-down here; verified against
     // the font atlas, which must come out upright for text lookups to work.
     origin_bottom = !origin_bottom;
-    static const bool flip_y = getenv("KZ2_FLIP_Y") != nullptr;
+    static const bool flip_y = getenv("HELSARI_FLIP_Y") != nullptr;
     if (flip_y) origin_bottom = !origin_bottom;
     vx[10] = origin_bottom ? 1.f : 0.f;
     memcpy(&vx[24], vattr, sizeof vattr);
@@ -2372,9 +2372,9 @@ void draw() {
     float arf;
     if (ar <= 255) arf = ar / 255.f; else memcpy(&arf, &ar, 4);
     px.alpha_ref[0] = arf;
-    // KZ2_WPOS_FLIP=1 (experiment): report WPOS with the opposite vertical origin from the
+    // HELSARI_WPOS_FLIP=1 (experiment): report WPOS with the opposite vertical origin from the
     // one used for rasterisation - tests position-based G-buffer lookups (light volumes).
-    static const bool wpos_flip = !getenv("KZ2_WPOS_FLIP") || atoi(getenv("KZ2_WPOS_FLIP"));   // default on
+    static const bool wpos_flip = !getenv("HELSARI_WPOS_FLIP") || atoi(getenv("HELSARI_WPOS_FLIP"));   // default on
     px.wpos[0] = (origin_bottom != wpos_flip) ? 1.f : 0.f;
     px.wpos[1] = (float)(reg(0x1d88) & 0xfff);
     px.wpos[2] = g_aa_sx, px.wpos[3] = g_aa_sy;
@@ -2494,8 +2494,8 @@ void draw() {
                     LOG("draw", "     tex%d data (%ux%u, %s):%s", t, tw, th, zero ? "ALL ZERO" : "non-zero", words.c_str());
                 }
             }
-        // Vertex shader and the first vertices' attributes: every full-screen pass, or KZ2_LOG_ATTRS=<draw>.
-        static int attr_draw = getenv("KZ2_LOG_ATTRS") ? atoi(getenv("KZ2_LOG_ATTRS")) : -1;
+        // Vertex shader and the first vertices' attributes: every full-screen pass, or HELSARI_LOG_ATTRS=<draw>.
+        static int attr_draw = getenv("HELSARI_LOG_ATTRS") ? atoi(getenv("HELSARI_LOG_ATTRS")) : -1;
         static int quad_logs;   // particle quads too (the first 40 of the frame)
         if (g_draw_logged_frame != (int)g_frame) g_draw_logged_frame = (int)g_frame, quad_logs = 0;
         if (g_draws_this_frame == attr_draw || list.size() <= 6 || (g_prim == 8 && quad_logs++ < 40)) {
@@ -2583,8 +2583,8 @@ void draw() {
             (reg(0x1a18 + t * 32) >> 16) * (reg(0x1a18 + t * 32) & 0xffff) >= 160 * 90)
             samples_main = true;
     // Skip draws that write no colour (occlusion queries); main-memory samplers always dump.
-    // F12 saves only the passes drawing to the display targets; KZ2_CAPTURE_FULL=1: every pass.
-    static const bool capture_full = getenv("KZ2_CAPTURE_FULL") && atoi(getenv("KZ2_CAPTURE_FULL"));
+    // F12 saves only the passes drawing to the display targets; HELSARI_CAPTURE_FULL=1: every pass.
+    static const bool capture_full = getenv("HELSARI_CAPTURE_FULL") && atoi(getenv("HELSARI_CAPTURE_FULL"));
     const bool pass_dump = (int)g_frame == g_log_frame && reg(0x0324) &&
         (capture_full || (b.color[0] && (b.color[0]->ea == 0xc0010000u || b.color[0]->ea == 0xc0394000u || b.color[0]->ea == 0xc16b0000u || b.color[0]->ea == 0xc12b4000u || b.color[0]->ea < mem::LOCAL_BASE))) &&
                            ((list.size() <= 6 && g_pass_dumps < 600) || samples_main);
@@ -2617,7 +2617,7 @@ void draw() {
     // Hand queued work to the GPU regularly, so it draws while we translate the next
     // commands: otherwise the driver submits only when a readback forces it, and the
     // CPU then waits for the GPU to do the whole frame's work at once.
-    static const int flush_every = getenv("KZ2_FLUSH_EVERY") ? atoi(getenv("KZ2_FLUSH_EVERY")) : 256;
+    static const int flush_every = getenv("HELSARI_FLUSH_EVERY") ? atoi(getenv("HELSARI_FLUSH_EVERY")) : 256;
     static int since_flush;
     if (flush_every > 0 && ++since_flush >= flush_every) g_ctx->Flush(), since_flush = 0;
     lap(6);
@@ -2639,11 +2639,11 @@ void draw() {
     // Early readback: a colour target in main memory is read by the SPUs (post-processing
     // inputs) once the game signals them. Start its GPU->CPU copy now and hand it to the
     // GPU, so the write-back at that signal finds it done instead of stalling the RSX
-    // thread on the whole queue. KZ2_EARLY_READBACK=0: copy at write-back time.
+    // thread on the whole queue. HELSARI_EARLY_READBACK=0: copy at write-back time.
     // Default OFF: the copy is taken right after a draw, but more draws (the half-res smoke
     // and particle passes) can follow before the SPUs read the buffer, so they read a stale
-    // copy (blocky fog over the whole shore level). KZ2_EARLY_READBACK=1: on.
-    static const bool early_rb = getenv("KZ2_EARLY_READBACK") && atoi(getenv("KZ2_EARLY_READBACK"));
+    // copy (blocky fog over the whole shore level). HELSARI_EARLY_READBACK=1: on.
+    static const bool early_rb = getenv("HELSARI_EARLY_READBACK") && atoi(getenv("HELSARI_EARLY_READBACK"));
     if (early_rb && reg(0x0324))
         for (int i = 0; i < 4; i++) {
             Surface *c = b.color[i];
@@ -2662,9 +2662,9 @@ void draw() {
     if (b.depth && zwrite) mark_drawn(*b.depth, b.proxied[4]);
     // Capture: after each small draw (post-processing quads), save its target.
     // (Square targets are shadow maps: skipped.)
-    // KZ2_STEP_EVERY=n with KZ2_STEP_RT=<ea>: also snapshot that target after every nth draw into it.
-    static const int step_every = getenv("KZ2_STEP_EVERY") ? atoi(getenv("KZ2_STEP_EVERY")) : 0;
-    static const uint32_t step_rt = getenv("KZ2_STEP_RT") ? (uint32_t)strtoul(getenv("KZ2_STEP_RT"), nullptr, 16) : 0;
+    // HELSARI_STEP_EVERY=n with HELSARI_STEP_RT=<ea>: also snapshot that target after every nth draw into it.
+    static const int step_every = getenv("HELSARI_STEP_EVERY") ? atoi(getenv("HELSARI_STEP_EVERY")) : 0;
+    static const uint32_t step_rt = getenv("HELSARI_STEP_RT") ? (uint32_t)strtoul(getenv("HELSARI_STEP_RT"), nullptr, 16) : 0;
     bool step = step_every > 0 && b.color[0] && b.color[0]->ea == step_rt && g_draws_this_frame % step_every == 0;
     if ((int)g_frame == g_log_frame && b.color[0] && g_step_dumps < (step_every ? 700 : 80) &&
         (step_every ? step : list.size() <= 96 && b.color[0]->w != b.color[0]->h)) {
@@ -2711,7 +2711,7 @@ bool create_device() {
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;  // blt model: stretches to the window, capturable
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    UINT flags = getenv("KZ2_D3D_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0;
+    UINT flags = getenv("HELSARI_D3D_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0;
     // The default adapter is whatever Windows considers primary - often the integrated
     // GPU of an APU. Ask DXGI for the high-performance one (the discrete GPU).
     IDXGIAdapter1 *adapter = nullptr;
@@ -2826,8 +2826,8 @@ bool create_device() {
     if (opts.ConstantBufferOffsetting && opts.MapNoOverwriteOnDynamicConstantBuffer &&
         SUCCEEDED(g_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&g_ctx1))) {
         g_cbring = make_cb(CBRING_SIZE);
-        // constant windows need buffer offsets (D3D11.1). KZ2_VS_WINDOWS=0: whole constant file.
-        g_vp_windows = g_cbring != nullptr && (!getenv("KZ2_VS_WINDOWS") || atoi(getenv("KZ2_VS_WINDOWS")));
+        // constant windows need buffer offsets (D3D11.1). HELSARI_VS_WINDOWS=0: whole constant file.
+        g_vp_windows = g_cbring != nullptr && (!getenv("HELSARI_VS_WINDOWS") || atoi(getenv("HELSARI_VS_WINDOWS")));
         if (!g_cbring) release(g_ctx1);
     }
     if (!g_cbring) LOG("rsx", "driver lacks constant buffer offsets: constants are re-uploaded per draw");
@@ -2917,14 +2917,14 @@ bool capturing() {
 // Copy colour surfaces rendered since the last sync point back to guest
 // memory in RSX layout. Called when the RSX signals progress (labels,
 // semaphores, user commands, flips): from then on the PPU and SPUs may read
-// what it rendered - Killzone 2 post-processes downsampled frames on the SPUs.
+// what it rendered - the game post-processes downsampled frames on the SPUs.
 // Only surfaces in main memory are copied here: those are what the PPU and SPUs
 // read. Surfaces in RSX local memory stay on the GPU until a texture or NV0039
 // copy needs their bytes (write_back_surface on demand); each copy stalls on
-// the GPU. KZ2_WB_LOCAL=1 also copies local surfaces at every sync point.
+// the GPU. HELSARI_WB_LOCAL=1 also copies local surfaces at every sync point.
 void write_back(bool all) {
     if (leak_mode() == 6) return;
-    static const bool wb_local = getenv("KZ2_WB_LOCAL") && atoi(getenv("KZ2_WB_LOCAL"));
+    static const bool wb_local = getenv("HELSARI_WB_LOCAL") && atoi(getenv("HELSARI_WB_LOCAL"));
     all |= wb_local;
     auto t0 = std::chrono::steady_clock::now();
     for (auto &[ea, s] : g_surfaces) if (all || ea < mem::LOCAL_BASE) write_back_surface(ea, s);
@@ -2980,7 +2980,7 @@ std::string stats_line(uint32_t frames) {
     return std::string(b) + seg + sk + sc;
 }
 
-// Debug: KZ2_SCREENSHOT=<sec> writes the presented frame, half size, to
+// Debug: HELSARI_SCREENSHOT=<sec> writes the presented frame, half size, to
 // shot_<seconds since start>.png every that many seconds.
 void write_png(const char *path, const uint8_t *rgb, uint32_t w, uint32_t h) {
     static uint32_t crc_table[256] = {};
@@ -3026,7 +3026,7 @@ void write_png(const char *path, const uint8_t *rgb, uint32_t w, uint32_t h) {
 }
 
 void maybe_screenshot() {
-    static const double interval = getenv("KZ2_SCREENSHOT") ? atof(getenv("KZ2_SCREENSHOT")) : 0;
+    static const double interval = getenv("HELSARI_SCREENSHOT") ? atof(getenv("HELSARI_SCREENSHOT")) : 0;
     static const ULONGLONG t0 = GetTickCount64();
     static double next = interval;
     if (interval <= 0) return;
@@ -3100,7 +3100,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         g_vs_dumped.clear();
         LOG("rsx", "capture: logging draws of frame %u, dumping its surfaces at the end", g_frame);
     }
-    static const bool trace_draws = getenv("KZ2_TRACE_DRAWS") != nullptr;
+    static const bool trace_draws = getenv("HELSARI_TRACE_DRAWS") != nullptr;
     if (trace_draws && g_frame % 60 == 0) LOG("rsx", "frame %u: %d draws", g_frame, g_draws_this_frame);
     g_draws_this_frame = 0;
     if (g_scene_draws) {
@@ -3112,7 +3112,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     // those unused for 10 s (time, not frames: at low frame rates 600 frames is minutes).
     static const auto t_start = std::chrono::steady_clock::now();
     g_flip_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-    if (getenv("KZ2_LEAK_BISECT")) {
+    if (getenv("HELSARI_LEAK_BISECT")) {
         static double last_log = 0;
         if (g_flip_time - last_log >= 1) {
             last_log = g_flip_time;
@@ -3282,7 +3282,7 @@ void method(uint32_t m, uint32_t arg) {
     }
     case 0x1800: {   // GET_REPORT: arg = type << 24 | offset; writes {u64 timer, u32 value, u32 0}
         // Occlusion queries (type 1, ZPASS_PIXEL_CNT) are answered "visible" for now
-        // (KZ2_REPORT_ZERO=1 answers 0 instead): unanswered, the game culled objects and
+        // (HELSARI_REPORT_ZERO=1 answers 0 instead): unanswered, the game culled objects and
         // lights from whatever stale memory held. Report area: RSX local memory
         // + 0x0e000000 (context 0x66626660) or io-mapped main memory.
         uint32_t type = arg >> 24, off = arg & 0xffffff, ctx = reg(0x01a8);
@@ -3290,8 +3290,8 @@ void method(uint32_t m, uint32_t arg) {
         static int logs;
         if (logs++ < 24) LOG("rsx", "GET_REPORT type %u offset 0x%x (dma ctx 0x%08x) -> ea 0x%x", type, off, ctx, ea);
         if (!ea) break;
-        static const bool zero = getenv("KZ2_REPORT_ZERO") != nullptr;
-        static const bool visible = getenv("KZ2_REPORT_VISIBLE") && atoi(getenv("KZ2_REPORT_VISIBLE"));
+        static const bool zero = getenv("HELSARI_REPORT_ZERO") != nullptr;
+        static const bool visible = getenv("HELSARI_REPORT_VISIBLE") && atoi(getenv("HELSARI_REPORT_VISIBLE"));
         if (type == 1 && g_ok && !zero && !visible) {
             occ_end_active();   // close the current stretch; counting continues in a new one
             PendingReport r{ea, g_occ_since_clear};

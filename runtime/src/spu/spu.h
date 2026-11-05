@@ -85,7 +85,7 @@ struct SpuThread {
     uint32_t history[64] = {};             // recently executed PCs, for crash dumps
     uint32_t history_pos = 0;
     void dump_history();
-    int64_t traced = 0;                      // instructions logged so far (KZ2_SPU_TRACE)
+    int64_t traced = 0;                      // instructions logged so far (HELSARI_SPU_TRACE)
 
     // MFC command parameters (channels 16-21)
     uint32_t mfc_lsa = 0, mfc_eah = 0, mfc_eal = 0, mfc_size = 0, mfc_tag = 0;
@@ -175,9 +175,9 @@ struct SpuThread {
     const NativeModule *recent[8] = {};
     // A DMA bringing bytes LS already holds over mapped code (job managers re-send the
     // same job binary before every run): nothing changes, so the mapping stays.
-    // Saves an unmap, an image match and a remap per job. KZ2_SPU_RELOAD_CHECK=0: off.
+    // Saves an unmap, an image match and a remap per job. HELSARI_SPU_RELOAD_CHECK=0: off.
     bool same_code_reload(uint32_t lsa, const void *src, uint32_t size, uint32_t ea = 0) {
-        static const bool on = [] { const char *e = getenv("KZ2_SPU_RELOAD_CHECK"); return !e || atoi(e) != 0; }();
+        static const bool on = [] { const char *e = getenv("HELSARI_SPU_RELOAD_CHECK"); return !e || atoi(e) != 0; }();
         if (!on || !size || lsa + size > LS_SIZE) return false;
         // An EBOOT job still mapped where it is being loaded again: the source is the game's
         // read-only image, and any write to that LS range would have unmapped it. Same bytes,

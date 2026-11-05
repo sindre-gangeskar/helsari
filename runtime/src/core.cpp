@@ -24,7 +24,7 @@ void log_msg(const char *chan, const char *fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     std::lock_guard<std::mutex> lk(g_log_lock);
-    if (!g_log_file) g_log_file = fopen("kz2.log", "w");
+    if (!g_log_file) g_log_file = fopen("helsari.log", "w");
     unsigned tid = thread::current_id();
     fprintf(stdout, "[%s] t%u: %s\n", chan, tid, buf);
     if (g_log_file) { fprintf(g_log_file, "[%s] t%u: %s\n", chan, tid, buf); fflush(g_log_file); }
@@ -49,19 +49,19 @@ void host_sleep_us(uint32_t us) {
     WaitForSingleObject(timer, INFINITE);
 }
 
-// Fast wake (default; KZ2_FAST_WAKE=0 off): no sleeps longer than 50 us in wait loops, and the
+// Fast wake (default; HELSARI_FAST_WAKE=0 off): no sleeps longer than 50 us in wait loops, and the
 // SPURS ready monitor polls every 100 us - tests whether frames are bound by how
 // quickly waiting threads notice work, rather than by the work itself.
 bool fast_wake() {
-    // Default on: frames are latency-bound by SPU/PPU hand-offs (KZ2_FAST_WAKE=0: off).
-    static const bool on = !getenv("KZ2_FAST_WAKE") || atoi(getenv("KZ2_FAST_WAKE"));
+    // Default on: frames are latency-bound by SPU/PPU hand-offs (HELSARI_FAST_WAKE=0: off).
+    static const bool on = !getenv("HELSARI_FAST_WAKE") || atoi(getenv("HELSARI_FAST_WAKE"));
     return on;
 }
 
 thread_local uint64_t t_backoff_ns;   // time this thread spent in host_backoff sleeps (workload stats)
 uint64_t take_backoff_ns() { uint64_t v = t_backoff_ns; t_backoff_ns = 0; return v; }
 
-// KZ2_SPIN=<n>: polls before sleeping (default 256: 128 pauses, then 128 yields). The
+// HELSARI_SPIN=<n>: polls before sleeping (default 256: 128 pauses, then 128 yields). The
 // spin phases cost CPU (heat), but 64 dropped the frame rate from 30 to ~20.
 void process_cpu_ms(double *kernel, double *user) {
     FILETIME c, e, k, u;
@@ -75,7 +75,7 @@ void idle_poll_stats(uint64_t *poll_ns, uint64_t *pauses, uint64_t *yields, uint
     *poll_ns = g_idle_poll_ns.load(), *pauses = g_bo_pause.load(), *yields = g_bo_yield.load(), *sleeps = g_bo_sleep.load();
 }
 void host_backoff(uint32_t n) {
-    static const uint32_t spin = [] { const char *e = getenv("KZ2_SPIN"); return e ? (uint32_t)atoi(e) : 256u; }();
+    static const uint32_t spin = [] { const char *e = getenv("HELSARI_SPIN"); return e ? (uint32_t)atoi(e) : 256u; }();
     if (n < spin / 2) {                          // a few hundred ns: the other side is about to answer
         g_bo_pause.fetch_add(1, std::memory_order_relaxed);
         YieldProcessor();
@@ -120,8 +120,8 @@ static void backtrace(PPUContext *ctx) {
     log_msg("FATAL", "r3=0x%llx r4=0x%llx r5=0x%llx r11=0x%llx r13=0x%llx r31=0x%llx",
             (unsigned long long)ctx->r[3], (unsigned long long)ctx->r[4], (unsigned long long)ctx->r[5],
             (unsigned long long)ctx->r[11], (unsigned long long)ctx->r[13], (unsigned long long)ctx->r[31]);
-    // KZ2_FATAL_PEEK=addr,addr,...: words to show; rN+off / rN-off are register-relative (e.g. r13-28068)
-    if (const char *p = getenv("KZ2_FATAL_PEEK")) {
+    // HELSARI_FATAL_PEEK=addr,addr,...: words to show; rN+off / rN-off are register-relative (e.g. r13-28068)
+    if (const char *p = getenv("HELSARI_FATAL_PEEK")) {
         std::string list = p;
         size_t i = 0;
         while (i < list.size()) {
@@ -198,12 +198,12 @@ extern "C" void ppu_trap(PPUContext *ctx, uint32_t addr) {
     if (n++ < 50) LOG("ppu", "trap instruction hit at 0x%08x (lr=0x%llx) - continuing", addr, (unsigned long long)ctx->lr);
 }
 
-// Who reads the clock (KZ2_TB_SITES=1): calls per host return address, reported
+// Who reads the clock (HELSARI_TB_SITES=1): calls per host return address, reported
 // in the flip log (tb_report) - finds the game's frame timer among 842 read sites.
 namespace {
 std::mutex g_tb_lock;
 std::map<uintptr_t, uint64_t> g_tb_sites;
-const bool g_tb_on = getenv("KZ2_TB_SITES") && atoi(getenv("KZ2_TB_SITES"));
+const bool g_tb_on = getenv("HELSARI_TB_SITES") && atoi(getenv("HELSARI_TB_SITES"));
 }
 std::string tb_report(double frames) {
     if (!g_tb_on) return "";
@@ -330,7 +330,7 @@ bool hle_dispatch(PPUContext *ctx, uint32_t addr) {
     const ImportEntry &im = g_imports[i];
     int n = (*g_hle_calls)[i]++;
     if (g_hle[i]) {
-        static const bool trace_hle = getenv("KZ2_TRACE_HLE") != nullptr;
+        static const bool trace_hle = getenv("HELSARI_TRACE_HLE") != nullptr;
         if (trace_hle && n < 20)
             LOG("hle", "%s(%llx, %llx, %llx, %llx)", im.name, ARG(0), ARG(1), ARG(2), ARG(3));
         thread::note_call(im.name, ctx, true);

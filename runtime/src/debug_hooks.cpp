@@ -10,11 +10,11 @@
 extern "C" void f_00a4a99c_guest(PPU_CTX);
 void edge_zlib_explain(uint32_t ea, uint32_t size);
 
-// KZ2_HOOK_WATCH="ea:len,ea:len": hooks and host writers log only what overlaps.
+// HELSARI_HOOK_WATCH="ea:len,ea:len": hooks and host writers log only what overlaps.
 bool mem::hook_watched(uint32_t ea, uint32_t size) {
     static const std::vector<std::pair<uint32_t, uint32_t>> ranges = [] {
         std::vector<std::pair<uint32_t, uint32_t>> r;
-        if (const char *p = getenv("KZ2_HOOK_WATCH"))
+        if (const char *p = getenv("HELSARI_HOOK_WATCH"))
             for (const char *s = p; *s;) {
                 char *end;
                 uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 4;
@@ -48,11 +48,11 @@ std::string hex(uint32_t ea, int bytes) {
 extern "C" void f_00a4a99c(PPU_CTX) {
     uint32_t dst = (uint32_t)ctx->r[4], size = (uint32_t)ctx->r[5];
     if (mem::hook_watched(dst, size)) {
-        // KZ2_WATCH_WRITE_LATE="ea:len,...": write watches armed only once a watched
+        // HELSARI_WATCH_WRITE_LATE="ea:len,...": write watches armed only once a watched
         // asset is read (e.g. after level load), so earlier traffic does not fill the log.
         static std::once_flag late;
         std::call_once(late, [] {
-            if (const char *p = getenv("KZ2_WATCH_WRITE_LATE"))
+            if (const char *p = getenv("HELSARI_WATCH_WRITE_LATE"))
                 for (const char *s = p; *s;) {
                     char *e;
                     uint32_t a = strtoul(s, &e, 16), n = *e == ':' ? strtoul(e + 1, &e, 16) : 4;

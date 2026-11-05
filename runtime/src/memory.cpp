@@ -50,7 +50,7 @@ uint32_t g_mmap_next = MMAP_BASE;
 int g_fault_logs;
 
 // "module+offset" for each of the first few host frames of a fault context,
-// so a fault inside a system DLL (memcpy) still names its caller in kz2.exe.
+// so a fault inside a system DLL (memcpy) still names its caller in helsari2.exe.
 std::string host_backtrace(const CONTEXT *ctx) {
     CONTEXT c = *ctx;
     std::string out;
@@ -78,7 +78,7 @@ std::string host_backtrace(const CONTEXT *ctx) {
     return out;
 }
 
-// KZ2_WATCH_WRITE="ea:len,..." finds who writes guest memory: the host pages
+// HELSARI_WATCH_WRITE="ea:len,..." finds who writes guest memory: the host pages
 // are made read-only once committed, a write faults here and is logged with a
 // host backtrace (generated f_XXXXXXXX functions or runtime code), then the
 // page is made writable and re-armed shortly after by watch_thread.
@@ -149,7 +149,7 @@ bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
         uint32_t ea = (uint32_t)(addr - g_mem);
         if (in_watch_range(ea, 16) && g_watch_logs < 300) {
             // The report is logged after the store (on_fault, single step), and only if
-            // the word written matches KZ2_WATCH_VALUE when that is set.
+            // the word written matches HELSARI_WATCH_VALUE when that is set.
             t_step_logged = ea & ~3u;
             PPUContext *ctx = thread::current();
             char line[512];
@@ -179,7 +179,7 @@ bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
                     snprintf(line, sizeof line, "  r%d=0x%x%s%s\n", r, v, ptr ? ":" : "", ptr ? hex(v & ~3u).c_str() : "");
                     t_step_report += line;
                 }
-                if (const char *e = getenv("KZ2_WATCH_PEEK")) {   // "reg:off,..." dumps [r<reg>+off]
+                if (const char *e = getenv("HELSARI_WATCH_PEEK")) {   // "reg:off,..." dumps [r<reg>+off]
                     for (const char *s = e; *s;) {
                         char *end;
                         int r = (int)strtol(s, &end, 10);
@@ -211,7 +211,7 @@ bool watch_fault(EXCEPTION_POINTERS *ep, uint8_t *addr) {
 namespace {
 constexpr uint32_t TRACK_PAGES = LOCAL_SIZE >> 12;
 std::atomic<uint8_t> g_armed[TRACK_PAGES];   // 1: read-only, not written since armed
-const bool g_track_on = [] { const char *e = getenv("KZ2_TEX_TRACK"); return !e || atoi(e) != 0; }();
+const bool g_track_on = [] { const char *e = getenv("HELSARI_TEX_TRACK"); return !e || atoi(e) != 0; }();
 bool track_range(uint32_t ea, uint32_t size, uint32_t &p0, uint32_t &p1) {
     if (!size || ea < LOCAL_BASE || ea - LOCAL_BASE >= LOCAL_SIZE) return false;
     uint64_t end = std::min<uint64_t>((uint64_t)ea + size, (uint64_t)LOCAL_BASE + LOCAL_SIZE);
@@ -306,7 +306,7 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {
             uint32_t v;
             memcpy(&v, g_mem + t_step_logged, 4);
             v = __builtin_bswap32(v);
-            static const char *want = getenv("KZ2_WATCH_VALUE");
+            static const char *want = getenv("HELSARI_WATCH_VALUE");
             if ((!want || v == strtoul(want, nullptr, 16)) && g_watch_logs++ < 300)
                 LOG("mem", "%s  -> 0x%x now 0x%08x", t_step_report.c_str(), t_step_logged, v);
             t_step_logged = 0;
@@ -373,7 +373,7 @@ void init() {
     if (!g_mem) fatal("could not reserve 4 GiB of address space for guest memory");
     AddVectoredExceptionHandler(1, on_fault);
     g_free[USER_BASE] = USER_SIZE;
-    if (const char *p = getenv("KZ2_WATCH_WRITE")) {
+    if (const char *p = getenv("HELSARI_WATCH_WRITE")) {
         for (const char *s = p; *s;) {
             char *end;
             uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 4;
@@ -383,7 +383,7 @@ void init() {
     }
 }
 
-// Starts logging writes to [ea, ea+size) from now on (see KZ2_WATCH_WRITE).
+// Starts logging writes to [ea, ea+size) from now on (see HELSARI_WATCH_WRITE).
 void watch_add(uint32_t ea, uint32_t size) {
     std::lock_guard<std::mutex> lk(g_watch_add_lock);
     static std::once_flag started;

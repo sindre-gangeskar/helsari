@@ -94,9 +94,9 @@ std::string host_path(const std::string &p) {
 
 // Movies need cellVdec/cellAdec, which are stubs: hide them so the game
 // skips playback instead of waiting forever for decoded frames.
-// KZ2_PLAY_MOVIES=1 opens them anyway.
+// HELSARI_PLAY_MOVIES=1 opens them anyway.
 bool hidden_movie(const std::string &path) {
-    static bool play = getenv("KZ2_PLAY_MOVIES") != nullptr;
+    static bool play = getenv("HELSARI_PLAY_MOVIES") != nullptr;
     return !play && path.find("/MOVIES/") != std::string::npos;
 }
 

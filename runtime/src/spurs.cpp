@@ -43,7 +43,7 @@ void flag_set(uint32_t ef, uint16_t bits) {
     __atomic_fetch_or(flag_word(ef), __builtin_bswap32((uint32_t)bits << 16), __ATOMIC_SEQ_CST);
 }
 
-// Debug (with KZ2_HOOK_WATCH): the last output of every Edge Zlib request by
+// Debug (with HELSARI_HOOK_WATCH): the last output of every Edge Zlib request by
 // destination, so a later reader of a buffer can tell whether it still holds
 // what was written (edge_zlib_explain), and a copy whether its source still
 // holds what the inflate produced.
@@ -51,7 +51,7 @@ struct Snap { uint32_t src = 0, size = 0; bool inflate = false; uint32_t caller 
 std::mutex g_snap_lock;
 std::map<uint32_t, Snap> g_snaps;
 std::atomic<uint64_t> g_snap_seq{0};
-const bool g_snap_on = getenv("KZ2_HOOK_WATCH") != nullptr;
+const bool g_snap_on = getenv("HELSARI_HOOK_WATCH") != nullptr;
 
 // First offset in [0, n) where guest memory at ea differs from want, or -1.
 long first_diff(uint32_t ea, const uint8_t *want, uint32_t n) {
@@ -73,9 +73,9 @@ void edge_zlib(uint32_t e) {
     if (outv & 1) {
         n = inflate_raw((const uint8_t *)mem::ptr(src), csize, (uint8_t *)mem::ptr(dst), usize);
         if (n < 0) LOG("spurs", "edge zlib: corrupt stream src=0x%x csize=%u usize=%u", src, csize, usize);
-        // KZ2_DUMP_INFLATE: save input/output of blocks whose output has a long zero run, to check
+        // HELSARI_DUMP_INFLATE: save input/output of blocks whose output has a long zero run, to check
         // the decoder against a reference (zlib) offline.
-        static const bool dump = getenv("KZ2_DUMP_INFLATE") != nullptr;
+        static const bool dump = getenv("HELSARI_DUMP_INFLATE") != nullptr;
         static std::atomic<int> dumps{0};
         if (dump && n > 0 && dumps < 40) {
             const uint8_t *o = (const uint8_t *)mem::ptr(dst);
@@ -106,9 +106,9 @@ void edge_zlib(uint32_t e) {
         memmove(mem::ptr(dst), mem::ptr(src), csize);
         n = csize;
     }
-    // KZ2_WATCH_ZLIB_COPY=<first word>:<offset>:<len>: when a copy writes a block that
+    // HELSARI_WATCH_ZLIB_COPY=<first word>:<offset>:<len>: when a copy writes a block that
     // starts with that word, watch [offset, offset+len) of its output for later writes.
-    static const char *wzc = getenv("KZ2_WATCH_ZLIB_COPY");
+    static const char *wzc = getenv("HELSARI_WATCH_ZLIB_COPY");
     if (wzc && !(outv & 1) && n > 0) {
         uint32_t word = 0, off = 0, len = 0;
         sscanf(wzc, "%x:%x:%x", &word, &off, &len);

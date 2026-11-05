@@ -44,7 +44,7 @@ winget install Python.Python.3.13 Kitware.CMake Ninja-build.Ninja
 winget install Microsoft.VisualStudio.BuildTools --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --add Microsoft.VisualStudio.Component.Windows11SDK.26100"
 set LLVM=C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/Llvm/x64/bin
 cmake -B build -G Ninja "-DCMAKE_C_COMPILER=%LLVM%/clang.exe" "-DCMAKE_CXX_COMPILER=%LLVM%/clang++.exe" ^
-      -DKZ2_DUMP="E:/PS3 Dumps/_BCES00081-[Killzone2]" -DRPCS3_EXE="E:/RPCS3/rpcs3.exe"
+      -DHELSARI_DUMP="E:/PS3 Dumps/YourDump" -DRPCS3_EXE="E:/RPCS3/rpcs3.exe"
 ninja -C build
 build\helsari2.exe
 ```
@@ -72,7 +72,7 @@ pose smoothly, which removes the 15 Hz steps, and its sway is the same size at a
 pitch. **Options > Gameplay > Viewmodel Sway Multiplier** sets how much sway there
 is (0.25x to 2x).
 
-`KZ2_MOUSE_SENS=<n>` sets the sensitivity, and `KZ2_MOUSE_OFF=1` turns all of this off.
+`HELSARI_MOUSE_SENS=<n>` sets the sensitivity, and `HELSARI_MOUSE_OFF=1` turns all of this off.
 
 ## Debugging
 
@@ -88,19 +88,19 @@ Environment variables:
 
 | Variable                             | Effect                                                                                          |
 | ------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| `KZ2_WATCHDOG=<sec>`                 | Periodically print every guest thread's current OS call and an RSX method histogram             |
-| `KZ2_PROFILE=<sec>`                  | Sample all threads: CPU time per thread and hot spots (`KZ2_PROFILE_THREADS=name,...` for more) |
-| `KZ2_TRACE_HLE=1`, `KZ2_TRACE_RSX=1` | Log the first calls of every implemented import / the start of the RSX command stream           |
-| `KZ2_DUMP_FRAME=N`, `KZ2_DUMP_RT=N`  | Write every RSX method of frame N to `frame.txt` / save its render targets                      |
-| `KZ2_DUMP_SHADERS=1`                 | Write all generated HLSL to `shaders/` (failed compiles are always written)                     |
-| `KZ2_LOG_DRAWS=N`, `KZ2_LOG_ATTRS=d` | Per-draw state for frame N; vertex attributes and textures of draw d                            |
-| `KZ2_SKIP_DRAWS=a,b`                 | Skip draw indices (bisecting rendering bugs)                                                    |
-| `KZ2_SPU_NATIVE=0`                   | Run all SPU code in the interpreter                                                             |
-| `KZ2_DEBUG_PS=<hash>`, `KZ2_DEBUG_EXPR` | Replace one pixel shader's output with an HLSL expression                                    |
-| `KZ2_FP_WORDS=1`                     | Put raw fragment program words into the generated HLSL                                          |
+| `HELSARI_WATCHDOG=<sec>`                 | Periodically print every guest thread's current OS call and an RSX method histogram             |
+| `HELSARI_PROFILE=<sec>`                  | Sample all threads: CPU time per thread and hot spots (`HELSARI_PROFILE_THREADS=name,...` for more) |
+| `HELSARI_TRACE_HLE=1`, `HELSARI_TRACE_RSX=1` | Log the first calls of every implemented import / the start of the RSX command stream           |
+| `HELSARI_DUMP_FRAME=N`, `HELSARI_DUMP_RT=N`  | Write every RSX method of frame N to `frame.txt` / save its render targets                      |
+| `HELSARI_DUMP_SHADERS=1`                 | Write all generated HLSL to `shaders/` (failed compiles are always written)                     |
+| `HELSARI_LOG_DRAWS=N`, `HELSARI_LOG_ATTRS=d` | Per-draw state for frame N; vertex attributes and textures of draw d                            |
+| `HELSARI_SKIP_DRAWS=a,b`                 | Skip draw indices (bisecting rendering bugs)                                                    |
+| `HELSARI_SPU_NATIVE=0`                   | Run all SPU code in the interpreter                                                             |
+| `HELSARI_DEBUG_PS=<hash>`, `HELSARI_DEBUG_EXPR` | Replace one pixel shader's output with an HLSL expression                                    |
+| `HELSARI_FP_WORDS=1`                     | Put raw fragment program words into the generated HLSL                                          |
 
 Most rendering and performance changes also have a switch to turn them off for
-comparison (e.g. `KZ2_CPU_VERTEX`, `KZ2_NO_SHADER_CACHE`, `KZ2_NO_MIPS`); they
+comparison (e.g. `HELSARI_CPU_VERTEX`, `HELSARI_NO_SHADER_CACHE`, `HELSARI_NO_MIPS`); they
 are documented where they are read in `runtime/src`.
 
 ## How it works

@@ -2,7 +2,7 @@
 // look code reaches the screen late and blended. With the mouse, on foot, the player's rotation
 // (entity matrices, controller pitch) is written every rendered frame instead, and the view is
 // corrected to match. Using a controller hands everything back to the game until the mouse moves.
-// The viewmodel has its own part of this in rsx/d3d.cpp. KZ2_MOUSE_OFF: the hooks only pass through.
+// The viewmodel has its own part of this in rsx/d3d.cpp. HELSARI_MOUSE_OFF: the hooks only pass through.
 #include "keybinds.h"
 
 #include "runtime.h"
@@ -42,7 +42,7 @@ namespace
     constexpr uint64_t NEW_PLAYER_NS = 1500000000ull;  // how long a respawn may correct the view
     constexpr uint64_t TURNING_NS = 60000000ull; // a few frames: the mouse does not report on every one
 
-    const bool g_mouse_off = getenv("KZ2_MOUSE_OFF") != nullptr;
+    const bool g_mouse_off = getenv("HELSARI_MOUSE_OFF") != nullptr;
     std::atomic<int> g_dx{0}, g_dy{0};
     std::atomic<bool> g_captured{false};
     float g_sensitivity = 1.0f;
@@ -61,6 +61,13 @@ namespace
     float g_target_yaw, g_target_pitch; // where the mouse says the view points
     std::atomic<uint64_t> g_new_player_ns{0}; // when a tick first saw a new player, or one back on foot
     float g_pending_yaw, g_pending_pitch;     // turns made while the player could not be written
+    // The mouse in menus: the system's cursor, free, while a page updates and the player does not.
+    HWND g_window;
+    std::atomic<uint64_t> g_menu_ns{0};
+    std::atomic<bool> g_menu_left{false};
+    std::atomic<uint64_t> g_press_cross_until{0}, g_press_circle_until{0}, g_press_up_until{0}, g_press_down_until{0};
+    constexpr uint64_t MENU_PRESS_NS = 80000000ull; // a few pad reads
+    constexpr uint64_t MENU_STEP_NS = 45000000ull;  // one up or down, with a release before the next
     float g_weapon_view_yaw, g_weapon_view_pitch; // the weapon_view's last turn, for captures
 
     bool on_foot(uint64_t now) { return now - g_last_onfoot_ns.load(std::memory_order_relaxed) < ON_FOOT_NS; }
@@ -207,8 +214,8 @@ namespace
         }
         rotate_xy(ctl + 88, c, s);
         // The points ahead of the player turn about its position (entity+832), and only when they are as
-        // far from it as they should be: 30 units. KZ2_NO_ROTATE_AIM=1 leaves them alone.
-        static const bool rotate_aim = getenv("KZ2_NO_ROTATE_AIM") == nullptr;
+        // far from it as they should be: 30 units. HELSARI_NO_ROTATE_AIM=1 leaves them alone.
+        static const bool rotate_aim = getenv("HELSARI_NO_ROTATE_AIM") == nullptr;
         if (rotate_aim)
         {
             const float px = guest_float(e + 832), py = guest_float(e + 836);
@@ -302,8 +309,8 @@ namespace
             return;
         }
         const float yaw = atan2f(ay, ax), pitch = asinf(az < -1.f ? -1.f : az > 1.f ? 1.f : az);
-        { // KZ2_LOOK_LOG: whenever the view and the player are apart, up to ten times a second.
-            static const bool gap_log = getenv("KZ2_LOOK_LOG") != nullptr;
+        { // HELSARI_LOOK_LOG: whenever the view and the player are apart, up to ten times a second.
+            static const bool gap_log = getenv("HELSARI_LOOK_LOG") != nullptr;
             static uint64_t last_gap_log;
             const uint32_t player = g_look_entity.load(std::memory_order_relaxed);
             if (gap_log && player && now - last_gap_log > 100000000ull)
@@ -327,8 +334,8 @@ namespace
             const float sign_x = profile && ld8(profile + PROFILE_INVERT_Y) ? -1.f : 1.f;
             const bool resting = now - g_last_move_ns.load(std::memory_order_relaxed) > REST_NS;
             // What turned the player since our last look at it was the game: a melee hit, a stagger. The
-            // view turns with it, on top of the mouse. KZ2_NO_GAME_TURNS=1: the view ignores them.
-            static const bool game_turns = getenv("KZ2_NO_GAME_TURNS") == nullptr;
+            // view turns with it, on top of the mouse. HELSARI_NO_GAME_TURNS=1: the view ignores them.
+            static const bool game_turns = getenv("HELSARI_NO_GAME_TURNS") == nullptr;
             static uint32_t seen_player;
             static float seen_heading, seen_pitch;
             const uint32_t player = g_look_entity.load(std::memory_order_relaxed), controller = g_look_controller.load(std::memory_order_relaxed);
@@ -432,9 +439,52 @@ namespace
     }
 } // namespace
 
+bool mouse_in_play();
+
+// A page's script updates: the cursor is free unless the player is in play. False while in play.
+bool mouse_menu_update()
+{
+    if (mouse_in_play())
+        return false;
+    g_menu_ns = host_now_ns();
+    if (g_captured && g_window && GetForegroundWindow() == g_window)
+        update_capture(g_window, false);
+    return !g_captured;
+}
+
+// Where the cursor is, in the game's 1280x720, and whether it moved since the last call.
+bool mouse_menu_point(int &x, int &y)
+{
+    POINT p{};
+    RECT r{};
+    GetCursorPos(&p);
+    ScreenToClient(g_window, &p);
+    GetClientRect(g_window, &r);
+    const int w = r.right > 0 ? r.right : 1, h = r.bottom > 0 ? r.bottom : 1;
+    x = p.x * 1280 / w, y = p.y * 720 / h;
+    static int last_x = -1, last_y = -1;
+    const bool moved = x != last_x || y != last_y;
+    last_x = x, last_y = y;
+    return moved;
+}
+
+bool mouse_menu_clicked() { return g_menu_left.exchange(false); }
+void mouse_menu_press(bool accept) { (accept ? g_press_cross_until : g_press_circle_until) = host_now_ns() + MENU_PRESS_NS; }
+void mouse_menu_step(bool down) { (down ? g_press_down_until : g_press_up_until) = host_now_ns() + MENU_STEP_NS; }
+bool mouse_menu_pressing()
+{
+    const uint64_t now = host_now_ns();
+    return now < g_press_cross_until.load() || now < g_press_circle_until.load() || now < g_press_up_until.load() || now < g_press_down_until.load();
+}
+bool mouse_menu_up() { return host_now_ns() < g_press_up_until.load(); }
+bool mouse_menu_down() { return host_now_ns() < g_press_down_until.load(); }
+bool mouse_menu_cross() { return host_now_ns() < g_press_cross_until.load(); }
+bool mouse_menu_circle() { return host_now_ns() < g_press_circle_until.load(); }
+
 void mouse_start(HWND h)
 {
-    if (const char *e = getenv("KZ2_MOUSE_SENS"))
+    g_window = h;
+    if (const char *e = getenv("HELSARI_MOUSE_SENS"))
         g_sensitivity = (float)atof(e);
     RAWINPUTDEVICE d{};
     d.usUsagePage = 1, d.usUsage = 2, d.hwndTarget = h; // generic desktop, mouse
@@ -479,12 +529,25 @@ bool mouse_message(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *result)
             update_capture(h, true);
         return false;
     case WM_SETCURSOR:
-        if (g_captured && LOWORD(l) == HTCLIENT)
+        if (LOWORD(l) == HTCLIENT)
         {
-            SetCursor(nullptr);
+            SetCursor(g_captured ? nullptr : LoadCursor(nullptr, IDC_ARROW));
             *result = TRUE;
             return true;
         }
+        return false;
+    case WM_LBUTTONDOWN:
+        if (!g_captured)
+            g_menu_left = true;
+        return false;
+    case WM_RBUTTONDOWN:
+        if (!g_captured)
+            g_press_circle_until = host_now_ns() + MENU_PRESS_NS;
+        return false;
+    case WM_MOUSEMOVE:
+        // No page has updated for a while (a cutscene, a loading screen): the cursor goes away again.
+        if (!g_captured && GetForegroundWindow() == h && host_now_ns() - g_menu_ns.load(std::memory_order_relaxed) > 500000000ull)
+            update_capture(h, true);
         return false;
     }
     return false;
@@ -500,8 +563,8 @@ extern "C" void f_00080a78(PPU_CTX)
     const uint32_t out_y = (uint32_t)ctx->r[4], out_x = (uint32_t)ctx->r[5];
     const uint32_t lr = (uint32_t)ctx->lr;
     g_last_look_ns = host_now_ns();
-    { // KZ2_LOOK_LOG: once a second, which callers run the look code and where the player points.
-        static const bool look_log = getenv("KZ2_LOOK_LOG") != nullptr;
+    { // HELSARI_LOOK_LOG: once a second, which callers run the look code and where the player points.
+        static const bool look_log = getenv("HELSARI_LOOK_LOG") != nullptr;
         static uint32_t callers[4];
         static uint64_t last_log;
         if (look_log)
@@ -533,6 +596,8 @@ extern "C" void f_00080a78(PPU_CTX)
     }
     if (lr == LOOK_ON_FOOT) // its registers still hold the player and its controller
     {
+        if (!g_captured && g_window && GetForegroundWindow() == g_window) // back in play from a menu
+            update_capture(g_window, true);
         if (g_look_entity.load(std::memory_order_relaxed) != (uint32_t)ctx->r[30] ||
             host_now_ns() - g_last_onfoot_ns.load(std::memory_order_relaxed) > 500000000ull)
         {

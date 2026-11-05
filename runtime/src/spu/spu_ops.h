@@ -256,7 +256,7 @@ inline float ftz(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::cop
 // SPU single precision has no infinities or NaNs: exponent 255 is an ordinary (huge)
 // number, and results saturate at the largest magnitude instead of overflowing. Code
 // relies on it - e.g. 1/0 followed by huge * 0 = 0 - where IEEE gives inf * 0 = NaN,
-// which the final float->int conversion turned into 0 (Killzone 2's per-object
+// which the final float->int conversion turned into 0 (the game's per-object
 // lighting probes came out black). spf: an operand; spr: a result.
 inline float spf(float f) { return std::isfinite(f) ? ftz(f) : std::copysign(FLT_MAX, f); }
 inline float spr(float f) { return std::isfinite(f) ? ftz(f) : std::isnan(f) ? 0.0f : std::copysign(FLT_MAX, f); }

@@ -13,9 +13,9 @@
 #include <vector>
 
 namespace cfg {
-std::string dump_dir = KZ2_DEFAULT_DUMP;
+std::string dump_dir = HELSARI_DEFAULT_DUMP;
 std::string data_dir;
-std::string elf_path = KZ2_DEFAULT_ELF;
+std::string elf_path = HELSARI_DEFAULT_ELF;
 }
 
 void register_sys();
@@ -85,13 +85,13 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
 }
 
 void start_alloc_tracing();
-extern "C" const char kz2_build_stamp[];   // build/kz2_build_stamp.cpp
+extern "C" const char helsari_build_stamp[];   // build/helsari_build_stamp.cpp
 
 int main(int argc, char **argv) {
     // One instance at a time: two would share the save data and fight over input.
-    CreateMutexA(nullptr, FALSE, "Local\\kz2-recomp-instance");
+    CreateMutexA(nullptr, FALSE, "Local\\helsari-instance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        fprintf(stderr, "kz2: another instance is already running\n");
+        fprintf(stderr, "helsari: another instance is already running\n");
         MessageBoxA(nullptr, "Helsari 2 is already running.", "Helsari 2", MB_OK | MB_ICONINFORMATION);
         return 1;
     }
@@ -110,10 +110,10 @@ int main(int argc, char **argv) {
     for (auto *s : {&cfg::dump_dir, &cfg::data_dir})
         for (auto &c : *s) if (c == '\\') c = '/';
     if (!std::filesystem::exists(cfg::dump_dir + "/PS3_GAME/PARAM.SFO"))
-        fatal("Killzone 2 dump not found at '%s' (pass --dump <folder containing PS3_GAME>)", cfg::dump_dir.c_str());
+        fatal("Game dump not found at '%s' (pass --dump <folder containing PS3_GAME>)", cfg::dump_dir.c_str());
     for (const char *d : {"/dev_hdd0/game", "/dev_hdd0/home/00000001/savedata", "/dev_hdd1"})
         std::filesystem::create_directories(cfg::data_dir + d);
-    LOG("main", "build: %s %s, stamp %s", __DATE__, __TIME__, kz2_build_stamp);   // which build wrote this log
+    LOG("main", "build: %s %s, stamp %s", __DATE__, __TIME__, helsari_build_stamp);   // which build wrote this log
     start_alloc_tracing();
     LOG("main", "dump: %s", cfg::dump_dir.c_str());
     LOG("main", "data: %s", cfg::data_dir.c_str());
@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
     st64(av, path);
     st64(av + 8, 0);
     st64(ev, 0);
-    if (const char *w = getenv("KZ2_WATCHDOG")) {
+    if (const char *w = getenv("HELSARI_WATCHDOG")) {
         int secs = atoi(w) > 0 ? atoi(w) : 10;
         std::thread([secs] {
             for (;;) {
@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
 
 // Leak hunting: every allocation of 8 MB or more - C++ new, and VirtualAlloc /
 // HeapAlloc calls made by any loaded DLL (the graphics driver) - is logged with
-// its host call stack ("module+offset", symbolize kz2.exe offsets with llvm-nm), up to 60.
+// its host call stack ("module+offset", symbolize helsari2.exe offsets with llvm-nm), up to 60.
 namespace {
 std::atomic<int> g_big_allocs{0};
 void log_big_alloc(const char *what, size_t n) {
@@ -219,7 +219,7 @@ int patch_imports(void *const *reals, int nreal, void *hook) {
     return patched;
 }
 
-// KZ2_TRACE_BIG_ALLOCS=1: hook the allocators once the graphics driver is loaded.
+// HELSARI_TRACE_BIG_ALLOCS=1: hook the allocators once the graphics driver is loaded.
 void hook_allocators() {
     HMODULE k32 = GetModuleHandleA("kernel32.dll"), kb = GetModuleHandleA("kernelbase.dll");
     void *va[2] = {(void *)GetProcAddress(k32, "VirtualAlloc"), (void *)GetProcAddress(kb, "VirtualAlloc")};
@@ -236,7 +236,7 @@ void hook_allocators() {
 } // namespace
 
 void start_alloc_tracing() {
-    if (!getenv("KZ2_TRACE_BIG_ALLOCS")) return;
+    if (!getenv("HELSARI_TRACE_BIG_ALLOCS")) return;
     std::thread([] { Sleep(15000); hook_allocators(); }).detach();
 }
 

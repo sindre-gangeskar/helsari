@@ -57,9 +57,9 @@ std::map<uint32_t, std::vector<std::shared_ptr<Task>>> g_tasksets;   // taskset 
 std::map<uint32_t, bool> g_shutdown;
 
 // About 78 task log lines per frame, each taking the global log lock and flushing to disk
-// (~0.5 fps at the bridge, and most of the log's size). KZ2_TASK_LOG=1 turns them on.
+// (~0.5 fps at the bridge, and most of the log's size). HELSARI_TASK_LOG=1 turns them on.
 bool task_log() {
-    static const bool on = getenv("KZ2_TASK_LOG") && atoi(getenv("KZ2_TASK_LOG"));
+    static const bool on = getenv("HELSARI_TASK_LOG") && atoi(getenv("HELSARI_TASK_LOG"));
     return on;
 }
 
@@ -108,7 +108,7 @@ void task_thread(std::shared_ptr<Task> tp) {
     Task &t = *tp;
     // A pool worker keeps its SpuThread memory and native table between tasks: about 30 tasks
     // start per frame, and zeroing warm memory is far cheaper than fresh pages from the OS.
-    // A task with spu already set was built by the scheduler (KZ2_TASK_POOL=0 path).
+    // A task with spu already set was built by the scheduler (HELSARI_TASK_POOL=0 path).
     thread_local void *t_mem;
     thread_local std::unique_ptr<spu::NativeFn[]> t_native;
     const bool pooled = !t.spu;
@@ -136,9 +136,9 @@ void task_thread(std::shared_ptr<Task> tp) {
     char buf[32];
     snprintf(buf, sizeof buf, "task %u (ELF 0x%x)", t.id, t.elf);
     s.name = buf;
-    static const bool profiling = getenv("KZ2_PROFILE") != nullptr;
+    static const bool profiling = getenv("HELSARI_PROFILE") != nullptr;
     if (!pooled || profiling) name_host_thread(s.name);
-    if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
+    if (const char *only = getenv("HELSARI_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;
 
     uint32_t entry = load_elf(s, t.elf);
@@ -272,10 +272,10 @@ void scheduler_thread(uint32_t ts) {
             bit_set(ts + TS_READY, id);
             bit_set(ts + TS_RUNNING, id);
             t->started = true;
-            // KZ2_TASK_POOL=0: a new thread and SpuThread per task. KZ2_TASK_POOL_AB=1: alternate
+            // HELSARI_TASK_POOL=0: a new thread and SpuThread per task. HELSARI_TASK_POOL_AB=1: alternate
             // every 8 s, fps per phase in the "delay" log lines.
-            static const bool pool = !getenv("KZ2_TASK_POOL") || atoi(getenv("KZ2_TASK_POOL"));
-            static const bool pool_ab = getenv("KZ2_TASK_POOL_AB") != nullptr;
+            static const bool pool = !getenv("HELSARI_TASK_POOL") || atoi(getenv("HELSARI_TASK_POOL"));
+            static const bool pool_ab = getenv("HELSARI_TASK_POOL_AB") != nullptr;
             if (pool && (!pool_ab || (host_now_ns() / 8000000000ull) % 2 == 1)) {
                 pool_submit(t);
             } else {
@@ -286,9 +286,9 @@ void scheduler_thread(uint32_t ts) {
         // Tasks made ready by SPU code send no wake-up, and a 1 ms poll cost ~3.5 ms per frame at
         // the bridge (37.6 -> 43.5 fps). All task bitsets share the taskset's first line: sleep
         // until it gets a commit. A change since `seen` returns at once, so no wake-up is lost.
-        // KZ2_TASK_WAKE=0: poll only. KZ2_TASK_POLL_AB=1: alternate every 8 s, fps in "delay" lines.
-        static const bool wake = !getenv("KZ2_TASK_WAKE") || atoi(getenv("KZ2_TASK_WAKE"));
-        static const bool ab = getenv("KZ2_TASK_POLL_AB") != nullptr;
+        // HELSARI_TASK_WAKE=0: poll only. HELSARI_TASK_POLL_AB=1: alternate every 8 s, fps in "delay" lines.
+        static const bool wake = !getenv("HELSARI_TASK_WAKE") || atoi(getenv("HELSARI_TASK_WAKE"));
+        static const bool ab = getenv("HELSARI_TASK_POLL_AB") != nullptr;
         if (wake && (!ab || (host_now_ns() / 8000000000ull) % 2 == 1)) {
             lk.unlock();
             line_wait(ts, seen, 1000);

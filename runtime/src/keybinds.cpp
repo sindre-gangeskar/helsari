@@ -19,6 +19,10 @@ extern "C"
     void f_0050a2e8(PPU_CTX);       // adds one character to the text: (text, code)
 }
 bool mouse_in_play();       // mouse.cpp
+bool mouse_menu_cross();    // mouse.cpp: a click in a menu
+bool mouse_menu_circle();
+bool mouse_menu_up();
+bool mouse_menu_down();
 bool mouse_look_active();   // mouse.cpp
 void mouse_note_pc_input(); // mouse.cpp
 
@@ -285,6 +289,14 @@ void keybind_apply(XINPUT_GAMEPAD &g)
         g.wButtons |= XINPUT_GAMEPAD_A;
         return;
     }
+    if (mouse_menu_cross())
+        g.wButtons |= XINPUT_GAMEPAD_A;
+    if (mouse_menu_circle())
+        g.wButtons |= XINPUT_GAMEPAD_B;
+    if (mouse_menu_up())
+        g.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+    if (mouse_menu_down())
+        g.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
     bool any = false;
     const auto press = [&](int vk, WORD bit)
     {

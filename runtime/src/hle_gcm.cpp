@@ -26,11 +26,11 @@
 std::atomic<uint32_t> g_tl_flips{0};
 std::atomic<uint32_t> g_parked_ea{0}; // guest address of the jump the RSX is parked on (0: not parked)
 std::atomic<uint32_t> g_flip_count{0};
-// F9: the SPU post-processing buffers as images, colour and alpha (Killzone 2's addresses),
+// F9: the SPU post-processing buffers as images, colour and alpha (the game's addresses),
 // to see what each stage holds. post_<ea>.bmp, post_<ea>_a.bmp.
 void dump_post_buffers(const char *tag)
 {
-    static const bool on = getenv("KZ2_POST_DUMP") && atoi(getenv("KZ2_POST_DUMP")); // slows the frames it runs in
+    static const bool on = getenv("HELSARI_POST_DUMP") && atoi(getenv("HELSARI_POST_DUMP")); // slows the frames it runs in
     if (!on)
         return;
     static const struct
@@ -108,12 +108,12 @@ void gcm_tl(const char *fmt, ...)
 }
 #define tl gcm_tl
 
-// KZ2_DELAY_CYCLE_US=<us>: which thread limits the frame? Adds that much busy work per frame, in
+// HELSARI_DELAY_CYCLE_US=<us>: which thread limits the frame? Adds that much busy work per frame, in
 // 8 s phases: none, main, rsx, both. A thread on the critical path makes frames that much longer;
 // on any other thread the delay disappears into a wait. Logs the fps of each phase ("delay" lines).
 //
-// KZ2_SLOW="jm_gfx,no name,task": which work holds up the frame? In 8 s phases (none, then each
-// name) SPU threads with that name run KZ2_SLOW_PCT percent slower (default 25): a busy wait in
+// HELSARI_SLOW="jm_gfx,no name,task": which work holds up the frame? In 8 s phases (none, then each
+// name) SPU threads with that name run HELSARI_SLOW_PCT percent slower (default 25): a busy wait in
 // proportion to the compute before each MFC command, so results become visible that much later.
 // If fps falls in step it is on the critical path; if not, speeding it up would gain nothing.
 static const std::vector<std::string> &slow_list()
@@ -121,7 +121,7 @@ static const std::vector<std::string> &slow_list()
     static const std::vector<std::string> list = []
     {
         std::vector<std::string> v;
-        if (const char *e = getenv("KZ2_SLOW"))
+        if (const char *e = getenv("HELSARI_SLOW"))
             for (const char *p = e; *p;)
             {
                 const char *c = strchr(p, ',');
@@ -143,7 +143,7 @@ void slow_work(const char *name, uint64_t ran_ns)
     size_t phase = (size_t)((now / 8000000000ull) % (l.size() + 1));
     if (!phase || !strstr(name, l[phase - 1].c_str()))
         return;
-    static const uint64_t pct = getenv("KZ2_SLOW_PCT") ? (uint64_t)atoi(getenv("KZ2_SLOW_PCT")) : 25;
+    static const uint64_t pct = getenv("HELSARI_SLOW_PCT") ? (uint64_t)atoi(getenv("HELSARI_SLOW_PCT")) : 25;
     for (uint64_t wait = ran_ns * pct / 100; host_now_ns() - now < wait;)
     {
     }
@@ -155,10 +155,10 @@ namespace spu
 
 void frame_delay(int who)
 { // 0 main, 1 rsx (called once per frame by each)
-    static const uint64_t delay_ns = getenv("KZ2_DELAY_CYCLE_US") ? (uint64_t)atoi(getenv("KZ2_DELAY_CYCLE_US")) * 1000 : 0;
-    static const bool ab_pool = getenv("KZ2_TASK_POOL_AB") != nullptr; // see scheduler_thread
+    static const uint64_t delay_ns = getenv("HELSARI_DELAY_CYCLE_US") ? (uint64_t)atoi(getenv("HELSARI_DELAY_CYCLE_US")) * 1000 : 0;
+    static const bool ab_pool = getenv("HELSARI_TASK_POOL_AB") != nullptr; // see scheduler_thread
     static const bool slow = !slow_list().empty();
-    static const bool ab = ab_pool || getenv("KZ2_TASK_POLL_AB");
+    static const bool ab = ab_pool || getenv("HELSARI_TASK_POLL_AB");
     if (!delay_ns && !ab && !slow)
         return;
     static const char *const names[4] = {"none", "main", "rsx", "both"};
@@ -299,12 +299,12 @@ namespace
         WNDCLASSW wc{};
         wc.lpfnWndProc = wndproc;
         wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"kz2recomp";
+        wc.lpszClassName = L"helsari";
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassW(&wc);
         RECT r{0, 0, 1280, 720};
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-        g_hwnd = CreateWindowW(L"kz2recomp", L"Helsari 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
+        g_hwnd = CreateWindowW(L"helsari", L"Helsari 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
                                CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
         pc_options_start();
         mouse_start(g_hwnd);
@@ -397,7 +397,7 @@ namespace
         g_cur_method.store(0xffffffff, std::memory_order_relaxed);
         if (m == GCM_FLIP_METHOD)
         {
-            static int want = getenv("KZ2_DUMP_FRAME") ? atoi(getenv("KZ2_DUMP_FRAME")) : -1;
+            static int want = getenv("HELSARI_DUMP_FRAME") ? atoi(getenv("HELSARI_DUMP_FRAME")) : -1;
             g_frame++;
             if (g_frame_dump)
             {
@@ -483,7 +483,7 @@ namespace
         while (!g_hwnd)
             Sleep(1);
         rsx::init(g_hwnd);
-        int trace = getenv("KZ2_TRACE_RSX") ? 400 : 0;
+        int trace = getenv("HELSARI_TRACE_RSX") ? 400 : 0;
         uint32_t last_put = 0, idle = 0;
         for (;;)
         {
@@ -500,8 +500,8 @@ namespace
                 // Parked: block on the jump word itself; whoever rewrites it wakes us
                 // (gcm_parked_wake). The former 50 us timer sleeps were half a core of kernel time
                 // for a thread doing nothing. The timeout covers writers that do not wake us.
-                // KZ2_RSX_PARK_WAIT=0: timer sleeps.
-                static const bool park_wait = !getenv("KZ2_RSX_PARK_WAIT") || atoi(getenv("KZ2_RSX_PARK_WAIT"));
+                // HELSARI_RSX_PARK_WAIT=0: timer sleeps.
+                static const bool park_wait = !getenv("HELSARI_RSX_PARK_WAIT") || atoi(getenv("HELSARI_RSX_PARK_WAIT"));
                 if (parked && park_wait && idle >= 64)
                 {
                     uint32_t raw = *(volatile uint32_t *)mem::ptr(ea0);
@@ -516,10 +516,10 @@ namespace
                     g_fifo_parked_us += us;
                 continue;
             }
-            // Experiment (KZ2_RSX_RESUME_DELAY_MS): after idling, give in-flight SPU writes
+            // Experiment (HELSARI_RSX_RESUME_DELAY_MS): after idling, give in-flight SPU writes
             // time to land before running the commands just released - tests whether
             // the RSX overtakes data the SPUs write after releasing it.
-            static const int resume_ms = getenv("KZ2_RSX_RESUME_DELAY_MS") ? atoi(getenv("KZ2_RSX_RESUME_DELAY_MS")) : 0;
+            static const int resume_ms = getenv("HELSARI_RSX_RESUME_DELAY_MS") ? atoi(getenv("HELSARI_RSX_RESUME_DELAY_MS")) : 0;
             if (idle && resume_ms > 0)
             {
                 host_sleep_us(resume_ms * 1000);
@@ -566,9 +566,9 @@ namespace
             {
                 uint32_t count = (cmd >> 18) & 0x7ff, m = cmd & 0xfffc;
                 bool noinc = cmd & 0x40000000;
-                // KZ2_TRACE_METHOD=<method>[:value]: where in memory the command words for it are.
-                static const uint32_t tm = getenv("KZ2_TRACE_METHOD") ? strtoul(getenv("KZ2_TRACE_METHOD"), nullptr, 16) : 0;
-                static const char *tv = tm && strchr(getenv("KZ2_TRACE_METHOD"), ':') ? strchr(getenv("KZ2_TRACE_METHOD"), ':') + 1 : nullptr;
+                // HELSARI_TRACE_METHOD=<method>[:value]: where in memory the command words for it are.
+                static const uint32_t tm = getenv("HELSARI_TRACE_METHOD") ? strtoul(getenv("HELSARI_TRACE_METHOD"), nullptr, 16) : 0;
+                static const char *tv = tm && strchr(getenv("HELSARI_TRACE_METHOD"), ':') ? strchr(getenv("HELSARI_TRACE_METHOD"), ':') + 1 : nullptr;
                 static int traced;
                 for (uint32_t i = 0; i < count; i++)
                 {
@@ -583,8 +583,8 @@ namespace
         }
     }
 
-    // KZ2_VBLANK_US=<us> sets the period directly. Default: a 60 fps cap.
-    std::atomic<int> g_vblank_us{getenv("KZ2_VBLANK_US") ? atoi(getenv("KZ2_VBLANK_US")) : 8333};
+    // HELSARI_VBLANK_US=<us> sets the period directly. Default: a 60 fps cap.
+    std::atomic<int> g_vblank_us{getenv("HELSARI_VBLANK_US") ? atoi(getenv("HELSARI_VBLANK_US")) : 8333};
 
     // Runs on a guest thread so handlers can be invoked with a valid context.
     void vblank_loop(PPUContext *ctx)
@@ -595,8 +595,8 @@ namespace
         // A flip is delivered at once when the frame already took two refresh periods: waiting for
         // the next tick idles everything (4 ms per frame on average) and snaps frame times to the
         // 8 ms grid, so saving work often gains nothing. Faster frames still wait: this keeps the
-        // cap. KZ2_VBLANK_ON_FLIP=0: flips only on ticks.
-        static const bool on_flip = !getenv("KZ2_VBLANK_ON_FLIP") || atoi(getenv("KZ2_VBLANK_ON_FLIP"));
+        // cap. HELSARI_VBLANK_ON_FLIP=0: flips only on ticks.
+        static const bool on_flip = !getenv("HELSARI_VBLANK_ON_FLIP") || atoi(getenv("HELSARI_VBLANK_ON_FLIP"));
         for (;;)
         {
             // The emulated refresh period. The game waits for two per frame, so this sets its frame
@@ -724,8 +724,8 @@ void rsx_dump_methods()
             LOG("watchdog", "  words at get%+d:%s", 32 * row, w.c_str());
         }
     }
-    // KZ2_WATCHDOG_PEEK="ea:len,ea:len" dumps guest memory (hex, len rounded up to 32).
-    if (const char *p = getenv("KZ2_WATCHDOG_PEEK"))
+    // HELSARI_WATCHDOG_PEEK="ea:len,ea:len" dumps guest memory (hex, len rounded up to 32).
+    if (const char *p = getenv("HELSARI_WATCHDOG_PEEK"))
     {
         for (const char *s = p; *s;)
         {

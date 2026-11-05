@@ -23,7 +23,7 @@
 void dualsense_merge(XINPUT_GAMEPAD &g);   // dualsense.cpp
 void mouse_note_controller();               // mouse.cpp
 
-static const bool g_trace_pad = getenv("KZ2_TRACE_PAD") != nullptr;
+static const bool g_trace_pad = getenv("HELSARI_TRACE_PAD") != nullptr;
 namespace {
 uint16_t axis(SHORT v, bool invert) {
     int x = (v + 32768) >> 8;
@@ -39,15 +39,15 @@ void keyboard(XINPUT_GAMEPAD &g) {
     if (window_focused()) keybind_apply(g);
 }
 
-// KZ2_PAD_SCRIPT="45:a,50:start,52.5:down" holds each button for 0.2 s at
+// HELSARI_PAD_SCRIPT="45:a,50:start,52.5:down" holds each button for 0.2 s at
 // that many seconds after the first pad read, so menus can be driven without
 // a human. "@188:a" instead presses on the 188th pad read for 6 reads, which
-// replays a KZ2_TRACE_PAD log exactly regardless of frame rate.
+// replays a HELSARI_TRACE_PAD log exactly regardless of frame rate.
 // Names: a b x y start back up down left right lb rb.
 struct ScriptPress { double t; WORD bit; bool by_read; };
 std::vector<ScriptPress> load_script() {
     std::vector<ScriptPress> v;
-    const char *e = getenv("KZ2_PAD_SCRIPT");
+    const char *e = getenv("HELSARI_PAD_SCRIPT");
     if (!e) return v;
     static const struct { const char *name; WORD bit; } names[] = {
         {"a", XINPUT_GAMEPAD_A}, {"b", XINPUT_GAMEPAD_B}, {"x", XINPUT_GAMEPAD_X}, {"y", XINPUT_GAMEPAD_Y},
@@ -203,7 +203,7 @@ HLE(cellPadGetData) {
 // Playback goes to the default output device through WASAPI (shared mode, the
 // port's channel count; Windows converts and down-mixes to the device), and the
 // device clock paces the blocks so audio and game stay in step. Without a device,
-// a host timer paces them silently. KZ2_NO_AUDIO=1: no output.
+// a host timer paces them silently. HELSARI_NO_AUDIO=1: no output.
 
 namespace {
 constexpr uint32_t AUDIO_BLOCK_SAMPLES = 256, MAX_PORTS = 8, OUT_CHANNELS = 8;
@@ -225,7 +225,7 @@ bool wasapi_open(uint32_t nch, Wasapi &w) {
     static const GUID iid_client = {0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2}};
     static const GUID iid_render = {0xf294acfc, 0x3146, 0x4483, {0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2}};
     static const GUID ieee_float = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
-    if (getenv("KZ2_NO_AUDIO") && atoi(getenv("KZ2_NO_AUDIO"))) return false;
+    if (getenv("HELSARI_NO_AUDIO") && atoi(getenv("HELSARI_NO_AUDIO"))) return false;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IMMDeviceEnumerator *en = nullptr;
     IMMDevice *dev = nullptr;

@@ -47,7 +47,7 @@ struct Workload {
     uint8_t *ready_byte() const { return (uint8_t *)mem::ptr(spurs + 0x00 + id); }
     uint8_t *contention_byte() const { return (uint8_t *)mem::ptr(spurs + 0x10 + id); }
     uint8_t ready_raw() const { return __atomic_load_n(ready_byte(), __ATOMIC_SEQ_CST); }
-    // Experiment (KZ2_SPURS_BOOST="name:n,..."): while the game asks for any SPU for
+    // Experiment (HELSARI_SPURS_BOOST="name:n,..."): while the game asks for any SPU for
     // this workload, run up to n instances - the job manager hands independent jobs
     // to whichever instances run it, so a workload the game gave one SPU (jm_anim)
     // spreads over more host cores.
@@ -62,12 +62,12 @@ struct Workload {
     std::mutex m;
     // One wake signal per instance, and only instances that have work are woken: waking
     // them all for one job cost ~100,000 thread switches a second at the shore, a quarter
-    // of the process's CPU time in the kernel. KZ2_SPURS_WAKE_ALL=1: wake every instance.
+    // of the process's CPU time in the kernel. HELSARI_SPURS_WAKE_ALL=1: wake every instance.
     static constexpr int MAX_INSTANCES = 8;
     std::condition_variable cv[MAX_INSTANCES];
     std::atomic<uint32_t> sleeping{0};                   // bit k: instance k waits on cv[k]
     void wake() {
-        static const bool all = getenv("KZ2_SPURS_WAKE_ALL") && atoi(getenv("KZ2_SPURS_WAKE_ALL"));
+        static const bool all = getenv("HELSARI_SPURS_WAKE_ALL") && atoi(getenv("HELSARI_SPURS_WAKE_ALL"));
         int r = ready();
         uint32_t want = shutdown || all ? ~0u : r >= 32 ? ~0u : (1u << r) - 1;
         uint32_t targets = sleeping.load(std::memory_order_seq_cst) & want;
@@ -79,13 +79,13 @@ struct Workload {
     std::vector<std::unique_ptr<spu::SpuThread>> spus;   // one per instance
 };
 
-// SPU instances per workload: the game's SPURS instance has 5 SPUs (KZ2_SPURS_SPUS
+// SPU instances per workload: the game's SPURS instance has 5 SPUs (HELSARI_SPURS_SPUS
 // overrides; 1 = the old single-instance behaviour), capped by maxContention.
 int instances_for(uint32_t max_contention) {
     static const int n = [] {
-        const char *e = getenv("KZ2_SPURS_SPUS");
+        const char *e = getenv("HELSARI_SPURS_SPUS");
         int v = e ? atoi(e) : 5;
-        // At most the SPURS instance's SPU count (Killzone 2: 5, cellSpursInitialize*):
+        // At most the SPURS instance's SPU count (the game: 5, cellSpursInitialize*):
         // SPURS keeps per-SPU state for that many, and a 6th instance corrupts it
         // (tried 8: the game froze while loading).
         return v < 1 ? 1 : v > 5 ? 5 : v;
@@ -123,7 +123,7 @@ void workload_thread(Workload *w, int k) {
     auto &s = *w->spus[k];
     s.name = "spurs:" + (w->name.empty() ? std::to_string(w->id) : w->name) + (k ? "#" + std::to_string(k) : "");
     name_host_thread(s.name);
-    if (const char *only = getenv("KZ2_SPU_TRACE_NAME"))
+    if (const char *only = getenv("HELSARI_SPU_TRACE_NAME"))
         if (s.name.find(only) == std::string::npos) s.traced = (int64_t)1 << 40;   // exclude from tracing
     memcpy(s.ls + PM_ADDR, mem::ptr(w->pm), w->size);
     s.code_loaded(PM_ADDR, w->pm, w->size);         // native code for the policy module, if compiled
@@ -157,8 +157,8 @@ void workload_thread(Workload *w, int k) {
         // Short spin before sleeping: jobs arrive in bursts tens of microseconds apart, and a
         // kernel sleep and wake-up per job costs more than that (a quarter of the process's
         // CPU time, and latency along the whole job chain). 50 us: no gain while SPU code was slow,
-        // but with faster code busy scenes went from ~38 to ~45 fps. KZ2_SPURS_SPIN_US=0: off.
-        static const uint32_t spin_us = getenv("KZ2_SPURS_SPIN_US") ? (uint32_t)atoi(getenv("KZ2_SPURS_SPIN_US")) : 50;
+        // but with faster code busy scenes went from ~38 to ~45 fps. HELSARI_SPURS_SPIN_US=0: off.
+        static const uint32_t spin_us = getenv("HELSARI_SPURS_SPIN_US") ? (uint32_t)atoi(getenv("HELSARI_SPURS_SPIN_US")) : 50;
         if (spin_us && runs) {
             uint64_t t0 = host_now_ns(), limit = spin_us * 1000ull;
             while (w->ready() <= k && !w->shutdown && host_now_ns() - t0 < limit)
@@ -321,7 +321,7 @@ HLE(cellSpursWorkloadAttributeSetName) {
 // instance's workloads that now want more SPUs than run. Without this, waiting
 // instances only noticed new work at the ready monitor's next poll - ~0.3-0.5 ms per
 // hand-off, hundreds of times a frame in a chain of dependent post-processing jobs.
-// KZ2_SPURS_WAKE_ON_WRITE=0: monitor only.
+// HELSARI_SPURS_WAKE_ON_WRITE=0: monitor only.
 namespace { std::atomic<uint32_t> g_spurs_lines[8]; Workload *g_wl_list[64]; std::atomic<int> g_wl_count{0}; }
 extern "C" void line_notify(uint64_t ea) {
     line_wake(ea);
@@ -338,7 +338,7 @@ extern "C" void line_notify(uint64_t ea) {
     }
 }
 
-// KZ2_CHAIN_STAT=1: what runs while the RSX is parked, sampled about every 50 us (burns one
+// HELSARI_CHAIN_STAT=1: what runs while the RSX is parked, sampled about every 50 us (burns one
 // core): how many jm_post instances are inside the job manager, and when none is, which other
 // workloads are. Reported in the stats line.
 namespace {
@@ -380,7 +380,7 @@ std::string spurs_stats_line(double frames) {
         last_k = k, last_u = u;
         out = pb;
     }
-    static const bool chain = getenv("KZ2_CHAIN_STAT") != nullptr;
+    static const bool chain = getenv("HELSARI_CHAIN_STAT") != nullptr;
     if (chain) {
         static std::once_flag once;
         std::call_once(once, [] { std::thread(chain_sampler).detach(); });
@@ -423,7 +423,7 @@ void ready_monitor() {
     name_host_thread("spurs ready monitor");
     for (;;) {
         // Commits wake instances directly (line_notify): this only catches what they miss.
-        static const uint32_t period = getenv("KZ2_SPURS_MONITOR_US") ? (uint32_t)atoi(getenv("KZ2_SPURS_MONITOR_US")) : 1000;
+        static const uint32_t period = getenv("HELSARI_SPURS_MONITOR_US") ? (uint32_t)atoi(getenv("HELSARI_SPURS_MONITOR_US")) : 1000;
         host_sleep_us(period);
         std::lock_guard<std::mutex> lk(g_lock);
         for (auto &[id, w] : g_workloads)
@@ -451,7 +451,7 @@ HLE(cellSpursAddWorkloadWithAttribute) {
         if (wn < 64) g_wl_list[wn] = p, g_wl_count.store(wn + 1, std::memory_order_release);
     }
     st32(ARG32(1), p->id);
-    static const bool wake_on_write = !getenv("KZ2_SPURS_WAKE_ON_WRITE") || atoi(getenv("KZ2_SPURS_WAKE_ON_WRITE"));
+    static const bool wake_on_write = !getenv("HELSARI_SPURS_WAKE_ON_WRITE") || atoi(getenv("HELSARI_SPURS_WAKE_ON_WRITE"));
     if (wake_on_write) {
         uint32_t line = p->spurs & ~127u;
         bool have = false;
@@ -463,8 +463,8 @@ HLE(cellSpursAddWorkloadWithAttribute) {
         g_line_notify[line_index(line)] = 1;
     }
     // Default: jm_anim (animation, which the main thread waits for) on up to 4 instances;
-    // KZ2_SPURS_BOOST="" disables, or lists other "name:n" pairs.
-    const char *boost_env = getenv("KZ2_SPURS_BOOST");
+    // HELSARI_SPURS_BOOST="" disables, or lists other "name:n" pairs.
+    const char *boost_env = getenv("HELSARI_SPURS_BOOST");
     if (!boost_env) boost_env = "jm_anim:4";
     if (const char *e = boost_env)
         for (const char *q = e; *q;) {

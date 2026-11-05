@@ -55,10 +55,10 @@ std::string src_expr(const Ctx &c, int n) {
     if (bits(s, 17, 1)) r = "(-" + r + ")";
     // Input precision modifier of operand n: SRC1 bits 19-21 (src0), 22-24 (src1), 25-27
     // (src2) - 1 fp16, 2 fx12 [-2, 2), 3 fx9 [-1, 1], 4 saturate. The operand is clamped
-    // before the operation (Killzone 2's soft particles limit their depth fade this way:
+    // before the operation (the game's soft particles limit their depth fade this way:
     // without it, smoke 70 m in front of the scene came out 70x opaque).
-    // KZ2_NO_SRC_PREC=1: ignore.
-    static const bool no_src_prec = getenv("KZ2_NO_SRC_PREC") && atoi(getenv("KZ2_NO_SRC_PREC"));
+    // HELSARI_NO_SRC_PREC=1: ignore.
+    static const bool no_src_prec = getenv("HELSARI_NO_SRC_PREC") && atoi(getenv("HELSARI_NO_SRC_PREC"));
     switch (no_src_prec ? 0 : bits(c.s[1], 19 + 3 * n, 3)) {
     case 1: r = "clamp(" + r + ", -65504.0, 65504.0)"; break;
     case 2: r = "clamp(" + r + ", -2.0, 2.0)"; break;
@@ -136,8 +136,8 @@ FpInfo translate_fp(const FpKey &key) {
     for (int n = 0; n < 1024; n++) {
         Ctx c{fpword(a), {fpword(a + 4), fpword(a + 8), fpword(a + 12)}, ""};
         a += 16;
-        // KZ2_FP_WORDS=1: each instruction's raw words as a comment (capture shader dumps).
-        static const bool fp_words = getenv("KZ2_FP_WORDS") && atoi(getenv("KZ2_FP_WORDS"));
+        // HELSARI_FP_WORDS=1: each instruction's raw words as a comment (capture shader dumps).
+        static const bool fp_words = getenv("HELSARI_FP_WORDS") && atoi(getenv("HELSARI_FP_WORDS"));
         if (fp_words) {
             char w[96];
             snprintf(w, sizeof w, "  // i%d: %08x %08x %08x %08x\n", n, c.dst, c.s[0], c.s[1], c.s[2]);
@@ -153,10 +153,10 @@ FpInfo translate_fp(const FpKey &key) {
         // R and H registers share storage: R[n].x is H[2n].x:H[2n].y (low:high half), R[n].y
         // H[2n].z:w, R[n].z H[2n+1].x:y, R[n].w H[2n+1].z:w. Here they are separate arrays,
         // which only matters when bits are reinterpreted: an unpack reading an R component
-        // last written through H gets those two halves, as if packed (Killzone 2 stores
+        // last written through H gets those two halves, as if packed (the game stores
         // normals with h[2].xy = n; up4(r[1]) in some shaders - noise on those materials
-        // otherwise). KZ2_NO_RH_ALIAS=1: off.
-        static const bool no_rh = getenv("KZ2_NO_RH_ALIAS") && atoi(getenv("KZ2_NO_RH_ALIAS"));
+        // otherwise). HELSARI_NO_RH_ALIAS=1: off.
+        static const bool no_rh = getenv("HELSARI_NO_RH_ALIAS") && atoi(getenv("HELSARI_NO_RH_ALIAS"));
         if (!no_rh && (op == 0x14 || op == 0x25 || op == 0x28 || op == 0x2a || op == 0x2d) && bits(c.s[0], 0, 2) == 0 &&
             !bits(c.s[0], 8, 1)) {
             uint32_t rn = bits(c.s[0], 2, 6), comp = bits(c.s[0], 9, 2);
@@ -171,9 +171,9 @@ FpInfo translate_fp(const FpKey &key) {
             used_tex[tex] = true;
             uint8_t dim = key.texdim[tex] & TEX_DIM_MASK;
             std::string cs = dim == TEX_2D ? "(" + coord + ").xy" : "(" + coord + ").xyz";
-            // Experiment (KZ2_CUBE_FLIP=1): read every cube face rotated 180 degrees (both
+            // Experiment (HELSARI_CUBE_FLIP=1): read every cube face rotated 180 degrees (both
             // face axes flipped) = negate the direction's two minor components.
-            static const bool cube_flip = getenv("KZ2_CUBE_FLIP") && atoi(getenv("KZ2_CUBE_FLIP"));
+            static const bool cube_flip = getenv("HELSARI_CUBE_FLIP") && atoi(getenv("HELSARI_CUBE_FLIP"));
             if (dim == TEX_CUBE && cube_flip) cs = "cubeflip(" + cs + ")";
             if (key.texdim[tex] & TEX_UNNORM) cs = "(" + cs + " * texscale[" + std::to_string(tex) + "].xy)";
             // Shadow lookup: compare z against the stored depth, filtered (PCF); every component is the result.
@@ -271,8 +271,8 @@ FpInfo translate_fp(const FpKey &key) {
         }
         // Instruction precision (dst bits 22-23): 0 fp32, 1 fp16, 2 fx12 (fixed point,
         // [-2, 2)), 3 fx9 ([-1, 1]). The result is clamped to its range; shaders rely
-        // on it (Killzone 2's specular exponent is formed in fx12). KZ2_NO_FP_PREC=1: off.
-        static const bool no_prec = getenv("KZ2_NO_FP_PREC") && atoi(getenv("KZ2_NO_FP_PREC"));
+        // on it (the game's specular exponent is formed in fx12). HELSARI_NO_FP_PREC=1: off.
+        static const bool no_prec = getenv("HELSARI_NO_FP_PREC") && atoi(getenv("HELSARI_NO_FP_PREC"));
         uint32_t prec = bits(c.dst, 22, 2);
         bool packs = op == 0x13 || op == 0x24 || op == 0x27 || op == 0x29 || op == 0x2c;   // results are bit patterns
         bool clampable = !e.empty() && e != "KIL" && !bits(c.dst, 31, 1) && !packs;
@@ -330,7 +330,7 @@ FpInfo translate_fp(const FpKey &key) {
     // view the program actually wrote; the control bit decides only when both are.
     bool fp32 = (wrote_r & 1) && !(wrote_h & 1) ? true : (wrote_h & 1) && !(wrote_r & 1) ? false : (key.control & 0x40) != 0;
     // Depth export (SHADER_CONTROL bits 1-3): the program's R1.z (H2.z in half
-    // precision) replaces the fragment depth. Killzone 2 writes its quarter-size
+    // precision) replaces the fragment depth. The game writes its quarter-size
     // depth buffer for depth of field this way.
     bool depth_export = (key.control & 0xe) != 0;
     std::string h = w;

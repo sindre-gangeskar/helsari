@@ -7,7 +7,7 @@
 // a mask of the quadwords the interpreter executed. The build
 // (tools/recomp/spu_cache.py) compiles those; the next run maps them
 // like any other recompiled module. Masks of the same image merge across runs.
-// KZ2_SPU_CAPTURE=0 disables it.
+// HELSARI_SPU_CAPTURE=0 disables it.
 #include "spu.h"
 
 #include "runtime.h"
@@ -27,7 +27,7 @@ namespace spu {
 namespace {
 
 const bool g_capture_on = [] {
-    const char *e = getenv("KZ2_SPU_CAPTURE");
+    const char *e = getenv("HELSARI_SPU_CAPTURE");
     return !e || atoi(e) != 0;
 }();
 constexpr uint32_t MAX_IMAGE = 0x30000;

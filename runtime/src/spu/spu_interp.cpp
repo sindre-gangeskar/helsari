@@ -80,14 +80,14 @@ void SpuThread::dump_history() {
 
 std::atomic<uint64_t> g_insns{0}, g_run_ns{0}, g_wait_ns{0}, g_interp{0};
 
-// KZ2_SPU_HOTSPOTS=1: every 1024th interpreted instruction is sampled as (thread, pc, hash of
+// HELSARI_SPU_HOTSPOTS=1: every 1024th interpreted instruction is sampled as (thread, pc, hash of
 // the 256 code bytes around it - job managers load different code at the same
 // LS address); stats_line dumps the top samples every 6th call.
 namespace {
 struct HotSample { uint64_t count = 0; std::string thread; uint32_t pc = 0; uint32_t code[6] = {}; };
 std::mutex g_hot_lock;
 std::unordered_map<uint64_t, HotSample> g_hot;
-const bool g_hot_on = getenv("KZ2_SPU_HOTSPOTS") != nullptr;
+const bool g_hot_on = getenv("HELSARI_SPU_HOTSPOTS") != nullptr;
 
 void hot_sample(const SpuThread &t) {
     uint32_t base = t.pc & (LS_SIZE - 256), h = 2166136261u;
@@ -176,8 +176,8 @@ std::string stats_line(double secs, uint32_t frames) {
 void SpuThread::run() {
     running = true;
     _mm_setcsr(_mm_getcsr() | 0x8040);   // DAZ + FTZ: see v_spf in spu_ops.h
-    // KZ2_SPU_TRACE=N logs the first N instructions executed by each SPU thread.
-    static const int64_t trace_limit = getenv("KZ2_SPU_TRACE") ? atoll(getenv("KZ2_SPU_TRACE")) : 0;
+    // HELSARI_SPU_TRACE=N logs the first N instructions executed by each SPU thread.
+    static const int64_t trace_limit = getenv("HELSARI_SPU_TRACE") ? atoll(getenv("HELSARI_SPU_TRACE")) : 0;
     uint32_t event_poll = 0;
     uint64_t executed = 0, interpreted = 0;
     auto started = std::chrono::steady_clock::now();
@@ -228,13 +228,13 @@ void SpuThread::run() {
                     pc = f(*this, pc);
                     continue;
                 }
-            // KZ2_SPU_MAP_LINES=0: the old rule (look once after any LS write) for comparison.
-            static const bool map_lines = !getenv("KZ2_SPU_MAP_LINES") || atoi(getenv("KZ2_SPU_MAP_LINES"));
+            // HELSARI_SPU_MAP_LINES=0: the old rule (look once after any LS write) for comparison.
+            static const bool map_lines = !getenv("HELSARI_SPU_MAP_LINES") || atoi(getenv("HELSARI_SPU_MAP_LINES"));
             if ((map_lines ? !line_seen[pc >> 7] : code_dirty) && map_at(pc)) continue;
         }
         if (!interp_once && pc != last_interp + 4 && code_q[pc >> 4] == CODE) record_entry(pc);
         last_interp = pc;
-        // KZ2_SPU_HOTSPOTS samples interpreted instructions only (compiled-code calls are not code
+        // HELSARI_SPU_HOTSPOTS samples interpreted instructions only (compiled-code calls are not code
         // the interpreter runs, and counting them made compiled tasks look interpreted).
         // Counted across run() calls: most runs are too short to reach 1024 on their own.
         ++interpreted;

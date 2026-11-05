@@ -1,4 +1,4 @@
-"""Build-time pipeline: user's Killzone 2 dump -> generated C sources.
+"""Build-time pipeline: user's own game dump -> generated C sources.
 
     python -m recomp --dump "<dump dir>" --rpcs3 <rpcs3.exe> --out <build/generated>
 
@@ -17,8 +17,8 @@ import time
 from . import analyze, codegen, elf, nid, spu
 from .overrides import OVERRIDES
 
-KNOWN_TITLES = {'BCES00081': 'Killzone 2 (EU)', 'BCUS98116': 'Killzone 2 (US)',
-                'BCJS30022': 'Killzone 2 (JP)', 'BCAS20071': 'Killzone 2 (Asia)'}
+KNOWN_TITLES = {'BCES00081': 'EU', 'BCUS98116': 'US',
+                'BCJS30022': 'JP', 'BCAS20071': 'Asia'}
 
 CODE_LO_SECTION = 1           # .init: first code section after the null section
 CHUNK_INSNS = 20000           # instructions per generated .c file
@@ -184,7 +184,7 @@ def _code_end(e):
 
 def main():
     ap = argparse.ArgumentParser(prog='recomp')
-    ap.add_argument('--dump', required=True, help='Killzone 2 disc dump folder (contains PS3_GAME)')
+    ap.add_argument('--dump', required=True, help='Game disc dump folder (contains PS3_GAME)')
     ap.add_argument('--rpcs3', help='rpcs3.exe, used to decrypt EBOOT.BIN and to recover function names')
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
@@ -192,9 +192,9 @@ def main():
     if not os.path.isfile(sfo):
         sys.exit(f'{a.dump} does not look like a PS3 disc dump (no PS3_GAME/PARAM.SFO)')
     title = read_sfo(sfo).get('TITLE_ID', '?')
-    log(f'title {title}: {KNOWN_TITLES.get(title, "unknown - this project targets Killzone 2")}')
+    log(f'title {title}: {KNOWN_TITLES.get(title, "not a supported title")}')
     if title not in KNOWN_TITLES:
-        sys.exit('not a Killzone 2 dump')
+        sys.exit('not a supported dump')
     if title != 'BCES00081':
         log('warning: only BCES00081 has been tested')
     os.makedirs(a.out, exist_ok=True)

@@ -1,6 +1,6 @@
-// Sampling profiler (KZ2_PROFILE=<seconds>): about every millisecond every
+// Sampling profiler (HELSARI_PROFILE=<seconds>): about every millisecond every
 // other thread is briefly suspended and its instruction pointer recorded; every
-// <seconds> the hottest addresses are logged as module+offset (map kz2.exe
+// <seconds> the hottest addresses are logged as module+offset (map helsari2.exe
 // offsets to functions with llvm-nm, image base 0x140000000).
 #include "runtime.h"
 
@@ -80,10 +80,10 @@ void profiler(int secs) {
                 }
             }
             if (!names.count(te.th32ThreadID)) names[te.th32ThreadID] = thread_name(h);
-            // KZ2_PROFILE_SAMPLE=0: CPU times only (suspending threads adds kernel time of its own).
-            static const bool sampling = !getenv("KZ2_PROFILE_SAMPLE") || atoi(getenv("KZ2_PROFILE_SAMPLE"));
-            // KZ2_PROFILE_ONLY=<name>: sample only these threads, many times more often.
-            static const char *only = getenv("KZ2_PROFILE_ONLY");
+            // HELSARI_PROFILE_SAMPLE=0: CPU times only (suspending threads adds kernel time of its own).
+            static const bool sampling = !getenv("HELSARI_PROFILE_SAMPLE") || atoi(getenv("HELSARI_PROFILE_SAMPLE"));
+            // HELSARI_PROFILE_ONLY=<name>: sample only these threads, many times more often.
+            static const char *only = getenv("HELSARI_PROFILE_ONLY");
             if (sampling && (!only || names[te.th32ThreadID].find(only) != std::string::npos) && SuspendThread(h) != (DWORD)-1) {
                 CONTEXT c{};
                 c.ContextFlags = CONTEXT_CONTROL;
@@ -108,8 +108,8 @@ void profiler(int secs) {
                 LOG("profile", "  %6.1f%%  (kernel %5.1f%%)  %s", threads[i].first / 1e5 / secs,
                     kern[threads[i].second] / 1e5 / secs, names[threads[i].second].c_str());
             // Where the busiest threads spend their time, plus any thread whose name
-            // contains one of KZ2_PROFILE_THREADS="name,name".
-            static const char *want = getenv("KZ2_PROFILE_THREADS");
+            // contains one of HELSARI_PROFILE_THREADS="name,name".
+            static const char *want = getenv("HELSARI_PROFILE_THREADS");
             auto wanted = [](const std::string &name) {
                 if (!want) return false;
                 for (const char *p = want; *p;) {
@@ -142,7 +142,7 @@ void profiler(int secs) {
 } // namespace
 
 void start_profiler() {
-    if (const char *e = getenv("KZ2_PROFILE")) {
+    if (const char *e = getenv("HELSARI_PROFILE")) {
         int secs = atoi(e) > 0 ? atoi(e) : 20;
         std::thread(profiler, secs).detach();
     }

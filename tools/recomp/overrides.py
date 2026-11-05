@@ -13,7 +13,7 @@ OVERRIDES = {
     0x71f24: 'microthread context restore (switch to a context, never returns)',
     # Native pick: the guest version spins without pause until a microthread is runnable.
     0x72680: 'microthread pick (next runnable context; backs off while none is ready)',
-    # Debugging hook (runtime/src/debug_hooks.cpp): logs reads that land in KZ2_HOOK_WATCH.
+    # Debugging hook (runtime/src/debug_hooks.cpp): logs reads that land in HELSARI_HOOK_WATCH.
     0xa4a99c: 'buffered asset stream read (stream, dst, size)',
     # GRAPHICS section of the options menu (runtime/src/pc_options.cpp).
     0x47ccc0: 'menu URL dispatcher (this, url): takes the clicks of our rows',

@@ -19,13 +19,13 @@ namespace {
 
 uint8_t *ea_ptr(uint32_t ea) { return (uint8_t *)mem::ptr(ea); }
 
-// KZ2_SPU_WATCH="ea:len,ea:len" logs every SPU transfer overlapping those
+// HELSARI_SPU_WATCH="ea:len,ea:len" logs every SPU transfer overlapping those
 // guest ranges (who reads or writes a buffer), at most 20000 lines.
 struct WatchRange { uint32_t ea, len; };
 const std::vector<WatchRange> &watch_ranges() {
     static std::vector<WatchRange> v = [] {
         std::vector<WatchRange> r;
-        if (const char *p = getenv("KZ2_SPU_WATCH"))
+        if (const char *p = getenv("HELSARI_SPU_WATCH"))
             for (const char *s = p; *s;) {
                 char *end;
                 uint32_t a = strtoul(s, &end, 16), n = *end == ':' ? strtoul(end + 1, &end, 16) : 4;
@@ -38,9 +38,9 @@ const std::vector<WatchRange> &watch_ranges() {
 }
 void watch(const SpuThread &t, const char *what, uint32_t cmd, uint32_t ea, uint32_t lsa, uint32_t size) {
     static std::atomic<int> logs{0};
-    // KZ2_SPU_WATCH_CAPTURE=1: log only around an F12 capture, so the log budget
+    // HELSARI_SPU_WATCH_CAPTURE=1: log only around an F12 capture, so the log budget
     // is not spent during loading.
-    static const bool only_capture = getenv("KZ2_SPU_WATCH_CAPTURE") != nullptr;
+    static const bool only_capture = getenv("HELSARI_SPU_WATCH_CAPTURE") != nullptr;
     if (only_capture && !rsx::capturing()) return;
     const int limit = only_capture ? 300000 : 20000;
     for (auto &w : watch_ranges())
@@ -95,7 +95,7 @@ uint32_t SpuThread::pending_events() {
 }
 
 void SpuThread::mfc_command(uint32_t cmd) {
-    static const bool slow_on = getenv("KZ2_SLOW") != nullptr;   // see slow_list in hle_gcm.cpp
+    static const bool slow_on = getenv("HELSARI_SLOW") != nullptr;   // see slow_list in hle_gcm.cpp
     if (slow_on) {
         extern void slow_work(const char *name, uint64_t ran_ns);
         thread_local uint64_t last;
@@ -104,10 +104,10 @@ void SpuThread::mfc_command(uint32_t cmd) {
         last = host_now_ns();
     }
     uint32_t lsa = mfc_lsa & (LS_SIZE - 1), ea = mfc_eal, size = mfc_size;
-    // KZ2_SPU_TRACE logs commands while instructions are traced; KZ2_SPU_TRACE_MFC logs
+    // HELSARI_SPU_TRACE logs commands while instructions are traced; HELSARI_SPU_TRACE_MFC logs
     // every command of the traced workload, with lock-line contents for atomic stores.
-    static const int64_t trace_limit = getenv("KZ2_SPU_TRACE") ? atoll(getenv("KZ2_SPU_TRACE")) : 0;
-    static const bool trace_all = getenv("KZ2_SPU_TRACE_MFC") != nullptr;
+    static const int64_t trace_limit = getenv("HELSARI_SPU_TRACE") ? atoll(getenv("HELSARI_SPU_TRACE")) : 0;
+    static const bool trace_all = getenv("HELSARI_SPU_TRACE_MFC") != nullptr;
     bool log = (traced && traced < trace_limit) || (trace_all && traced < ((int64_t)1 << 40));
     if (log) {
         LOG("spu", "%s   mfc cmd 0x%x lsa 0x%x ea 0x%x size 0x%x tag %u", name.c_str(), cmd, lsa, ea, size, mfc_tag);
@@ -128,9 +128,9 @@ void SpuThread::mfc_command(uint32_t cmd) {
             LOG("spu", "%s: mfc cmd 0x%x on NULL page: ea 0x%x lsa 0x%x size 0x%x at pc 0x%x (lr 0x%x)", name.c_str(),
                 cmd, ea, lsa, size, pc, gpr[0].w[0]);
     }
-    // KZ2_POST_TRACE=1, F9 timeline: the post-processing chain's bulk transfers and which job's
+    // HELSARI_POST_TRACE=1, F9 timeline: the post-processing chain's bulk transfers and which job's
     // code is mapped, to map which job reads and writes which buffer.
-    static const bool post_trace = getenv("KZ2_POST_TRACE") != nullptr;   // off by default: this runs on every transfer
+    static const bool post_trace = getenv("HELSARI_POST_TRACE") != nullptr;   // off by default: this runs on every transfer
     if (post_trace && size >= 512 && name.find("jm_post") != std::string::npos && (cmd == 0x40 || cmd == 0x41 || cmd == 0x42 || cmd == 0x20 || cmd == 0x21 || cmd == 0x22)) {
         const char *job = "-";
         for (auto &mp : mapped)
@@ -165,9 +165,9 @@ void SpuThread::mfc_command(uint32_t cmd) {
             bool unchanged = raddr == (ea & ~127u) && !memcmp(rdata, ea_ptr(raddr), 128);
             // Long idle (the backoff would sleep): block until the line is committed to
             // (atomics wake us through line_notify) or a short timeout, instead of
-            // waking every 50 us to look. KZ2_LLAR_WAIT_US=0: backoff sleeps only.
+            // waking every 50 us to look. HELSARI_LLAR_WAIT_US=0: backoff sleeps only.
             static const uint32_t wait_us = [] {
-                const char *e = getenv("KZ2_LLAR_WAIT_US");
+                const char *e = getenv("HELSARI_LLAR_WAIT_US");
                 return e ? (uint32_t)atoi(e) : 1000u;
             }();
             if (unchanged && wait_us && llar_idle.streak >= 256 && host_now_ns() - llar_idle.last < 10000) {
@@ -242,7 +242,7 @@ void SpuThread::run_list(uint32_t cmd, uint32_t tag, uint32_t lsa, uint32_t list
         // low 4 bits of its EA, and the next element starts at the following quadword.
         uint32_t la = (lsa & (LS_SIZE - 16)) | (eal & 15);
         if (!watch_ranges().empty()) watch(*this, get ? "list get" : "list put", cmd, eal, la, sz);
-        static const bool post_trace_list = getenv("KZ2_POST_TRACE") != nullptr;
+        static const bool post_trace_list = getenv("HELSARI_POST_TRACE") != nullptr;
         if (post_trace_list && sz >= 256 && name.find("jm_post") != std::string::npos) {
             const char *job = "-";
             for (auto &mp : mapped)

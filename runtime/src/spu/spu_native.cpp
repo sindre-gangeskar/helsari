@@ -5,7 +5,7 @@
 // only for code quadwords, so writes to the rest of the image (data) are harmless.
 // EBOOT modules (task ELFs, job binaries) are compared with the EBOOT; runtime
 // modules (captured by spu_capture.cpp) with their embedded image, on their
-// code quadwords. KZ2_SPU_NATIVE=0 disables it.
+// code quadwords. HELSARI_SPU_NATIVE=0 disables it.
 #include "spu.h"
 
 #include "runtime.h"
@@ -30,7 +30,7 @@ extern const int g_rt_module_count;
 
 namespace {
 const bool g_enabled = [] {
-    const char *e = getenv("KZ2_SPU_NATIVE");
+    const char *e = getenv("HELSARI_SPU_NATIVE");
     return !e || atoi(e) != 0;
 }();
 
@@ -44,9 +44,9 @@ const std::unordered_multimap<uint32_t, const NativeModule *> &by_source() {
     return m;
 }
 
-// KZ2_SPU_RT=0: ignore modules compiled from spu_cache/ (EBOOT modules still map).
+// HELSARI_SPU_RT=0: ignore modules compiled from spu_cache/ (EBOOT modules still map).
 const bool g_rt_enabled = [] {
-    const char *e = getenv("KZ2_SPU_RT");
+    const char *e = getenv("HELSARI_SPU_RT");
     return !e || atoi(e) != 0;
 }();
 } // namespace
@@ -85,7 +85,7 @@ bool image_matches(const uint8_t *ls, const NativeModule *m) {
 }
 } // namespace
 
-// KZ2_SKIP_JOBS=job_d62e00,job_d65480 ("post" = the whole post-processing set): these jobs do
+// HELSARI_SKIP_JOBS=job_d62e00,job_d65480 ("post" = the whole post-processing set): these jobs do
 // no pixel work. Measures what a job costs, or (later) lets the GPU do its work. They still run:
 // returning at once hangs the game, the job manager relies on the job's calls back into it. So
 // the job gets empty job data (no rows, no optional inputs). Job's code starts at its header's
@@ -107,7 +107,7 @@ uint32_t skip_job(SpuThread &t, uint32_t pc) {
 }
 bool job_skipped(const char *job) {
     static const std::string list = [] {
-        const char *e = getenv("KZ2_SKIP_JOBS");
+        const char *e = getenv("HELSARI_SKIP_JOBS");
         std::string s = e ? e : "";
         if (s == "post")
             s = "job_d4a280,job_d52080,job_d55200,job_d68180,job_d5b200,job_d4e380,"
@@ -175,9 +175,9 @@ bool SpuThread::map_at(uint32_t pc) {
         if (pc < m->ls_base || pc >= m->ls_base + m->size || !is_code(m, (pc - m->ls_base) >> 4)) return false;
         for (auto &mp : mapped)
             if (mp.m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size) {
-                static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
+                static const char *mlog = getenv("HELSARI_SPU_MATCH_LOG");
                 static std::atomic<int> logs{0};
-                static const uint32_t spc = getenv("KZ2_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("KZ2_SPU_MATCH_PC"), nullptr, 16) : 0;
+                static const uint32_t spc = getenv("HELSARI_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("HELSARI_SPU_MATCH_PC"), nullptr, 16) : 0;
                 if (mlog && logs < 30 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos) && (!spc || (pc & ~0x1ffu) == (spc & ~0x1ffu)))
                     logs++, LOG("spu", "%s: %s skipped at pc 0x%x: overlaps mapped %s (0x%x+0x%x)", name.c_str(), m->name, pc,
                                 mp.m->name, mp.m->ls_base, mp.m->size);
@@ -185,12 +185,12 @@ bool SpuThread::map_at(uint32_t pc) {
             }
         g_match_tries++;
         if (!image_matches(ls, m)) {
-            // Diagnostics (KZ2_SPU_MATCH_LOG=1): which compiled module was rejected, and the
+            // Diagnostics (HELSARI_SPU_MATCH_LOG=1): which compiled module was rejected, and the
             // first code quadword where LS differs from the image it was compiled from.
-            // KZ2_SPU_MATCH_LOG=<text>: only threads whose name contains it ("1": all).
-            static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
+            // HELSARI_SPU_MATCH_LOG=<text>: only threads whose name contains it ("1": all).
+            static const char *mlog = getenv("HELSARI_SPU_MATCH_LOG");
             static std::atomic<int> logs{0};
-            static const uint32_t mpc = getenv("KZ2_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("KZ2_SPU_MATCH_PC"), nullptr, 16) : 0;
+            static const uint32_t mpc = getenv("HELSARI_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("HELSARI_SPU_MATCH_PC"), nullptr, 16) : 0;
             if (mlog && logs < 60 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos) && (!mpc || (pc & ~0x1ffu) == (mpc & ~0x1ffu))) {
                 const uint8_t *img = m->image ? m->image : (const uint8_t *)mem::ptr(m->src_ea);
                 for (uint32_t off = 0; off < m->size; off += 16)
@@ -213,8 +213,8 @@ bool SpuThread::map_at(uint32_t pc) {
         recent[0] = m;
         return true;
     };
-    {   // Diagnostics (KZ2_SPU_MATCH_LOG): every map attempt per line, once per line and thread.
-        static const char *mlog = getenv("KZ2_SPU_MATCH_LOG");
+    {   // Diagnostics (HELSARI_SPU_MATCH_LOG): every map attempt per line, once per line and thread.
+        static const char *mlog = getenv("HELSARI_SPU_MATCH_LOG");
         static std::atomic<int> logs{0};
         if (mlog && logs < 200 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos)) {
             int cover = 0;

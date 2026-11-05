@@ -1,6 +1,6 @@
 // The game's microthread scheduler, on host fibers.
 //
-// Killzone 2 runs some work as cooperative microthreads. A context buffer
+// The game runs some work as cooperative microthreads. A context buffer
 // holds the callee-saved registers, r1 (+144), r2 (+152), the resume address
 // (+160, the saved r0), r3 (+168) and r4/r5 (+512/+520):
 //   0x71e10  save(buf)                 - like setjmp
@@ -141,10 +141,10 @@ extern "C" void f_0007203c(PPU_CTX) {
 // The guest loops without pause while slots exist but none is runnable - a
 // busy-wait for an SPU job or another thread to set a word, which kept a host
 // core spinning in the main thread. Here each fruitless pass backs off (pause,
-// yield, then 50 us sleeps). KZ2_PICK_SPIN=1: the original guest code.
+// yield, then 50 us sleeps). HELSARI_PICK_SPIN=1: the original guest code.
 extern "C" void f_00072680_guest(PPU_CTX);
 extern "C" void f_00072680(PPU_CTX) {
-    static const bool spin = getenv("KZ2_PICK_SPIN") && atoi(getenv("KZ2_PICK_SPIN"));
+    static const bool spin = getenv("HELSARI_PICK_SPIN") && atoi(getenv("HELSARI_PICK_SPIN"));
     if (spin) { f_00072680_guest(ctx); return; }
     const uint32_t s = (uint32_t)ctx->r[3];
     uint64_t t_wait = 0;   // set at the first fruitless pass: time waited goes to the flip log

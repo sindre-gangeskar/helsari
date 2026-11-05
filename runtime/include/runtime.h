@@ -38,7 +38,7 @@ std::string host_regions();                           /* committed private host 
 uint32_t alloc(uint32_t size, uint32_t align = 16);  /* user region */
 void free(uint32_t addr);
 void ensure(uint32_t ea, uint32_t size);  /* commit before host (kernel) I/O touches it */
-/* KZ2_WATCH_WRITE: kernel I/O into watched memory doesn't fault, so host I/O
+/* HELSARI_WATCH_WRITE: kernel I/O into watched memory doesn't fault, so host I/O
    reports itself here (and the pages are unprotected for it). True if watched. */
 bool watch_host_write(uint32_t ea, uint32_t size, const char *what);
 /* Write tracking of RSX local memory (texture change detection, memory.cpp):
@@ -50,7 +50,7 @@ bool track_written(uint32_t ea, uint32_t size);
 void track_unarm(uint32_t ea, uint32_t size);
 bool track_enabled();
 void watch_add(uint32_t ea, uint32_t size);
-/* KZ2_HOOK_WATCH="ea:len": does [ea, ea+size) overlap it? (debug_hooks.cpp) */
+/* HELSARI_HOOK_WATCH="ea:len": does [ea, ea+size) overlap it? (debug_hooks.cpp) */
 bool hook_watched(uint32_t ea, uint32_t size);
 uint32_t alloc_stack(uint32_t size);
 uint32_t mmap_reserve(uint32_t size, uint32_t align);
@@ -106,7 +106,7 @@ void gcm_tl(const char *fmt, ...);
 void gcm_post_job_mapped(const char *job);
 void gcm_parked_wake(uint32_t ea, uint32_t size);   /* [ea, ea+size) was written: wake the RSX if parked on it */
 uint32_t gcm_parked_ea();   /* guest address of the jump the RSX is parked on, 0 if none */
-std::string tb_report(double frames);   /* KZ2_TB_SITES: clock reads per site (core.cpp) */   /* frame timeline log around an F12 capture (hle_gcm.cpp) */
+std::string tb_report(double frames);   /* HELSARI_TB_SITES: clock reads per site (core.cpp) */   /* frame timeline log around an F12 capture (hle_gcm.cpp) */
 namespace thread {
 PPUContext *create_context();
 uint32_t current_id();

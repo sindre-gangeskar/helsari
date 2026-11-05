@@ -1,7 +1,7 @@
 // Native menu entries: the game's menus are text pages (SVML layout + Lua) inside data_ps3.psarc.
 // The dump stays untouched and no game data is stored: when the archive is opened, the pages to
 // change are read from it and patched in memory, then appended past its real end, and reads of
-// its table of contents are redirected there. KZ2_MENU_PATCH=0: no changes.
+// its table of contents are redirected there. HELSARI_MENU_PATCH=0: no changes.
 #include "keybinds.h"
 #include "runtime.h"
 
@@ -155,7 +155,7 @@ namespace menu_patch
             return;
         done = true;
         g_real_size = real_size;
-        if (getenv("KZ2_MENU_PATCH") && !atoi(getenv("KZ2_MENU_PATCH")))
+        if (getenv("HELSARI_MENU_PATCH") && !atoi(getenv("HELSARI_MENU_PATCH")))
             return;
         uint8_t h[HEADER_SIZE];
         rd(0, h, sizeof h);
