@@ -568,12 +568,13 @@ Bound bind_surfaces() {
     b.w = (reg(0x0200) >> 16) + (reg(0x0200) & 0xffff);
     b.h = (reg(0x0204) >> 16) + (reg(0x0204) & 0xffff);
     uint32_t aa = (fmt >> 12) & 0xf;                 // 3: diagonal 2x, 4/5: square 4x
-    // No multisampling: the game's multisampled targets render at one sample per pixel. It still
-    // reads them as if they had their samples: see Surface::res_x.
-    const float guest_x = aa >= 3 && aa <= 5 ? 2.f : 1.f, guest_y = aa == 4 || aa == 5 ? 2.f : 1.f;
+    // No multisampling. Diagonal 2x (3), the main scene, renders at one sample per pixel; the game
+    // still reads it as double width (see surface_width). Square 4x (4, 5) is not there to smooth
+    // edges: Killzone 2 draws its cheaper particles at 320x180 4x into a 640x360 layer, sharing it with
+    // the ones drawn at 640x360, so those targets keep the size of their samples.
+    const float samples = aa == 4 || aa == 5 ? 2.f : 1.f;
     g_res_scale = dma_location(reg(0x0194)) == 0 && b.w != b.h ? g_res_setting : 1;
-    g_aa_sx = g_aa_sy = (float)g_res_scale;
-    (void)guest_x, (void)guest_y;
+    g_aa_sx = g_aa_sy = g_res_scale * samples;
     // The game also binds those targets as plain double-width ones, to shade each sample.
     if (dma_location(reg(0x0194)) == 0 && b.w == 2560 && b.h == 720 && aa < 3)
         g_aa_sx = g_res_scale / 2.f;
@@ -2245,7 +2246,7 @@ void draw() {
     px.wpos[0] = (origin_bottom != wpos_flip) ? 1.f : 0.f;
     px.wpos[1] = (float)(reg(0x1d88) & 0xfff);
     px.wpos[2] = g_aa_sx, px.wpos[3] = g_aa_sy;
-    px.alpha_ref[1] = (float)g_res_scale;
+    px.alpha_ref[1] = g_aa_sy;  // steps per guest pixel in wpos
     for (size_t k = 0; k < ps->consts.size(); k++)
         for (int c = 0; c < 4; c++) px.fc[k * 4 + c] = fp_const_word(fp_ea + ps->consts[k] + 4 * c);
     if (!cb_on) {
@@ -2449,7 +2450,7 @@ void draw() {
     // F12 saves only the passes drawing to the display targets; KZ2_CAPTURE_FULL=1: every pass.
     static const bool capture_full = getenv("KZ2_CAPTURE_FULL") && atoi(getenv("KZ2_CAPTURE_FULL"));
     const bool pass_dump = (int)g_frame == g_log_frame && reg(0x0324) &&
-        (capture_full || (b.color[0] && (b.color[0]->ea == 0xc0010000u || b.color[0]->ea == 0xc0394000u || b.color[0]->ea == 0xc16b0000u || b.color[0]->ea == 0xc12b4000u))) &&
+        (capture_full || (b.color[0] && (b.color[0]->ea == 0xc0010000u || b.color[0]->ea == 0xc0394000u || b.color[0]->ea == 0xc16b0000u || b.color[0]->ea == 0xc12b4000u || b.color[0]->ea < mem::LOCAL_BASE))) &&
                            ((list.size() <= 6 && g_pass_dumps < 600) || samples_main);
     if (pass_dump)
         for (int t = 0; t < 16; t++)
