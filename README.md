@@ -16,17 +16,17 @@
 
 
 
-## Components
+### Architecture & Subsystems
 
-| Part      | How it runs                                                                                                                 |
-| --------- | --------------------------------------------------------------------------------------------------------------------------- |
-| PPU (CPU) | Statically recompiled: all reachable code (2.9M instructions, 49k functions) becomes C, including FPU and VMX/AltiVec       |
-| SPU       | Statically recompiled from the EBOOT and from SPU code captured at run time; float, shuffle and rotate instructions use SIMD |
-| SPURS     | Job-manager workloads run on up to 5 host threads each; task sets, events and mailboxes are emulated                        |
-| RSX (GPU) | Translated to Direct3D 11: shaders to HLSL (cached on disk), render-target cache, vertex decoding on the GPU                |
-| OS        | Threads, synchronisation primitives, memory, file system (`/dev_bdvd` mapped onto your dump), save data                     |
-| Input     | XInput controller mapped to a DualShock 3; 1:1 raw mouse look on foot, see [Mouse look](#mouse-look)                        |
-| Audio     | cellAudio ports mixed to 7.1 and played through WASAPI                                                                      |
+| Subsystem Component | Implementation Method & Status |
+| :--- | :--- |
+| **PPU (CPU)** | Statically recompiled: all reachable code (2.9M instructions, 49k functions) becomes native C, including full FPU and VMX/AltiVec support. |
+| **SPU** | Statically recompiled from the EBOOT and from SPU code captured at run time; float, shuffle, and rotate instructions utilize host SIMD hardware. |
+| **SPURS** | Job-manager workloads run on up to 5 host threads each; task sets, events, and mailboxes are abstractly emulated. |
+| **RSX (GPU)** | Translated directly to Direct3D 11: shaders are recompiled to HLSL (cached locally on disk), utilizing a render-target cache and on-GPU vertex decoding. |
+| **OS Layer** | System threads, synchronization primitives, memory maps, save data virtualization, and file system abstractions (`/dev_bdvd` mapped onto the user's local dump). |
+| **Input** | Native XInput controller mapped directly to virtual DualShock 3 bindings; features 1:1 raw mouse look handling while on foot. |
+| **Audio** | Proprietary `cellAudio` ports mixed down into native 7.1 surround sound audio, processed through the low-latency WASAPI pipeline. |
 
 ## Building
 
