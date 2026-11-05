@@ -382,7 +382,8 @@ FpInfo translate_fp(const FpKey &key) {
          "  float4 cc0 = 0, cc1 = 0;\n"
          "  float face = i.front ? 1 : -1;\n"
          // wpos_info: x = origin bottom, y = window height, zw = multisample scale (pixel = sample / scale)
-         "  float2 px = floor(i.pos.xy / wpos_info.zw) + 0.5;\n"
+         // alpha_ref.y: internal resolution scale, so a guest pixel holds that many steps
+         "  float2 px = (floor(i.pos.xy / wpos_info.zw * alpha_ref.y) + 0.5) / alpha_ref.y;\n"
          "  float4 wpos = float4(px.x, wpos_info.x > 0 ? wpos_info.y - px.y : px.y, i.pos.z, 1 / i.pos.w);\n" +
          body + "  POut o;\n";
     if (fp32) h += "  o.c0 = r[0]; o.c1 = r[2]; o.c2 = r[3]; o.c3 = r[4];\n";

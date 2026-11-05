@@ -8,6 +8,7 @@
 #include "rsx.h"
 #include "idle_backoff.h"
 
+#include <map>
 #include <algorithm>
 #include <atomic>
 #include <set>
@@ -37,6 +38,7 @@ float vp_consts[512 * 4];
 bool vp_consts_dirty = true;
 // Backend costs on the FIFO thread, reported with the fps (rsx::stats_line).
 uint64_t g_wb_us, g_wb_calls, g_draw_us, g_draw_calls, g_present_us;
+uint64_t g_snap_n, g_snap_px;   // snapshots of a target being read while rendered to
 uint64_t g_hash_ns, g_hash_n;   // texture change detection (hashing guest memory)
 // Draws dropped before reaching the GPU, by reason (fps log): no vertex ranges, no render
 // target, index range too large, ring buffer full, no primitives, shader missing.
@@ -96,7 +98,15 @@ uint64_t g_scene_sum;
 // later passes read it that way. We render such surfaces supersampled at
 // their memory size; the transform still uses the clip size (the viewport
 // stretches it) and WPOS is mapped back to pixel space.
-uint32_t g_aa_sx = 1, g_aa_sy = 1;
+float g_aa_sx = 1, g_aa_sy = 1; // host pixels per pixel of the current target, as the game sees it
+// Internal resolution: GPU-local targets render at this many times their size, following the
+// Resolution option (pc_options.cpp); KZ2_RES_SCALE overrides it. Targets in main memory (the SPUs read
+// those) and square ones (shadow maps) keep their size. g_aa_sx and g_aa_sy include it, so viewports,
+// scissors and wpos follow. A change takes effect at the next flip, with new surfaces.
+const int g_res_forced = getenv("KZ2_RES_SCALE") ? atoi(getenv("KZ2_RES_SCALE")) : 0;
+std::atomic<uint32_t> g_res_wanted{g_res_forced > 0 ? (uint32_t)std::min(g_res_forced, 4) : 1u};
+uint32_t g_res_setting = g_res_wanted.load();
+uint32_t g_res_scale = 1;
 // Frame capture: draws of g_log_frame are logged, surfaces dumped when g_dump_frame begins.
 std::atomic<bool> g_capture_req{false};
 std::atomic<bool> g_no_cube{false};   // F11 diagnostic: cube maps read as black
@@ -321,6 +331,7 @@ struct Surface {
     uint64_t sub_serial = 0;
     ID3D11Texture2D *sub_tex = nullptr;
     ID3D11ShaderResourceView *sub_srv = nullptr;
+    uint32_t res = 1;   // internal resolution scale
     ID3D11RenderTargetView *sub_rtv = nullptr;
 };
 
@@ -343,6 +354,7 @@ ID3D11ShaderResourceView *snapshot(Surface &s) {
         }
     }
     g_ctx->CopyResource(s.copy, s.tex);
+    g_snap_n++, g_snap_px += (uint64_t)s.w * s.h;
     return s.copy_srv;
 }
 std::unordered_map<uint32_t, Surface> g_surfaces, g_depth_surfaces;   // by guest address
@@ -465,6 +477,90 @@ struct Bound {
     bool proxied[5] = {};                  // colour 0-3, depth
 };
 
+// KZ2_GPU_TIMING=1: GPU time per render target, logged every 120 frames. Each frame's timestamps
+// are read a few frames later, when the GPU has reached them.
+const bool g_gpu_timing = getenv("KZ2_GPU_TIMING") != nullptr;
+struct GpuFrame {
+    ID3D11Query *disjoint = nullptr;
+    std::vector<std::pair<ID3D11Query *, uint64_t>> marks;
+    int state = 0;      // 0 free, 1 recording, 2 waiting for the GPU
+};
+GpuFrame g_gpu_frames[8];
+int g_gpu_write, g_gpu_read, g_gpu_n;
+std::vector<ID3D11Query *> g_gpu_pool;
+uint64_t g_gpu_last = ~0ull;
+std::map<uint64_t, double> g_gpu_ms;
+double g_gpu_total;
+
+void gpu_mark(uint64_t key) {
+    GpuFrame &f = g_gpu_frames[g_gpu_write];
+    if (f.state != 1) {
+        if (!f.disjoint) {
+            D3D11_QUERY_DESC d{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            g_dev->CreateQuery(&d, &f.disjoint);
+        }
+        g_ctx->Begin(f.disjoint);
+        f.state = 1;
+    }
+    ID3D11Query *q = nullptr;
+    if (!g_gpu_pool.empty()) q = g_gpu_pool.back(), g_gpu_pool.pop_back();
+    else {
+        D3D11_QUERY_DESC d{D3D11_QUERY_TIMESTAMP, 0};
+        g_dev->CreateQuery(&d, &q);
+    }
+    g_ctx->End(q);
+    f.marks.push_back({q, key});
+}
+
+bool gpu_read_frame(GpuFrame &f, bool wait) {
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+    while (g_ctx->GetData(f.disjoint, &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) if (!wait) return false;
+    std::vector<UINT64> t(f.marks.size());
+    for (size_t i = 0; i < f.marks.size(); i++)
+        while (g_ctx->GetData(f.marks[i].first, &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {}
+    if (!dj.Disjoint && t.size() > 1) {
+        for (size_t i = 0; i + 1 < t.size(); i++) g_gpu_ms[f.marks[i].second] += (t[i + 1] - t[i]) * 1e3 / dj.Frequency;
+        g_gpu_total += (t.back() - t.front()) * 1e3 / dj.Frequency;
+        g_gpu_n++;
+    }
+    for (auto &m : f.marks) g_gpu_pool.push_back(m.first);
+    f.marks.clear();
+    f.state = 0;
+    return true;
+}
+
+void gpu_frame_end() {
+    if (!g_gpu_timing) return;
+    GpuFrame &f = g_gpu_frames[g_gpu_write];
+    if (f.state == 1) {
+        gpu_mark(0);
+        g_ctx->End(f.disjoint);
+        f.state = 2;
+    }
+    g_gpu_last = ~0ull;
+    g_gpu_write = (g_gpu_write + 1) % 8;
+    if (g_gpu_frames[g_gpu_write].state == 2) {     // caught up with the oldest frame
+        gpu_read_frame(g_gpu_frames[g_gpu_read], true);
+        g_gpu_read = (g_gpu_read + 1) % 8;
+    }
+    while (g_gpu_read != g_gpu_write && g_gpu_frames[g_gpu_read].state == 2 && gpu_read_frame(g_gpu_frames[g_gpu_read], false))
+        g_gpu_read = (g_gpu_read + 1) % 8;
+    while (g_gpu_read != g_gpu_write && g_gpu_frames[g_gpu_read].state == 0) g_gpu_read = (g_gpu_read + 1) % 8;
+    if (g_gpu_n < 120) return;
+    std::vector<std::pair<double, uint64_t>> v;
+    for (auto &[k, ms] : g_gpu_ms) v.push_back({ms, k});
+    std::sort(v.rbegin(), v.rend());
+    std::string line;
+    char b[64];
+    for (size_t i = 0; i < v.size() && i < 10; i++) {
+        snprintf(b, sizeof b, " %08x@%u %.2f", (uint32_t)(v[i].second >> 32), (uint32_t)v[i].second, v[i].first / g_gpu_n);
+        line += b;
+    }
+    LOG("rsx", "GPU timing: %.1f ms per frame;%s; snapshots %.1f per frame (%.0f MB)", g_gpu_total / g_gpu_n, line.c_str(),
+        (double)g_snap_n / g_gpu_n, g_snap_px * 4.0 / g_gpu_n / 1e6);
+    g_gpu_ms.clear(), g_gpu_total = 0, g_gpu_n = 0, g_snap_n = g_snap_px = 0;
+}
+
 Bound bind_surfaces() {
     Bound b;
     uint32_t fmt = reg(0x0208);
@@ -472,9 +568,16 @@ Bound bind_surfaces() {
     b.w = (reg(0x0200) >> 16) + (reg(0x0200) & 0xffff);
     b.h = (reg(0x0204) >> 16) + (reg(0x0204) & 0xffff);
     uint32_t aa = (fmt >> 12) & 0xf;                 // 3: diagonal 2x, 4/5: square 4x
-    g_aa_sx = aa >= 3 && aa <= 5 ? 2 : 1;
-    g_aa_sy = aa == 4 || aa == 5 ? 2 : 1;
-    uint32_t sw = b.w * g_aa_sx, shh = b.h * g_aa_sy;
+    // No multisampling: the game's multisampled targets render at one sample per pixel. It still
+    // reads them as if they had their samples: see Surface::res_x.
+    const float guest_x = aa >= 3 && aa <= 5 ? 2.f : 1.f, guest_y = aa == 4 || aa == 5 ? 2.f : 1.f;
+    g_res_scale = dma_location(reg(0x0194)) == 0 && b.w != b.h ? g_res_setting : 1;
+    g_aa_sx = g_aa_sy = (float)g_res_scale;
+    (void)guest_x, (void)guest_y;
+    // The game also binds those targets as plain double-width ones, to shade each sample.
+    if (dma_location(reg(0x0194)) == 0 && b.w == 2560 && b.h == 720 && aa < 3)
+        g_aa_sx = g_res_scale / 2.f;
+    uint32_t sw = (uint32_t)(b.w * g_aa_sx), shh = (uint32_t)(b.h * g_aa_sy);
     uint32_t target = reg(0x0220);
     static const uint32_t off_m[4] = {0x0210, 0x0218, 0x0288, 0x028c};     // COLOR_A..D_OFFSET
     static const uint32_t pitch_m[4] = {0x020c, 0x021c, 0x0280, 0x0284};   // SURFACE_PITCH_A..D
@@ -491,12 +594,22 @@ Bound bind_surfaces() {
         if (!(mask & (1 << i))) continue;
         uint32_t ea = ea_for(dma_location(reg(dma_m[i])), reg(off_m[i]));
         b.color[i] = get_surface(ea, cfmt, sw, shh, false);
-        if (b.color[i]) b.color[i]->pitch = reg(pitch_m[i]);
+        if (b.color[i]) b.color[i]->pitch = reg(pitch_m[i]), b.color[i]->res = g_res_scale;
     }
     if (zfmt) {
         uint32_t ea = ea_for(dma_location(reg(0x0198)), reg(0x0214));          // CONTEXT_DMA_ZETA
-        b.depth = get_surface(ea, zfmt, sw, shh, true);
-        if (b.depth) b.depth->pitch = reg(0x022c);                               // SURFACE_PITCH_Z
+        // A scaled pass can use the memory of an unscaled square target as its depth (Killzone 2's
+        // half-size passes reuse the shadow map's). On the PS3 that is only memory; here the two
+        // would fight over one surface's size, so the scaled pass has its own, the size of its colour
+        // target, under a key no real address has: nothing reads this depth back as a texture.
+        uint32_t depth_w = sw, depth_h = shh;
+        if (g_res_scale > 1) {
+            auto shared = g_depth_surfaces.find(ea);
+            if (shared != g_depth_surfaces.end() && shared->second.w == shared->second.h && shared->second.res == 1) ea |= 1;
+            if (ea & 1) for (Surface *c : b.color) if (c) { depth_w = c->w, depth_h = c->h; break; }
+        }
+        b.depth = get_surface(ea, zfmt, depth_w, depth_h, true);
+        if (b.depth) b.depth->pitch = reg(0x022c), b.depth->res = g_res_scale; // SURFACE_PITCH_Z
     }
     // Surfaces keep their largest size, so one address reused for a smaller buffer
     // (Killzone 2: the 1024x1024 shadow map as the 640x360 depth for depth of field,
@@ -518,6 +631,10 @@ Bound bind_surfaces() {
         if (i < 4) b.rtv[i] = v->rtv; else b.dsv = v->dsv;
     }
     g_ctx->OMSetRenderTargets(4, b.rtv, b.dsv);
+    if (g_gpu_timing && first) {
+        const uint64_t key = (uint64_t)first->ea << 32 | sw;
+        if (key != g_gpu_last) g_gpu_last = key, gpu_mark(key);
+    }
     D3D11_VIEWPORT vp{0, 0, (float)sw, (float)shh, 0, 1};
     g_ctx->RSSetViewports(1, &vp);
     return b;
@@ -946,7 +1063,14 @@ bool same_layout(uint32_t sfmt, uint32_t base) {
 // region from there. Colour surfaces: a region copy in the surface's format. 16-bit depth
 // read as X16: a pass writing the depth into all four channels (as decode() does).
 ID3D11PixelShader *g_depth_x16_ps;
+// Host texels across a surface read as w x h. The game reads its multisampled targets as 2560x720,
+// with its samples side by side; here they have one sample per pixel, so that width is half.
+uint32_t surface_width(const Surface &s, uint32_t w, uint32_t h) {
+    return w == 2560 && h == 720 ? 1280 * s.res : w * s.res;
+}
+
 ID3D11ShaderResourceView *sub_view(Surface &s, uint32_t w, uint32_t h) {
+    w = surface_width(s, w, h), h *= s.res;
     if (s.sub_w != w || s.sub_h != h || !s.sub_tex) {
         release(s.sub_srv), release(s.sub_rtv), release(s.sub_tex);
         DXGI_FORMAT f = s.depth ? DXGI_FORMAT_R16G16B16A16_UNORM : color_format(s.fmt);
@@ -982,8 +1106,16 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         uint32_t base = fmt & ~0x60u;
         bool depth_fmt = base >= 0x90 && base <= 0x93;
         auto ds = g_depth_surfaces.find(ea);
+        // A scaled pass's depth that shares a square target's memory has its own surface (see
+        // bind_surfaces). Reads of it at a non-square size are of that one, not the square target.
+        if (w != h) {
+            auto own = g_depth_surfaces.find(ea | 1);
+            if (own != g_depth_surfaces.end() && own->second.w >= w * own->second.res && own->second.h >= h * own->second.res) ds = own;
+        }
         if (ds != g_depth_surfaces.end()) sync_primary(ds->second);
-        bool ds_fits = ds != g_depth_surfaces.end() && ds->second.w == w && ds->second.h == h;
+        const auto holds = [&](const Surface &x) { return x.w == surface_width(x, w, h) && x.h == h * x.res; };
+        const auto covers = [&](const Surface &x) { return x.w >= surface_width(x, w, h) && x.h >= h * x.res; };
+        bool ds_fits = ds != g_depth_surfaces.end() && holds(ds->second);
         if (depth_fmt && ds_fits) {
             if (reg(b + 8) >> 28) dim = (TexDim)(dim | TEX_SHADOW);           // compare function set
             return ds->second.srv;
@@ -1004,19 +1136,19 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
         // KZ2_SUBRECT_GPU=0: read such regions back through guest memory, as before.
         static const bool subrect = !getenv("KZ2_SUBRECT_GPU") || atoi(getenv("KZ2_SUBRECT_GPU"));
         if (subrect && (fmt & 0x20) && s != g_surfaces.end() && !s->second.depth && pitch == s->second.pitch &&
-            s->second.w >= w && s->second.h >= h && (s->second.w != w || s->second.h != h) &&
+            covers(s->second) && !holds(s->second) &&
             same_layout(s->second.fmt, base) && color_format(s->second.fmt) != DXGI_FORMAT_UNKNOWN) {
             trace("GPU region copy of the colour surface");
             if (ID3D11ShaderResourceView *v = sub_view(s->second, w, h)) return v;
         }
         if (subrect && (fmt & 0x20) && base == 0x94 && ds != g_depth_surfaces.end() && ds->second.fmt == 1 &&
-            pitch == ds->second.pitch && ds->second.w >= w && ds->second.h >= h) {
+            pitch == ds->second.pitch && covers(ds->second)) {
             trace("GPU region copy of the Z16 depth surface");
             if (ID3D11ShaderResourceView *v = sub_view(ds->second, w, h)) return v;
         }
         if (s != g_surfaces.end()) {
             Surface &rt = s->second;
-            if (rt.w == w && rt.h == h) {
+            if (holds(rt)) {
                 if (same_layout(rt.fmt, base)) { trace("COLOUR surface at the same address"); return rt.srv; }
                 if (color_format(rt.fmt) == DXGI_FORMAT_R8G8B8A8_UNORM && reinterpretable(base))
                     return reinterpret_view(rt, base);
@@ -1261,6 +1393,10 @@ void apply_state() {
             t.RenderTargetWriteMask = wm0;
             if (k && mrt_state && mrt_mask_seen) {
                 uint32_t m = mrt_mask >> (4 * k);
+                // Decals: blending on, this target's colour written but not its alpha, which the shader
+                // still sets to the same value as target 0's. Unblended, it fills the decal's whole quad.
+                static const bool decal_blend = !getenv("KZ2_DECAL_BLEND") || atoi(getenv("KZ2_DECAL_BLEND"));
+                if (decal_blend && be && (m & 0xf) == 0xe) t.BlendEnable = TRUE;
                 t.RenderTargetWriteMask = ((m >> 1) & 1 ? 1 : 0) | ((m >> 2) & 1 ? 2 : 0) | ((m >> 3) & 1 ? 4 : 0) | (m & 1 ? 8 : 0);
             }
         }
@@ -1317,7 +1453,7 @@ void apply_state() {
     g_ctx->RSSetState(rs);
     uint32_t sh = reg(0x08c0), sv = reg(0x08c4);
     D3D11_RECT r{(LONG)(sh & 0xffff), (LONG)(sv & 0xffff), (LONG)((sh & 0xffff) + (sh >> 16)), (LONG)((sv & 0xffff) + (sv >> 16))};
-    r.left *= g_aa_sx, r.right *= g_aa_sx, r.top *= g_aa_sy, r.bottom *= g_aa_sy;
+    r.left = (LONG)(r.left * g_aa_sx), r.right = (LONG)(r.right * g_aa_sx), r.top = (LONG)(r.top * g_aa_sy), r.bottom = (LONG)(r.bottom * g_aa_sy);
     if (!(sh >> 16) || !(sv >> 16)) r = {0, 0, 8192, 8192};
     g_ctx->RSSetScissorRects(1, &r);
 }
@@ -1924,8 +2060,8 @@ void draw() {
         uint32_t filt = reg(0x1a14 + t * 32);
         if (((filt >> 16) & 0xff) == 7 || ((filt >> 24) & 0xff) == 4) {
             uint32_t k = (filt >> 13) & 7;
-            if (k == 1 || k == 3) texdim[t] |= TEX_QUINCUNX;
-            else if (k == 2) texdim[t] |= TEX_GAUSS;
+            // k 1 and 3 are the quincunx kernel, which resolves multisampling: there is none here.
+            if (k == 2) texdim[t] |= TEX_GAUSS;
         }
         smp[t] = get_sampler(t, texdim[t] & TEX_SHADOW);
     }
@@ -2108,7 +2244,8 @@ void draw() {
     static const bool wpos_flip = !getenv("KZ2_WPOS_FLIP") || atoi(getenv("KZ2_WPOS_FLIP"));   // default on
     px.wpos[0] = (origin_bottom != wpos_flip) ? 1.f : 0.f;
     px.wpos[1] = (float)(reg(0x1d88) & 0xfff);
-    px.wpos[2] = (float)g_aa_sx, px.wpos[3] = (float)g_aa_sy;
+    px.wpos[2] = g_aa_sx, px.wpos[3] = g_aa_sy;
+    px.alpha_ref[1] = (float)g_res_scale;
     for (size_t k = 0; k < ps->consts.size(); k++)
         for (int c = 0; c < 4; c++) px.fc[k * 4 + c] = fp_const_word(fp_ea + ps->consts[k] + 4 * c);
     if (!cb_on) {
@@ -2309,7 +2446,10 @@ void draw() {
             (reg(0x1a18 + t * 32) >> 16) * (reg(0x1a18 + t * 32) & 0xffff) >= 160 * 90)
             samples_main = true;
     // Skip draws that write no colour (occlusion queries); main-memory samplers always dump.
+    // F12 saves only the passes drawing to the display targets; KZ2_CAPTURE_FULL=1: every pass.
+    static const bool capture_full = getenv("KZ2_CAPTURE_FULL") && atoi(getenv("KZ2_CAPTURE_FULL"));
     const bool pass_dump = (int)g_frame == g_log_frame && reg(0x0324) &&
+        (capture_full || (b.color[0] && (b.color[0]->ea == 0xc0010000u || b.color[0]->ea == 0xc0394000u || b.color[0]->ea == 0xc16b0000u || b.color[0]->ea == 0xc12b4000u))) &&
                            ((list.size() <= 6 && g_pass_dumps < 600) || samples_main);
     if (pass_dump)
         for (int t = 0; t < 16; t++)
@@ -2651,7 +2791,7 @@ void write_back(bool all) {
     all |= wb_local;
     auto t0 = std::chrono::steady_clock::now();
     for (auto &[ea, s] : g_surfaces) if (all || ea < mem::LOCAL_BASE) write_back_surface(ea, s);
-    for (auto &[ea, s] : g_depth_surfaces) if (all || ea < mem::LOCAL_BASE) write_back_surface(ea, s);
+    for (auto &[ea, s] : g_depth_surfaces) if (!(ea & 1) && (all || ea < mem::LOCAL_BASE)) write_back_surface(ea, s);
     g_wb_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     g_wb_calls++;
 }
@@ -2782,7 +2922,27 @@ void maybe_screenshot() {
     bb->Release();
 }
 
+// The window's size picks the internal scale: the smallest whole scale that covers it.
+void set_output_size(uint32_t width) {
+    if (g_res_forced <= 0) g_res_wanted = std::min(4u, std::max(1u, (width + 1279) / 1280));
+}
+
 void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
+    if (g_res_wanted.load() != g_res_setting) {
+        g_res_setting = g_res_wanted.load();
+        g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        // Only scaled surfaces change size. The rest stay, with their contents: the game draws its
+        // menu and HUD characters into a square target once, as each is first needed.
+        const auto rescale = [](auto &surfaces) {
+            for (auto it = surfaces.begin(); it != surfaces.end();) {
+                if (it->first >= mem::LOCAL_BASE && it->second.w != it->second.h) free_surface(it->second), it = surfaces.erase(it);
+                else ++it;
+            }
+        };
+        rescale(g_surfaces);
+        rescale(g_depth_surfaces);
+        LOG("rsx", "internal resolution scale: %u", g_res_setting);
+    }
     if (!g_ok) return;
     extern void frame_delay_rsx();
     frame_delay_rsx();
@@ -2845,7 +3005,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     if (it != g_surfaces.end() && !it->second.depth) {
         sync_primary(it->second);
         src = it->second.srv;
-        uv[0] = (float)width / it->second.w, uv[1] = (float)height / it->second.h;
+        uv[0] = (float)(width * it->second.res) / it->second.w, uv[1] = (float)(height * it->second.res) / it->second.h;
     } else if (width && height) {
         // Nothing rendered there by the GPU: show memory contents (CPU-drawn).
         if (!g_cpu_tex) {
@@ -2916,6 +3076,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     }
     extern bool pc_vsync();        // GRAPHICS menu (pc_options.cpp)
     g_swap->Present(pc_vsync() ? 1 : 0, 0);
+    gpu_frame_end();
     g_present_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 

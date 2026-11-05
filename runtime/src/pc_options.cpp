@@ -28,6 +28,10 @@ extern "C"
 }
 void gcm_pc_command(const std::string &cmd);                 // hle_gcm.cpp
 void gcm_set_window(int width, int height, bool borderless); // hle_gcm.cpp
+namespace rsx
+{
+    void set_output_size(uint32_t width); // rsx/d3d.cpp
+}
 
 namespace
 {
@@ -113,7 +117,11 @@ namespace
         if (!getenv("KZ2_VBLANK_US"))
             gcm_pc_command(std::string("fps=") + FPS[g_fps]);
     }
-    void apply_window() { gcm_set_window(RES[g_res].w, RES[g_res].h, g_borderless); }
+    void apply_window()
+    {
+        gcm_set_window(RES[g_res].w, RES[g_res].h, g_borderless);
+        rsx::set_output_size((uint32_t)RES[g_res].w);
+    }
 
     // Runs Lua source in state L, on the guest stack of the calling thread. Registers are restored.
     void lua_run(PPUContext *ctx, uint32_t L, const std::string &code)

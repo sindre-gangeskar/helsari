@@ -8,3 +8,5 @@ kz2.log
 data/
 __pycache__/
 *.bin
+shaders/
+settings.ini
