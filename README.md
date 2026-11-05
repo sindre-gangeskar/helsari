@@ -1,6 +1,10 @@
 <p align="center" width="100%">
       <img src=".github/assets/images/helsari_logo.webp" alt="Helsari Logo" width="80%"/>
-</p>
+</p>  
+<p align="center" width="100%">
+      Unofficial Static Recompilation project for Killzone 2 and Killzone 3
+</p>  
+
 <p align="center" width="100%">
       <img src=".github/assets/images/helsari_message_board.webp" alt="Helsari Message Board" width="80%"/>
 </p>
