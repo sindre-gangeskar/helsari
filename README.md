@@ -1,6 +1,8 @@
 <p align="center" width="100%">
       <img src=".github/assets/images/helsari_logo.webp" alt="Helsari Logo" width="80%"/>
 </p>  
+<p align="center" width="100%"><strong>WIP - Not yet ready for play</strong>
+</p>  
 <p align="center" width="100%">
       <img src=".github/assets/images/helsari_note.webp" alt="Helsari Note" width="80%"/>
 </p>
