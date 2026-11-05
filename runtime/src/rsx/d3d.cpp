@@ -8,6 +8,7 @@
 #include "rsx.h"
 #include "idle_backoff.h"
 
+#include <array>
 #include <map>
 #include <algorithm>
 #include <atomic>
@@ -30,8 +31,12 @@ PromptSet keybind_prompts(); // keybinds.cpp
 void keybind_note_square_prompt(); // keybinds.cpp
 void keybind_paint_hud(unsigned char *rgba, int width, int height); // keybinds.cpp
 bool mouse_turning();     // mouse.cpp
+float mouse_turn_factor(); // mouse.cpp: changes with the zoom
+void mouse_weapon_view(float &yaw, float &pitch); // mouse.cpp
+void mouse_log_aim(); // mouse.cpp
 float pc_viewmodel_sway(); // GAMEPLAY menu (pc_options.cpp)
 namespace rsx {
+bool pc_motion_blur();   // GRAPHICS menu (pc_options.cpp)
 uint32_t regs[0x10000 / 4];
 uint32_t vp_ucode[512 * 4];
 float vp_consts[512 * 4];
@@ -332,6 +337,9 @@ struct Surface {
     ID3D11Texture2D *sub_tex = nullptr;
     ID3D11ShaderResourceView *sub_srv = nullptr;
     uint32_t res = 1;   // internal resolution scale
+    ID3D11Texture2D *ring[3] = {};              // copies on their way back to guest memory (write_back_surface)
+    int ring_first = 0, ring_count = 0;
+    bool ring_stored = false;
     ID3D11RenderTargetView *sub_rtv = nullptr;
 };
 
@@ -372,6 +380,8 @@ DXGI_FORMAT color_format(uint32_t f) {
 
 void free_surface(Surface &s) {
     release(s.rtv); release(s.dsv); release(s.srv); release(s.tex); release(s.copy_srv); release(s.copy); release(s.staging);
+    for (auto *&r : s.ring) release(r);
+    s.ring_first = s.ring_count = 0, s.ring_stored = false;
     release(s.as_color_srv); release(s.as_color_rtv); release(s.as_color);
     release(s.view_srv); release(s.view_rtv); release(s.view);
     release(s.sub_srv); release(s.sub_rtv); release(s.sub_tex);
@@ -786,15 +796,7 @@ void write_back_surface(uint32_t ea, Surface &s) {
                            : s.fmt == 0xb ? 8 : s.fmt == 0xc ? 16 : s.fmt == 0x9 ? 1 : s.fmt == 0xa ? 2 : 4;
     uint32_t w = std::min(s.w, s.pitch / bpp), h = s.h;
     if (!w) return;
-    if (!s.staging) {
-        D3D11_TEXTURE2D_DESC d;
-        s.tex->GetDesc(&d);
-        d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &s.staging))) return;
-    }
-    if (s.copied_serial != s.drawn_serial) g_ctx->CopyResource(s.staging, s.tex), s.copied_serial = s.drawn_serial;
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(g_ctx->Map(s.staging, 0, D3D11_MAP_READ, 0, &m))) return;
+    const auto store = [&](const D3D11_MAPPED_SUBRESOURCE &m) {
     for (uint32_t y = 0; y < h; y++) {
         const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
         uint8_t *dst = (uint8_t *)mem::ptr(ea + y * s.pitch);
@@ -826,6 +828,46 @@ void write_back_surface(uint32_t ea, Surface &s) {
                 dst[4 * x + 3] = src[4 * x + 2];
         }
     }
+    };
+    // Mapping a copy waits for the GPU to finish everything queued before it: at high resolution most of
+    // a frame. What the SPUs read (main memory) need not be that fresh, so its copies go on a queue and
+    // guest memory gets the newest one finished, a frame or two old. The GPU and CPU then work at the
+    // same time, not in turns. KZ2_SYNC_READBACK=1: wait, always fresh.
+    static const bool sync_readback = getenv("KZ2_SYNC_READBACK") != nullptr;
+    if (!sync_readback && ea < mem::LOCAL_BASE && !s.depth) {
+        constexpr int RING = 3;
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (!s.ring[0]) {
+            D3D11_TEXTURE2D_DESC d;
+            s.tex->GetDesc(&d);
+            d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            for (auto *&r : s.ring)
+                if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &r))) return;
+        }
+        const auto store_oldest = [&](UINT flags) {
+            if (!s.ring_count || FAILED(g_ctx->Map(s.ring[s.ring_first], 0, D3D11_MAP_READ, flags, &m))) return false;
+            store(m);
+            g_ctx->Unmap(s.ring[s.ring_first], 0);
+            s.ring_first = (s.ring_first + 1) % RING, s.ring_count--, s.ring_stored = true;
+            return true;
+        };
+        if (s.ring_count == RING) store_oldest(0);      // the GPU is that far behind: wait for it
+        g_ctx->CopyResource(s.ring[(s.ring_first + s.ring_count) % RING], s.tex), s.ring_count++;
+        g_ctx->Flush();
+        while (store_oldest(D3D11_MAP_FLAG_DO_NOT_WAIT)) {}
+        if (!s.ring_stored) store_oldest(0);            // the very first one: nothing to show otherwise
+        return;
+    }
+    if (!s.staging) {
+        D3D11_TEXTURE2D_DESC d;
+        s.tex->GetDesc(&d);
+        d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &s.staging))) return;
+    }
+    if (s.copied_serial != s.drawn_serial) g_ctx->CopyResource(s.staging, s.tex), s.copied_serial = s.drawn_serial;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(g_ctx->Map(s.staging, 0, D3D11_MAP_READ, 0, &m))) return;
+    store(m);
     g_ctx->Unmap(s.staging, 0);
     static int logs;
     if (logs++ < 10) LOG("rsx", "write-back surface 0x%x fmt %u %ux%u pitch 0x%x", ea, s.fmt, w, h, s.pitch);
@@ -2096,34 +2138,68 @@ void draw() {
     float gun_saved[8 * 4];
     bool gun_edited = false;
     const float gun_near = vp_consts[3 * 4 + 2] - vp_consts[3 * 4 + 3];
-    if (gun_near < -0.008f && gun_near > -0.05f && mouse_look_active())
+    // KZ2_GUN_TRACE=1: every frame while zoomed, the game's own pose of the weapon's first mesh.
     {
-        struct Smooth { float m[16], rest[16]; uint64_t last; int frame; };
-        static std::unordered_map<uint64_t, Smooth> meshes;
-        static std::unordered_map<uint64_t, uint32_t> seen;
-        static int frame = -1;
+        static const bool gun_trace = getenv("KZ2_GUN_TRACE") != nullptr;
+        static int traced_frame = -1, traced[2];
+        const int input = mouse_look_active() ? 0 : 1;
+        if (gun_trace && gun_near < -0.008f && gun_near > -0.05f && traced_frame != (int)g_frame && mouse_turn_factor() < 0.99f && traced[input] < 1500)
+        {
+            traced_frame = (int)g_frame, traced[input]++;
+            const float *m = &vp_consts[4 * 4];
+            LOG("guntrace", "%s %.2f live %.4f %.4f %.4f fwd %.4f %.4f %.4f", input ? "pad" : "pc", host_now_ns() / 1e6, m[12], m[13], m[14], m[2], m[6], m[10]);
+        }
+    }
+    static const bool gun_raw = getenv("KZ2_GUN_RAW") != nullptr;   // the game's own pose, untouched
+    // Screen-space overlays can have the same near value: the weapon is the one close to the camera, plus
+    // its mask, far by its transform, which writes only depth and stencil. Left out, the mask stays at the
+    // game's own 15 Hz pose and shows as a trail along the weapon.
+    const float gun_x = vp_consts[4 * 4 + 12], gun_y = vp_consts[4 * 4 + 13], gun_z = vp_consts[4 * 4 + 14];
+    const bool gun_close = gun_x * gun_x + gun_y * gun_y + gun_z * gun_z < 4.f;
+    if ((int)g_frame == g_log_frame && gun_near < -0.002f && gun_near > -0.2f)
+        LOG("gun", "candidate n=%u vs %016llx near %.4f pos %.3f %.3f %.3f close %d rt %08x", (unsigned)list.size(), (unsigned long long)g_vs_hash, gun_near,
+            gun_x, gun_y, gun_z, (int)gun_close, b.color[0] ? b.color[0]->ea : 0);
+    if (!gun_raw && (gun_close || !b.color[0]) && gun_near < -0.008f && gun_near > -0.05f && mouse_look_active())
+    {
+        // One filter, run on the weapon's first mesh in the main scene. Its result is a single rigid
+        // correction that every mesh gets: filtered apart, the hand and the weapon drift against each
+        // other. Parts drawn earlier, in the particle layer, have a slightly different pose, so they only
+        // receive it, the one from the frame before.
+        struct Smooth { float m[16], rest[16], aim[16]; uint64_t last; int frame; };
+        static Smooth f;
+        static uint64_t f_mesh;
+        static float correct_rot[3][3], correct_pos[3];
+        static int frame = -1, filtered_frame = -1;
+        static bool have_correction;
         static bool turning;
-        static uint64_t last_turn_ns;
+        static uint64_t last_turn_ns, last_zoom_ns;
+        static float zoom_factor;
         static const float rot_ms = getenv("KZ2_GUN_ROT_MS") ? (float)atof(getenv("KZ2_GUN_ROT_MS")) : 120.f;
         static const float pos_ms = getenv("KZ2_GUN_POS_MS") ? (float)atof(getenv("KZ2_GUN_POS_MS")) : 40.f;
         static const float fwd_ms = getenv("KZ2_GUN_FWD_MS") ? (float)atof(getenv("KZ2_GUN_FWD_MS")) : 150.f;
         if (frame != (int)g_frame)
         {
             frame = (int)g_frame;
-            seen.clear();
             turning = mouse_turning();
             if (turning)
                 last_turn_ns = host_now_ns();
+            if (mouse_turn_factor() != zoom_factor)
+                zoom_factor = mouse_turn_factor(), last_zoom_ns = host_now_ns();
         }
-        // The same mesh can be drawn twice with different transforms (say, two hands): count them apart.
         const uint64_t mesh = ((uint64_t)(uint32_t)g_vs_hash << 32) | (uint32_t)list.size();
-        Smooth &f = meshes[mesh ^ ((uint64_t)seen[mesh]++ << 24)];
         const uint64_t now = host_now_ns();
         const float *live = &vp_consts[4 * 4];
+        const bool first_draw = filtered_frame != frame && b.color[0] && b.color[0]->ea == 0xc07b0000u;
+        if (first_draw)
+        {
+        filtered_frame = frame, have_correction = true;
+        if (mesh != f_mesh)
+            f_mesh = mesh, f.last = 0;  // another weapon: start from its pose
         float aim[16];
         memcpy(aim, live, sizeof aim);
-        // The resting pose: taken once the mouse has been still for a moment.
-        if (!f.last || (!turning && now - last_turn_ns > 400000000ull))
+        // The resting pose: taken once the mouse has been still for a moment, and all through a zoom in
+        // or out, which really moves the weapon and must not wait for the mouse.
+        if (!f.last || (!turning && now - last_turn_ns > 400000000ull) || now - last_zoom_ns < 600000000ull)
             memcpy(f.rest, live, sizeof f.rest);
         // The viewmodel's parent sits 0.38 below the camera, and its lag turns it about the world's up
         // axis. That swings the lever sideways by lag * 0.38 * sin(pitch), and forward and back with
@@ -2169,26 +2245,82 @@ void draw() {
         else if (f.frame != frame)
         {
             const float dt_ms = (float)(now - f.last) / 1e6f;
-            const float rot = rot_ms > 0.f ? 1.f - expf(-dt_ms / rot_ms) : 1.f, pos = pos_ms > 0.f ? 1.f - expf(-dt_ms / pos_ms) : 1.f;
-            for (int i = 0; i < 12; i++)
-                f.m[i] += (aim[i] - f.m[i]) * rot;
-            for (int i = 12; i < 14; i++)
-                f.m[i] += (aim[i] - f.m[i]) * pos;
-            // Forward and back: the game moves the weapon in and out with the pitch, in steps.
-            f.m[14] += (aim[14] - f.m[14]) * (fwd_ms > 0.f ? 1.f - expf(-dt_ms / fwd_ms) : 1.f);
+            // The game's bob moves the weapon and turns it back so its sights stay on the centre: delayed,
+            // that shows as jitter. So with the mouse still the game's motion passes through untouched, and
+            // only what the turn left behind fades away. While turning: a filter, slower for rotation (the
+            // sway) and for forward and back, which the game moves with the pitch, in steps.
+            const bool still = !turning && now - last_turn_ns > 400000000ull;
+            if (still)
+            {
+                const float keep = pos_ms > 0.f ? expf(-dt_ms / pos_ms) : 0.f;
+                for (int i = 0; i < 15; i++)
+                    f.m[i] = aim[i] + (f.m[i] - f.aim[i]) * keep;
+            }
+            else
+            {
+                const float rot = rot_ms > 0.f ? 1.f - expf(-dt_ms / rot_ms) : 1.f, pos = pos_ms > 0.f ? 1.f - expf(-dt_ms / pos_ms) : 1.f;
+                for (int i = 0; i < 12; i++)
+                    f.m[i] += (aim[i] - f.m[i]) * rot;
+                for (int i = 12; i < 14; i++)
+                    f.m[i] += (aim[i] - f.m[i]) * pos;
+                f.m[14] += (aim[14] - f.m[14]) * (fwd_ms > 0.f ? 1.f - expf(-dt_ms / fwd_ms) : 1.f);
+            }
         }
+        memcpy(f.aim, aim, sizeof f.aim);
         f.last = now;
         f.frame = frame;
+        {
+            static const bool drawn_trace = getenv("KZ2_GUN_TRACE") != nullptr;
+            static int drawn_frame = -1, drawn_count;
+            if (drawn_trace && drawn_frame != frame && zoom_factor < 0.99f && drawn_count < 3000)
+            {
+                drawn_frame = frame, drawn_count++;
+                LOG("guntrace", "drawn %.2f live %.4f %.4f %.4f drawn %.4f %.4f %.4f turning %d", now / 1e6, live[12], live[13], live[14], f.m[12], f.m[13], f.m[14], (int)turning);
+            }
+        }
+        if ((int)g_frame == g_log_frame)
+        {
+            float wv_yaw, wv_pitch;
+            mouse_weapon_view(wv_yaw, wv_pitch);
+            mouse_log_aim();
+            const auto fwd = [](const float *m) { return std::array<float, 3>{m[2], m[6], m[10]}; };
+            const auto a = fwd(live), b2 = fwd(f.m), c2 = fwd(f.rest);
+            LOG("gun", "mesh %016llx n=%u pos live %.4f %.4f %.4f drawn %.4f %.4f %.4f rest %.4f %.4f %.4f | fwd live %.4f %.4f %.4f drawn %.4f %.4f %.4f rest %.4f %.4f %.4f | zoom %.3f turning %d weapon_view %.4f %.4f near %.4f",
+                (unsigned long long)mesh, (unsigned)list.size(), live[12], live[13], live[14], f.m[12], f.m[13], f.m[14], f.rest[12], f.rest[13], f.rest[14],
+                a[0], a[1], a[2], b2[0], b2[1], b2[2], c2[0], c2[1], c2[2], zoom_factor, (int)turning, wv_yaw, wv_pitch, gun_near);
+        }
+        // The correction: the filtered pose after the inverse of the live one.
+        const float scale2 = live[0] * live[0] + live[1] * live[1] + live[2] * live[2];
+        for (int a = 0; a < 3; a++)
+        {
+            for (int k = 0; k < 3; k++)
+            {
+                float sum = 0.f;
+                for (int j = 0; j < 3; j++)
+                    sum += f.m[j * 4 + a] * live[j * 4 + k];
+                correct_rot[a][k] = scale2 > 0.f ? sum / scale2 : (a == k ? 1.f : 0.f);
+            }
+            correct_pos[a] = f.m[12 + a] - (correct_rot[a][0] * live[12] + correct_rot[a][1] * live[13] + correct_rot[a][2] * live[14]);
+        }
+        }
+        float corrected[16];
+        memcpy(corrected, live, sizeof corrected);
+        for (int j = 0; have_correction && j < 4; j++)
+        {
+            for (int a = 0; a < 3; a++)
+                corrected[j * 4 + a] = correct_rot[a][0] * live[j * 4] + correct_rot[a][1] * live[j * 4 + 1] + correct_rot[a][2] * live[j * 4 + 2] + (j == 3 ? correct_pos[a] : 0.f);
+            corrected[j * 4 + 3] = live[j * 4 + 3];
+        }
         const float *c = vp_consts;
         const float sx2 = (live[0] * live[0] + live[4] * live[4] + live[8] * live[8]), sy2 = (live[1] * live[1] + live[5] * live[5] + live[9] * live[9]);
         if (sx2 > 0.f && sy2 > 0.f)
         {
             const float sx = sqrtf((c[0] * c[0] + c[4] * c[4] + c[8] * c[8]) / sx2), sy = sqrtf((c[1] * c[1] + c[5] * c[5] + c[9] * c[9]) / sy2);
             memcpy(gun_saved, vp_consts, sizeof gun_saved);
-            memcpy(&vp_consts[4 * 4], f.m, sizeof f.m);
+            memcpy(&vp_consts[4 * 4], corrected, sizeof corrected);
             for (int j = 0; j < 4; j++)
             {
-                const float *v = &f.m[j * 4];
+                const float *v = &corrected[j * 4];
                 float *out = &vp_consts[j * 4];
                 out[0] = sx * v[0];
                 out[1] = sy * v[1];
@@ -2405,6 +2537,10 @@ void draw() {
         for (auto *c : b.color) if (s && c && s == c->srv) s = snapshot(*c);
         if (s && b.depth && s == b.depth->srv) s = snapshot(*b.depth);
     }
+    // GRAPHICS menu: the motion blur and depth of field reach the screen in this one image. Without it
+    // (read as zero, alpha included) the composite leaves the scene sharp and still adds its glow.
+    if (!pc_motion_blur() && srv[1] && ea_for((reg(0x1a04 + 32) & 3) == 2, reg(0x1a00 + 32)) == 0x31b7d200u)
+        srv[1] = nullptr;
     // On PC input the HUD's button icons come from our copy of their atlas.
     if (reg(0x1a18) == 0x04000200u && reg(0x1a04) == 0x00018829u)
     {

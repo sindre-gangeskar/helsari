@@ -36,6 +36,8 @@ namespace
     constexpr uint64_t VIEW_HOLD_NS = 200000000ull; // two game ticks and a bit
     constexpr uint64_t REST_NS = 250000000ull;   // the game has caught up by then
     constexpr uint64_t ON_FOOT_NS = 200000000ull; // the on-foot look code ran this recently
+    constexpr uint64_t PLAYER_WRITE_NS = 120000000ull; // about two game ticks
+    constexpr uint64_t NEW_PLAYER_NS = 1500000000ull;  // how long a respawn may correct the view
     constexpr uint64_t TURNING_NS = 60000000ull; // a few frames: the mouse does not report on every one
 
     const bool g_mouse_off = getenv("KZ2_MOUSE_OFF") != nullptr;
@@ -46,6 +48,7 @@ namespace
     std::atomic<uint64_t> g_last_move_ns{0}, g_last_look_ns{0}, g_last_onfoot_ns{0};
     std::atomic<bool> g_mouse_active{true}; // PC input; hle_io turns it off when a controller is there
     std::atomic<uint32_t> g_look_entity{0}, g_look_controller{0};
+    std::atomic<uint32_t> g_look_entity_tag{0}, g_look_controller_tag{0}; // their first words at the last tick
     std::atomic<float> g_turn_factor{1.f};
     // How far the game's heading and pitch are from the view, once the mouse is still.
     std::atomic<float> g_residual_yaw{0.f}, g_residual_pitch{0.f};
@@ -54,6 +57,9 @@ namespace
     float g_tick_yaw[3], g_tick_pitch[3];
     uint64_t g_tick_ns[3];
     float g_target_yaw, g_target_pitch; // where the mouse says the view points
+    std::atomic<uint64_t> g_new_player_ns{0}; // when a tick first saw a new player, or one back on foot
+    float g_pending_yaw, g_pending_pitch;     // turns made while the player could not be written
+    float g_weapon_view_yaw, g_weapon_view_pitch; // the weapon_view's last turn, for captures
 
     bool on_foot(uint64_t now) { return now - g_last_onfoot_ns.load(std::memory_order_relaxed) < ON_FOOT_NS; }
 
@@ -164,12 +170,32 @@ namespace
     }
 
     // The player's rotation, measured: entity+64 right and +80 forward, with copies at +128, +464 and
-    // +784 and at controller+88. Not the points ahead of the player (entity+348, +372, controller+300):
-    // rotating those went with crashes and freezes when the player dies.
+    // +784 and at controller+88, and the points ahead of the player: the weapon follows those.
+    // The player is only written while it is certainly still there: a tick looked at it moments ago and
+    // it still starts as it did then. It goes away at death, and its memory is used for something else.
+    bool player_writable(uint32_t e, uint32_t ctl)
+    {
+        if (!e || !ctl || host_now_ns() - g_last_onfoot_ns.load(std::memory_order_relaxed) > PLAYER_WRITE_NS)
+            return false;
+        if (ld32(e) == g_look_entity_tag.load(std::memory_order_relaxed) && ld32(ctl) == g_look_controller_tag.load(std::memory_order_relaxed))
+            return true;
+        static int logs;
+        if (logs++ < 8)
+            LOG("mouse", "player %x / %x changed since the last tick: not writing it", e, ctl);
+        return false;
+    }
+
     void rotate_player(float yaw)
     {
         const uint32_t e = g_look_entity.load(std::memory_order_relaxed), ctl = g_look_controller.load(std::memory_order_relaxed);
-        if (!e || !ctl || !yaw)
+        if (!player_writable(e, ctl))
+        {
+            g_pending_yaw += yaw; // the tick is late (a hit, a stutter): the turn waits for it
+            return;
+        }
+        yaw += g_pending_yaw;
+        g_pending_yaw = 0.f;
+        if (!yaw)
             return;
         const float c = cosf(yaw), s = sinf(yaw);
         for (uint32_t m : {64u, 128u, 464u, 784u})
@@ -178,6 +204,23 @@ namespace
             rotate_xy(e + m + 16, c, s);
         }
         rotate_xy(ctl + 88, c, s);
+        // The points ahead of the player turn about its position (entity+832), and only when they are as
+        // far from it as they should be: 30 units. KZ2_NO_ROTATE_AIM=1 leaves them alone.
+        static const bool rotate_aim = getenv("KZ2_NO_ROTATE_AIM") == nullptr;
+        if (rotate_aim)
+        {
+            const float px = guest_float(e + 832), py = guest_float(e + 836);
+            const auto rotate_point = [&](uint32_t ea, float reach) {
+                const float x = guest_float(ea) - px, y = guest_float(ea + 4) - py, d2 = x * x + y * y;
+                if (!(d2 > reach * reach * 0.25f && d2 < reach * reach * 4.f))
+                    return;
+                guest_float_set(ea, px + x * c - y * s);
+                guest_float_set(ea + 4, py + x * s + y * c);
+            };
+            rotate_point(e + 348, 30.f);
+            rotate_point(e + 372, 30.f);
+            rotate_point(ctl + 300, 30.f);
+        }
     }
 
     // The player's pitch: controller+120, limited by entity+420 and +424 as the look code does.
@@ -185,14 +228,19 @@ namespace
     float pitch_player(float turn)
     {
         const uint32_t e = g_look_entity.load(std::memory_order_relaxed), ctl = g_look_controller.load(std::memory_order_relaxed);
-        if (!e || !ctl)
+        if (!player_writable(e, ctl))
+        {
+            g_pending_pitch += turn;
             return turn;
+        }
+        const float waiting = g_pending_pitch;
+        g_pending_pitch = 0.f;
         const float now = guest_float(ctl + 120), low = guest_float(e + 420), high = guest_float(e + 424);
-        float next = now + turn;
+        float next = now + turn + waiting;
         if (low < high)
             next = next < low ? low : next > high ? high : next;
         guest_float_set(ctl + 120, next);
-        return next - now;
+        return next - now - waiting;
     }
 
     // The camera the viewmodel is drawn with: rebuilt from the player's rotation at the last game ticks,
@@ -203,7 +251,16 @@ namespace
         const uint64_t now = host_now_ns();
         const float ax = guest_float(in + 16), ay = guest_float(in + 20), az = guest_float(in + 24);
         const float len = sqrtf(ax * ax + ay * ay);
-        if (!on_foot(now) || len < 0.001f || !g_tick_ns[2])
+        g_weapon_view_yaw = g_weapon_view_pitch = 0.f;
+        // Only while the mouse turns the view: at rest any difference is the game's own (recoil, a hit),
+        // and correcting it takes the sights off centre. It fades in and out: switched, a slow turn makes it pop.
+        static float weight;
+        static uint64_t last_call;
+        const float step = (float)(now - last_call) / 100000000.f;
+        last_call = now;
+        const float wanted = now - g_last_move_ns.load(std::memory_order_relaxed) < REST_NS ? 1.f : 0.f;
+        weight += (wanted - weight) * (step > 1.f ? 1.f : step);
+        if (!on_foot(now) || len < 0.001f || !g_tick_ns[2] || weight < 0.001f)
             return;
         const float yaw = atan2f(ay, ax), pitch = asinf(az < -1.f ? -1.f : az > 1.f ? 1.f : az);
         const float span = (float)(g_tick_ns[1] - g_tick_ns[2]);
@@ -212,7 +269,8 @@ namespace
         const float want_yaw = g_tick_yaw[2] + wrap_angle(g_tick_yaw[1] - g_tick_yaw[2]) * t;
         const float want_pitch = g_tick_pitch[2] + (g_tick_pitch[1] - g_tick_pitch[2]) * t;
         const auto limit = [](float v) { return v > WEAPON_VIEW_MAX ? WEAPON_VIEW_MAX : v < -WEAPON_VIEW_MAX ? -WEAPON_VIEW_MAX : v; };
-        const float gun_yaw = limit(wrap_angle(want_yaw - yaw)), gun_pitch = limit(want_pitch - pitch);
+        const float gun_yaw = limit(wrap_angle(want_yaw - yaw)) * weight, gun_pitch = limit(want_pitch - pitch) * weight;
+        g_weapon_view_yaw = gun_yaw, g_weapon_view_pitch = gun_pitch;
         rotate_view_vector(in + 16, 0.f, gun_pitch, ay / len, -ax / len);
         rotate_view_vector(in + 28, 0.f, gun_pitch, ay / len, -ax / len);
         const float ux = guest_float(in + 28), uy = guest_float(in + 32), uz = guest_float(in + 36);
@@ -242,6 +300,22 @@ namespace
             return;
         }
         const float yaw = atan2f(ay, ax), pitch = asinf(az < -1.f ? -1.f : az > 1.f ? 1.f : az);
+        { // KZ2_LOOK_LOG: whenever the view and the player are apart, up to ten times a second.
+            static const bool gap_log = getenv("KZ2_LOOK_LOG") != nullptr;
+            static uint64_t last_gap_log;
+            const uint32_t player = g_look_entity.load(std::memory_order_relaxed);
+            if (gap_log && player && now - last_gap_log > 100000000ull)
+            {
+                const float heading = atan2f(guest_float(player + 84), guest_float(player + 80));
+                if (fabsf(wrap_angle(g_target_yaw - heading)) > 0.2f || fabsf(wrap_angle(yaw - heading)) > 0.2f)
+                {
+                    last_gap_log = now;
+                    LOG("mouse", "apart: target %.3f camera %.3f heading %.3f off %.3f on_foot %d look %.0f ms ago onfoot %.0f ms ago moved %.0f ms ago turned %d",
+                        g_target_yaw, yaw, heading, off_yaw, (int)on_foot(now), (now - g_last_look_ns.load()) / 1e6,
+                        (now - g_last_onfoot_ns.load()) / 1e6, (now - g_last_move_ns.load()) / 1e6, (int)mouse_turned);
+                }
+            }
+        }
         if (lr == VIEW_FIRST || now - computed > 50000000ull)
         {
             const float k = RAD_PER_COUNT * g_sensitivity * g_turn_factor.load(std::memory_order_relaxed);
@@ -250,6 +324,23 @@ namespace
             const float sign_y = profile && ld8(profile + PROFILE_INVERT_X) ? -1.f : 1.f;
             const float sign_x = profile && ld8(profile + PROFILE_INVERT_Y) ? -1.f : 1.f;
             const bool resting = now - g_last_move_ns.load(std::memory_order_relaxed) > REST_NS;
+            // What turned the player since our last look at it was the game: a melee hit, a stagger. The
+            // view turns with it, on top of the mouse. KZ2_NO_GAME_TURNS=1: the view ignores them.
+            static const bool game_turns = getenv("KZ2_NO_GAME_TURNS") == nullptr;
+            static uint32_t seen_player;
+            static float seen_heading, seen_pitch;
+            const uint32_t player = g_look_entity.load(std::memory_order_relaxed), controller = g_look_controller.load(std::memory_order_relaxed);
+            if (game_turns && on_foot(now) && player_writable(player, controller))
+            {
+                if (player == seen_player)
+                {
+                    const float heading = atan2f(guest_float(player + 84), guest_float(player + 80));
+                    g_target_yaw = wrap_angle(g_target_yaw + wrap_angle(heading - seen_heading));
+                    g_target_pitch += guest_float(controller + 120) - seen_pitch;
+                }
+                else
+                    g_target_yaw = atan2f(guest_float(player + 84), guest_float(player + 80)), g_target_pitch = pitch;
+            }
             if (!computed || resting)
             {
                 // The mouse has stopped. Whatever gap built up during the turn is closed once by moving
@@ -291,6 +382,16 @@ namespace
                 {
                     rotate_player(turn);
                     turn_pitch = pitch_player(turn_pitch);
+                    // Just after a respawn the view is still the old player's: it may face the other way.
+                    // Only after a tick has seen the new one: during the reload the player is not there.
+                    const uint32_t player = g_look_entity.load(std::memory_order_relaxed);
+                    if (now - g_new_player_ns.load(std::memory_order_relaxed) < NEW_PLAYER_NS &&
+                        player_writable(player, g_look_controller.load(std::memory_order_relaxed)))
+                    {
+                        const float heading = atan2f(guest_float(player + 84), guest_float(player + 80));
+                        if (fabsf(wrap_angle(g_target_yaw - heading)) > MAX_GAP)
+                            g_target_yaw = heading;
+                    }
                 }
                 g_target_pitch += turn_pitch;
                 off_yaw = wrap_angle(g_target_yaw - yaw);
@@ -303,6 +404,12 @@ namespace
                     off_pitch = -MAX_PITCH - pitch;
                 g_target_yaw = wrap_angle(yaw + off_yaw); // a limit stays a limit
                 g_target_pitch = pitch + off_pitch;
+            }
+            if (game_turns && on_foot(now) && player_writable(player, controller))
+            {
+                seen_player = player;
+                seen_heading = atan2f(guest_float(player + 84), guest_float(player + 80));
+                seen_pitch = guest_float(controller + 120);
             }
             last_x = total_x, last_y = total_y;
             // While the mouse moves the game is expected to trail the view, so the difference says
@@ -391,10 +498,49 @@ extern "C" void f_00080a78(PPU_CTX)
     const uint32_t out_y = (uint32_t)ctx->r[4], out_x = (uint32_t)ctx->r[5];
     const uint32_t lr = (uint32_t)ctx->lr;
     g_last_look_ns = host_now_ns();
+    { // KZ2_LOOK_LOG: once a second, which callers run the look code and where the player points.
+        static const bool look_log = getenv("KZ2_LOOK_LOG") != nullptr;
+        static uint32_t callers[4];
+        static uint64_t last_log;
+        if (look_log)
+        {
+            for (uint32_t &c : callers)
+            {
+                if (c == lr)
+                    break;
+                if (!c)
+                {
+                    c = lr;
+                    break;
+                }
+            }
+            const uint64_t t = host_now_ns();
+            if (t - last_log > 1000000000ull)
+            {
+                last_log = t;
+                const uint32_t e = g_look_entity.load(), c = g_look_controller.load();
+                if (e && c)
+                    LOG("mouse", "look callers %x %x %x %x on_foot %d entity %x ctl %x target %.3f entity %.3f ctl %.3f aim_e %.3f %.3f aim_c %.3f moved %.1f s ago",
+                        callers[0], callers[1], callers[2], callers[3], on_foot(t), e, c, g_target_yaw,
+                        atan2f(guest_float(e + 84), guest_float(e + 80)), atan2f(guest_float(c + 92), guest_float(c + 88)),
+                        atan2f(guest_float(e + 352), guest_float(e + 348)), atan2f(guest_float(e + 376), guest_float(e + 372)),
+                        atan2f(guest_float(c + 304), guest_float(c + 300)), (t - g_last_move_ns.load()) / 1e9);
+                memset(callers, 0, sizeof callers);
+            }
+        }
+    }
     if (lr == LOOK_ON_FOOT) // its registers still hold the player and its controller
     {
+        if (g_look_entity.load(std::memory_order_relaxed) != (uint32_t)ctx->r[30] ||
+            host_now_ns() - g_last_onfoot_ns.load(std::memory_order_relaxed) > 500000000ull)
+        {
+            g_new_player_ns = host_now_ns();
+            g_pending_yaw = g_pending_pitch = 0.f;
+        }
         g_look_entity = (uint32_t)ctx->r[30];
         g_look_controller = (uint32_t)ctx->r[31];
+        g_look_entity_tag = ld32((uint32_t)ctx->r[30]);
+        g_look_controller_tag = ld32((uint32_t)ctx->r[31]);
         g_last_onfoot_ns = host_now_ns();
         for (int i = 2; i > 0; i--)
         {
@@ -482,6 +628,23 @@ bool mouse_in_play()
 bool mouse_look_active()
 {
     return !g_mouse_off && g_mouse_active.load(std::memory_order_relaxed);
+}
+
+float mouse_turn_factor() { return g_turn_factor.load(std::memory_order_relaxed); }
+void mouse_weapon_view(float &yaw, float &pitch) { yaw = g_weapon_view_yaw, pitch = g_weapon_view_pitch; }
+
+// For captures: where the player, and the points ahead of it, point, and how far away those are.
+void mouse_log_aim()
+{
+    const uint32_t e = g_look_entity.load(std::memory_order_relaxed), c = g_look_controller.load(std::memory_order_relaxed);
+    if (!e || !c)
+        return;
+    const float px = guest_float(e + 832), py = guest_float(e + 836);
+    const auto angle = [&](uint32_t ea) { return atan2f(guest_float(ea + 4) - py, guest_float(ea) - px); };
+    const auto reach = [&](uint32_t ea) { return hypotf(guest_float(ea + 4) - py, guest_float(ea) - px); };
+    LOG("gun", "aim target %.3f heading %.3f ctl %.3f | points %.3f (%.1f) %.3f (%.1f) %.3f (%.1f)", g_target_yaw,
+        atan2f(guest_float(e + 84), guest_float(e + 80)), atan2f(guest_float(c + 92), guest_float(c + 88)),
+        angle(e + 348), reach(e + 348), angle(e + 372), reach(e + 372), angle(c + 300), reach(c + 300));
 }
 
 bool mouse_turning()

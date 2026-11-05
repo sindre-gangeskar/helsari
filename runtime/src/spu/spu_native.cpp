@@ -19,6 +19,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace rsx { bool pc_depth_of_field(); }   // GRAPHICS menu (pc_options.cpp)
+
 namespace spu {
 
 extern const NativeModule g_native_modules[];      // from the EBOOT (spu_modules.cpp)
@@ -122,7 +124,9 @@ bool SpuThread::map_module(const NativeModule *m) {
     if (slot < 0) return false;
     if (!native) native = std::make_unique<NativeFn[]>(LS_SIZE / 4);
     for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = m->entries[i].fn;
-    if (job_skipped(m->name)) native[(m->ls_base + JOB_ENTRY) >> 2] = skip_job;
+    // job_d65480 is the depth of field. Jobs map many times a frame, so the menu's choice applies at once.
+    if (job_skipped(m->name) || (!::rsx::pc_depth_of_field() && !strcmp(m->name, "job_d65480")))
+        native[(m->ls_base + JOB_ENTRY) >> 2] = skip_job;
     // code_q for this module: computed once, copied at every map (jobs map hundreds of times a frame).
     {
         static std::mutex lock;

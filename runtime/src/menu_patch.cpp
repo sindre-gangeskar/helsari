@@ -78,7 +78,7 @@ namespace menu_patch
                 return std::string("<_l name=\"") + name + "\" c=\"_Normal\" p=\"16,14,620," + std::to_string(height) + "\" a=\"true\" bn=\"DOWN_BUTTON\" bp=\"UP_BUTTON\" g=\"" + std::to_string(g) + "\" /> ";
             };
             const auto end = [](int g) { return "<_l: name=\"!\" g=\"" + std::to_string(g) + "\" /> "; };
-            std::string out = list("lG", 203, 900) + row("F", 0, 901, "fps", 29) + row("R", 29, 902, "res", 29) + row("M", 58, 903, "mode", 29) + row("V", 87, 904, "vsync", 29) + end(900);
+            std::string out = list("lG", 203, 900) + row("F", 0, 901, "fps", 29) + row("R", 29, 902, "res", 29) + row("M", 58, 903, "mode", 29) + row("V", 87, 904, "vsync", 29) + row("B", 116, 907, "fx", 29) + end(900);
             out += list("lP", 203, 905) + row("S", 0, 906, "sway", 29) + end(905);
             constexpr int ROW = 26;
             out += list("lK", KEYBIND_COUNT * ROW, 910);
