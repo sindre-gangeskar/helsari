@@ -5,8 +5,12 @@
 #include <windows.h>
 
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #define REG(n) hle_register(#n, hle_##n)
 
@@ -181,14 +185,69 @@ HLE(cellGameContentPermit) {
     mem::write_cstr(ARG32(1), "/dev_bdvd/PS3_GAME/USRDIR", 128);
     RET(0);
 }
+// PARAM.SFO of the user's dump: little-endian header, an index of entries,
+// then a key table and a data table. Read once, at the first query.
+namespace {
+struct SfoValue { bool is_int; uint32_t i; std::string s; };
+const std::map<std::string, SfoValue> &sfo() {
+    static const std::map<std::string, SfoValue> m = [] {
+        std::map<std::string, SfoValue> out;
+        std::string path = cfg::dump_dir + "/PS3_GAME/PARAM.SFO";
+        FILE *f = fopen(path.c_str(), "rb");
+        if (!f) { LOG("game", "cannot read %s", path.c_str()); return out; }
+        std::vector<uint8_t> d;
+        uint8_t buf[4096];
+        for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) d.insert(d.end(), buf, buf + n);
+        fclose(f);
+        auto u16 = [&](size_t o) { return o + 2 <= d.size() ? (uint32_t)(d[o] | d[o + 1] << 8) : 0u; };
+        auto u32 = [&](size_t o) { return o + 4 <= d.size() ? u16(o) | u16(o + 2) << 16 : 0u; };
+        if (d.size() < 20 || memcmp(d.data(), "\0PSF", 4)) { LOG("game", "%s: not a PARAM.SFO", path.c_str()); return out; }
+        const uint32_t keys = u32(8), data = u32(12), count = u32(16);
+        for (uint32_t k = 0; k < count; k++) {
+            const size_t e = 20 + 16 * (size_t)k;
+            const size_t ko = keys + u16(e), vo = data + u32(e + 12);
+            const uint32_t fmt = u16(e + 2), len = u32(e + 4);
+            if (ko >= d.size() || vo + len > d.size()) break;
+            std::string key((const char *)&d[ko], strnlen((const char *)&d[ko], d.size() - ko));
+            if (fmt == 0x0404) out[key] = {true, u32(vo), {}};
+            else out[key] = {false, 0, std::string((const char *)&d[vo], strnlen((const char *)&d[vo], len))};
+        }
+        return out;
+    }();
+    return m;
+}
+const SfoValue *sfo_get(const char *key) {
+    // Debugging: HELSARI_SFO_ZERO="KEY,KEY" answers 0 / "" for those keys.
+    static const std::string zero = [] { const char *z = getenv("HELSARI_SFO_ZERO"); return z ? "," + std::string(z) + "," : ""; }();
+    static const SfoValue empty_int{true, 0, {}}, empty_str{false, 0, {}};
+    if (zero.find("," + std::string(key) + ",") != std::string::npos) {
+        LOG("game", "%s: answering 0 (HELSARI_SFO_ZERO)", key);
+        auto it = sfo().find(key);
+        return it != sfo().end() && !it->second.is_int ? &empty_str : &empty_int;
+    }
+    auto it = sfo().find(key);
+    return it == sfo().end() ? nullptr : &it->second;
+}
+} // namespace
+
 HLE(cellGameGetParamInt) {
-    // 50 PARENTAL_LEVEL, 60 RESOLUTION, 61 SOUND_FORMAT
-    uint32_t v = ARG32(0) == 60 ? 0x3f : ARG32(0) == 61 ? 0x17 : ARG32(0) == 50 ? 5 : 0;
-    put32(ARG32(1), v);
+    // 102 PARENTAL_LEVEL, 103 RESOLUTION, 104 SOUND_FORMAT
+    const uint32_t id = ARG32(0);
+    const char *key = id == 102 ? "PARENTAL_LEVEL" : id == 103 ? "RESOLUTION" : id == 104 ? "SOUND_FORMAT" : nullptr;
+    const SfoValue *v = key ? sfo_get(key) : nullptr;
+    if (!v || !v->is_int) LOG("game", "GetParamInt %u: no value", id);
+    put32(ARG32(1), v && v->is_int ? v->i : 0);
     RET(0);
 }
 HLE(cellGameGetParamString) {
-    const char *s = ARG32(0) == 100 ? "Helsari" : ARG32(0) == 102 ? "BCES00081" : ARG32(0) == 104 ? "01.00" : "";
+    // 0-20 titles (default and per language), 100 TITLE_ID, 101 VERSION, 106 APP_VER.
+    // The title stays our own: the save folder name is built from it.
+    const uint32_t id = ARG32(0);
+    std::string s;
+    if (id <= 20) s = getenv("HELSARI_SFO_ZERO") && strstr(getenv("HELSARI_SFO_ZERO"), "TITLE,") ? "" : "Helsari";
+    else if (const SfoValue *v = sfo_get(id == 100 ? "TITLE_ID" : id == 101 ? "VERSION" : id == 106 ? "APP_VER" : ""))
+        s = v->s;
+    else LOG("game", "GetParamString %u: no value", id);
     mem::write_cstr(ARG32(1), s, ARG32(2) ? ARG32(2) : 1);
     RET(0);
 }

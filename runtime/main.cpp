@@ -26,6 +26,8 @@ void register_spurs_kernel();
 void register_spurs_tasks();
 void register_sync();
 void register_savedata();
+void register_vdec();
+void register_adec();
 void start_profiler();
 void hle_dump_counts();
 void rsx_dump_methods();
@@ -40,6 +42,8 @@ void hle_register_all() {
     register_spurs_tasks();
     register_sync();
     register_savedata();
+    register_vdec();
+    register_adec();
     start_profiler();
 }
 

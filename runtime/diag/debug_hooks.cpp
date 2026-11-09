@@ -71,3 +71,44 @@ extern "C" void f_00a4a99c(PPU_CTX) {
     }
     f_00a4a99c_guest(ctx);
 }
+
+// The scripts' trace and print functions (one empty function in the shipped
+// game): log their text arguments, so the menu scripts' progress shows in the
+// log. HELSARI_NO_SCRIPT_TRACE=1 turns it off.
+extern "C" void f_003e2630_guest(PPU_CTX);
+extern "C" void f_003f0388(PPU_CTX);   // lua_gettop(L)
+extern "C" void f_003f0980(PPU_CTX);   // lua_tolstring(L, index, len)
+
+extern "C" void f_003e2630(PPU_CTX) {
+    static const bool off = getenv("HELSARI_NO_SCRIPT_TRACE") != nullptr;
+    if (!off) {
+        const PPUContext saved = *ctx;
+        const uint32_t L = (uint32_t)saved.r[3];
+        ctx->r[1] = (saved.r[1] - 256) & ~15ull;
+        st64(ctx->r[1], saved.r[1]);
+        ctx->r[3] = L;
+        f_003f0388(ctx);
+        const int top = (int32_t)ctx->r[3];
+        std::string line;
+        for (int i = 1; i <= top && i <= 8; i++) {
+            ctx->r[3] = L, ctx->r[4] = (uint64_t)i, ctx->r[5] = 0;
+            f_003f0980(ctx);   // numbers convert in place; other types give no text
+            const uint32_t s = (uint32_t)ctx->r[3];
+            line += i > 1 ? " " : "";
+            line += s ? std::string((const char *)mem::ptr(s)).substr(0, 300) : "?";
+        }
+        LOG("lua", "trace: %s", line.c_str());
+        *ctx = saved;
+    }
+    f_003e2630_guest(ctx);
+}
+
+// Script SwitchToGameModule: logs the handler it calls (a descriptor stored at +76 of the module
+// object that r3 points to), so the switch can be followed.
+extern "C" void f_00077310_guest(PPU_CTX);
+extern "C" void f_00077310(PPU_CTX) {
+    const uint32_t obj = ld32((uint32_t)ctx->r[3]), opd = obj ? ld32(obj + 76) : 0;
+    LOG("module", "SwitchToGameModule: object 0x%x, handler 0x%x (code 0x%x)", obj, opd, opd ? ld32(opd) : 0);
+    f_00077310_guest(ctx);
+    LOG("module", "SwitchToGameModule returned 0x%llx", (unsigned long long)ctx->r[3]);
+}

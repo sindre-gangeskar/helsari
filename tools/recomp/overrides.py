@@ -15,6 +15,10 @@ OVERRIDES = {
     0x72680: 'microthread pick (next runnable context; backs off while none is ready)',
     # Debugging hook (runtime/diag/debug_hooks.cpp): logs reads that land in HELSARI_HOOK_WATCH.
     0xa4a99c: 'buffered asset stream read (stream, dst, size)',
+    # Debugging hook (runtime/diag/debug_hooks.cpp): the scripts' trace and print
+    # functions, empty in this build, are logged.
+    0x3e2630: 'script trace / print (L): does nothing in the shipped game',
+    0x77310: 'script SwitchToGameModule (L): calls a handler stored in the module object',
     # GRAPHICS section of the options menu (port/pc_options.cpp).
     0x47ccc0: 'menu URL dispatcher (this, url): takes the clicks of our rows',
     0x47b900: 'calls a script function: adds our section when a page opens',

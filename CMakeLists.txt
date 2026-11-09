@@ -116,6 +116,8 @@ add_executable(helsari
   runtime/spu/spu_native.cpp
   runtime/spu/spu_capture.cpp
   libs/codec/inflate.cpp
+  libs/codec/vdec.cpp
+  libs/codec/adec.cpp
   libs/video/rsx/vp.cpp
   libs/video/rsx/fp.cpp
   libs/video/rsx/d3d.cpp)
@@ -133,7 +135,7 @@ target_compile_definitions(helsari PRIVATE
   HELSARI_DEFAULT_DUMP="${_dump}"
   HELSARI_DEFAULT_ELF="${GEN_DIR}/decrypt/EBOOT.elf")
 target_compile_options(helsari PRIVATE -O2 -g -march=${HELSARI_MARCH})
-target_link_libraries(helsari PRIVATE helsari_spu helsari_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm ole32 synchronization)
+target_link_libraries(helsari PRIVATE helsari_spu helsari_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm ole32 synchronization mfplat mfuuid)
 if(MINGW)
   target_link_options(helsari PRIVATE -static)
 else()

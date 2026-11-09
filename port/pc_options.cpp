@@ -13,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <map>
 #include <vector>
 
 extern "C"
@@ -350,6 +351,37 @@ namespace
         return out;
     }
 
+    // Debugging: HELSARI_LUA_WATCH="name,name" logs those script globals whenever their value
+    // changes, checked ten times a second while a page updates. Reads only, runs no Lua code.
+    void lua_watch(PPUContext *ctx, uint32_t L)
+    {
+        static const std::vector<std::string> names = [] {
+            std::vector<std::string> v;
+            if (const char *p = getenv("HELSARI_LUA_WATCH"))
+                for (std::string s = p; !s.empty();)
+                {
+                    const size_t c = s.find(',');
+                    v.push_back(s.substr(0, c));
+                    s = c == std::string::npos ? "" : s.substr(c + 1);
+                }
+            return v;
+        }();
+        static std::map<std::string, std::string> seen;
+        static uint64_t last;
+        const uint64_t now = host_now_ns();
+        if (names.empty() || now - last < 100000000ull)
+            return;
+        last = now;
+        for (const std::string &n : names)
+        {
+            std::string v = lua_global(ctx, L, n.c_str());
+            if (seen.count(n) && seen[n] == v)
+                continue;
+            seen[n] = v;
+            LOG("lua", "watch: %s = %s", n.c_str(), v.empty() ? "(nil or not text)" : v.c_str());
+        }
+    }
+
     // The Field of View slider: read while the page updates, ten times a second.
     void fov_slider(PPUContext *ctx, uint32_t L)
     {
@@ -490,6 +522,20 @@ extern "C" void f_0047b900(PPU_CTX)
     std::string call;
     if (uint32_t s = ld32(call_ref))
         call = (const char *)mem::ptr(s + 16);
+    // Debugging: HELSARI_TRACE_SCRIPT_CALLS=1 logs every script call the menu makes; page
+    // updates (every frame) are only counted, once a second.
+    static const bool trace_calls = getenv("HELSARI_TRACE_SCRIPT_CALLS") != nullptr;
+    if (trace_calls)
+    {
+        static uint64_t last, updates;
+        if (call == "OnUpdatePage")
+            updates++;
+        else
+            LOG("script", "call %s (script 0x%x)", call.c_str(), script);
+        const uint64_t now = host_now_ns();
+        if (now - last >= 1000000000ull)
+            LOG("script", "%llu page updates in the last second", (unsigned long long)updates), updates = 0, last = now;
+    }
     // Before the call: a script can open another page from OnEnterPage, which destroys its state.
     // The options table exists by now, it is built at the script's top level.
     // Scripts load lazily: the wrapper at M checks its load state (+12) before each use and loads
@@ -506,7 +552,7 @@ extern "C" void f_0047b900(PPU_CTX)
     if (G)
         g_L = L; // a script of the page in use: any of them can reach the page's tags
     if (G && call == "OnUpdatePage")
-        menu_mouse(ctx, L), fov_slider(ctx, L);
+        menu_mouse(ctx, L), fov_slider(ctx, L), lua_watch(ctx, L);
     if (G && call == "OnEnterPage")
     {
         std::lock_guard<std::mutex> lk(g_lock);

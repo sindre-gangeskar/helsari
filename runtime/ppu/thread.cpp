@@ -32,6 +32,7 @@ struct Thread {
     int call_depth = 0;
     const char *call_name = nullptr;
     uint64_t call_t0 = 0;
+    uint64_t last_stack_ns = 0;   // HELSARI_STACKS
     std::mutex stats_lock;
     std::map<const char *, uint64_t> call_ns;
 };
@@ -94,6 +95,26 @@ Thread *make(uint32_t entry_opd, uint64_t arg, uint32_t stack, const char *name,
 void note_call(const char *name, PPUContext *ctx, bool entering) {
     if (!t_cur) return;
     if (entering) {
+        // HELSARI_STACKS=<seconds>: every so often each thread logs its guest call stack at its
+        // next OS call (frames link through r1; each caller's return address is at +16).
+        static const uint64_t stack_ns = getenv("HELSARI_STACKS") ? (uint64_t)atoi(getenv("HELSARI_STACKS")) * 1000000000ull : 0;
+        if (stack_ns && t_cur->call_depth == 0) {
+            const uint64_t now = host_now_ns();
+            if (now - t_cur->last_stack_ns >= stack_ns) {
+                t_cur->last_stack_ns = now;
+                std::string s;
+                uint32_t sp = (uint32_t)ctx->r[1];
+                for (int i = 0; i < 24 && sp >= 0x10000 && sp < 0xf0000000u; i++) {
+                    const uint32_t up = (uint32_t)ld64(sp);
+                    if (!up || up <= sp) break;
+                    char b[16];
+                    snprintf(b, sizeof b, " %x", (uint32_t)ld64(up + 16));
+                    s += b;
+                    sp = up;
+                }
+                LOG("stack", "%s in %s, lr %llx:%s", t_cur->name.c_str(), name, (unsigned long long)ctx->lr, s.c_str());
+            }
+        }
         // usleep is how the game polls: account it per call site (lr), to find the loop.
         if (t_cur->call_depth == 0 && !strcmp(name, "syscall_141")) {
             static std::mutex m;

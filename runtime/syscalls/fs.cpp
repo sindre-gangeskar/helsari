@@ -92,12 +92,10 @@ std::string host_path(const std::string &p) {
     return cfg::data_dir + "/unmapped" + p;
 }
 
-// Movies need cellVdec/cellAdec, which are stubs: hide them so the game
-// skips playback instead of waiting forever for decoded frames.
-// HELSARI_PLAY_MOVIES=1 opens them anyway.
+// HELSARI_SKIP_MOVIES=1 hides the movies, so the game skips playback.
 bool hidden_movie(const std::string &path) {
-    static bool play = getenv("HELSARI_PLAY_MOVIES") != nullptr;
-    return !play && path.find("/MOVIES/") != std::string::npos;
+    static bool skip = getenv("HELSARI_SKIP_MOVIES") != nullptr;
+    return skip && path.find("/MOVIES/") != std::string::npos;
 }
 
 int32_t open(const std::string &path, int32_t flags, uint32_t *fd) {

@@ -42,8 +42,11 @@ struct Workload {
     uint64_t data = 0;
     std::string name;
     // Ready count and contention live in the CellSpurs structure in guest
-    // memory (wklReadyCount1 at +0x00, wklCurrentContention at +0x10, one byte
+    // memory (wklReadyCount1 at +0x00, contention assumed at +0x10, one byte
     // per workload id), where the SPU-side module updates them with atomics.
+    // The byte at +0x10 also carries a value of the game's own (47 above our
+    // count for the MP3 job list), so cellSpursGetWorkloadInfo reports
+    // `running` instead of reading it back.
     uint8_t *ready_byte() const { return (uint8_t *)mem::ptr(spurs + 0x00 + id); }
     uint8_t *contention_byte() const { return (uint8_t *)mem::ptr(spurs + 0x10 + id); }
     uint8_t ready_raw() const { return __atomic_load_n(ready_byte(), __ATOMIC_SEQ_CST); }
@@ -497,7 +500,18 @@ HLE(cellSpursGetWorkloadInfo) {
         st64(info + 0, w->data);
         st32(info + 16, w->pm);
         st32(info + 20, w->size);
-        *(uint8_t *)mem::ptr(info + 32) = *w->contention_byte();   // contention
+        // Contention: how many SPUs run the workload now. Report our own count, not the guest
+        // byte: that byte drifted (47 with nothing running) and the sound streams wait for 0
+        // before they stop, which hung the switch from the menu to the game.
+        const int running = w->running.load();
+        const uint8_t byte = *w->contention_byte();
+        if (byte != (uint8_t)running) {
+            static int logged;
+            if (logged++ < 5)
+                LOG("spurs", "workload %u '%s': contention byte %u, but %d instances run - reporting %d", w->id,
+                    w->name.c_str(), byte, running, running);
+        }
+        *(uint8_t *)mem::ptr(info + 32) = (uint8_t)running;   // contention
         *(uint8_t *)mem::ptr(info + 35) = w->ready();               // readyCount
     }
     RET(0);
