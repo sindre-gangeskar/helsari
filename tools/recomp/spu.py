@@ -6,7 +6,7 @@ EBOOT to a fixed LS address. Each such image is compiled as one "module":
 its words are swept linearly and split into basic blocks, and every block
 start becomes an entry point. Instruction semantics are not generated here:
 each instruction is a call to the runtime's step<OP>(thread, insn, pc)
-(runtime/src/spu/spu_ops.h) with constant operands, so recompiled code and
+(runtime/spu/spu_ops.h) with constant operands, so recompiled code and
 the interpreter execute identical semantics. Only control flow is compiled.
 
 A generated chunk function `uint32_t f(SpuThread &t, uint32_t pc)` starts at
@@ -21,7 +21,7 @@ import os
 import re
 import struct
 
-OPS_HEADER = os.path.join(os.path.dirname(__file__), '..', '..', 'runtime', 'src', 'spu', 'spu_ops.h')
+OPS_HEADER = os.path.join(os.path.dirname(__file__), '..', '..', 'runtime', 'spu', 'spu_ops.h')
 LS_MASK = 0x3fffc
 CHUNK_INSNS = 4000             # instructions per generated function (larger: slow, memory-hungry compiles)
 JOB_LS_BASE = 0x4000          # job managers DMA job binaries here (observed for jm_post)

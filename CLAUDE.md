@@ -12,6 +12,7 @@ Helsari is a static recompiler and runtime. **This repository contains no code o
 - Captures and dumps: `pass_*.bmp`, `rt_*.bmp`, `tex_*.bin`, captured `.hlsl`, frame or run logs, screenshots of the game
 - Saves and local settings: `CHECKPNT.DAT`, `build/data/`, `settings.ini`
 - Sony SDK files or system modules, and encryption keys or firmware
+- Code from other recompilation projects, including ps3recomp and other ports of this game: we may study their design, but every line here is our own
 
 ## What is fine
 

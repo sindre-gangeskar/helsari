@@ -88,46 +88,46 @@ endif()
 
 add_executable(helsari
   ${BUILD_STAMP_SRC}
-  runtime/src/main.cpp
-  runtime/src/core.cpp
-  runtime/src/memory.cpp
-  runtime/src/thread.cpp
-  runtime/src/fibers.cpp
-  runtime/src/debug_hooks.cpp
-  runtime/src/kernel.cpp
-  runtime/src/syscalls.cpp
-  runtime/src/fs.cpp
-  runtime/src/menu_patch.cpp
-  runtime/src/pc_options.cpp
-  runtime/src/mouse.cpp
-  runtime/src/keybinds.cpp
-  runtime/src/hle_sys.cpp
-  runtime/src/hle_gcm.cpp
-  runtime/src/hle_io.cpp
-  runtime/src/dualsense.cpp
-  runtime/src/spurs.cpp
-  runtime/src/spurs_kernel.cpp
-  runtime/src/spurs_tasks.cpp
-  runtime/src/sync.cpp
-  runtime/src/savedata.cpp
-  runtime/src/profiler.cpp
-  runtime/src/spu/spu_interp.cpp
-  runtime/src/spu/spu_mfc.cpp
-  runtime/src/spu/spu_native.cpp
-  runtime/src/spu/spu_capture.cpp
-  runtime/src/inflate.cpp
-  runtime/src/rsx/vp.cpp
-  runtime/src/rsx/fp.cpp
-  runtime/src/rsx/d3d.cpp)
+  runtime/main.cpp
+  runtime/core.cpp
+  runtime/memory/memory.cpp
+  runtime/ppu/thread.cpp
+  runtime/ppu/fibers.cpp
+  runtime/diag/debug_hooks.cpp
+  runtime/syscalls/kernel.cpp
+  runtime/syscalls/syscalls.cpp
+  runtime/syscalls/fs.cpp
+  port/menu_patch.cpp
+  port/pc_options.cpp
+  port/mouse.cpp
+  port/keybinds.cpp
+  libs/system/hle_sys.cpp
+  libs/video/hle_gcm.cpp
+  libs/input/hle_io.cpp
+  libs/input/dualsense.cpp
+  libs/spurs/spurs.cpp
+  libs/spurs/spurs_kernel.cpp
+  libs/spurs/spurs_tasks.cpp
+  runtime/syscalls/sync.cpp
+  libs/system/savedata.cpp
+  runtime/diag/profiler.cpp
+  runtime/spu/spu_interp.cpp
+  runtime/spu/spu_mfc.cpp
+  runtime/spu/spu_native.cpp
+  runtime/spu/spu_capture.cpp
+  libs/codec/inflate.cpp
+  libs/video/rsx/vp.cpp
+  libs/video/rsx/fp.cpp
+  libs/video/rsx/d3d.cpp)
 set_target_properties(helsari PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON OUTPUT_NAME helsari2)
 
 # Recompiled SPU code (EBOOT modules and the runtime-captured cache).
 add_library(helsari_spu STATIC ${GENERATED_SPU_SOURCES} ${SPU_RT_SOURCES})
 add_dependencies(helsari_spu spu_cache_gen)
 set_target_properties(helsari_spu PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON JOB_POOL_COMPILE spu_pool)
-target_include_directories(helsari_spu PRIVATE runtime/include runtime/src ${GEN_DIR})
+target_include_directories(helsari_spu PRIVATE runtime/include runtime runtime/spu runtime/syscalls runtime/ppu runtime/memory runtime/diag libs libs/video libs/video/rsx libs/spurs libs/input libs/system libs/codec port ${GEN_DIR})
 target_compile_options(helsari_spu PRIVATE -O2 -march=${HELSARI_MARCH} -Wno-unused-label)
-target_include_directories(helsari PRIVATE runtime/include runtime/src ${GEN_DIR})
+target_include_directories(helsari PRIVATE runtime/include runtime runtime/spu runtime/syscalls runtime/ppu runtime/memory runtime/diag libs libs/video libs/video/rsx libs/spurs libs/input libs/system libs/codec port ${GEN_DIR})
 cmake_path(SET _dump NORMALIZE "${HELSARI_DUMP}")
 target_compile_definitions(helsari PRIVATE
   HELSARI_DEFAULT_DUMP="${_dump}"

@@ -64,8 +64,8 @@ namespace
     const char *const SCREEN_FX[] = {"MOTION BLUR + DEPTH OF FIELD", "MOTION BLUR ONLY", "OFF"};
     constexpr int SCREEN_FX_N = 3;
     std::atomic<int> g_screen_fx{0};
-    const int FOV_VALUES[] = {0, 80, 85, 90, 95, 100, 105, 110}; // horizontal degrees; 0 is the game's own, 72.7
-    constexpr int FOV_N = 8;
+    // Horizontal field of view in degrees, 74 to 110; 0 is the game's own, 72.7, shown as 73 on its slider.
+    constexpr int FOV_MIN = 73, FOV_MAX = 110;
     std::atomic<int> g_fov{0};
     std::atomic<int> g_sway{3};
     std::atomic<uint32_t> g_L{0}; // Lua state of the page's script
@@ -76,7 +76,7 @@ namespace
         if (FILE *f = fopen(SETTINGS_FILE, "w"))
         {
             fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
-                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), FOV_VALUES[g_fov.load()], SWAY[g_sway.load()]);
+                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), g_fov.load(), SWAY[g_sway.load()]);
             for (int i = 0; i < KEYBIND_COUNT; i++)
                 fprintf(f, "key_%s=%d\n", keybind_id(i), keybind_key(i));
             fclose(f);
@@ -119,9 +119,7 @@ namespace
             }
             else if (sscanf(line, "field_of_view=%d", &a) == 1)
             {
-                for (int i = 0; i < FOV_N; i++)
-                    if (FOV_VALUES[i] == a)
-                        g_fov = i;
+                g_fov = a > FOV_MIN && a <= FOV_MAX ? a : 0;
             }
             else if (sscanf(line, "key_%63[^=]=%d", s, &a) == 2)
             {
@@ -227,17 +225,16 @@ namespace
     std::string show_values()
     {
         char res[48], sway[48], fov[48];
-        if (FOV_VALUES[g_fov.load()])
-            snprintf(fov, sizeof fov, "FIELD OF VIEW: %d", FOV_VALUES[g_fov.load()]);
-        else
-            snprintf(fov, sizeof fov, "FIELD OF VIEW: 73 (ORIGINAL)");
+        const int fov_degrees = g_fov.load() ? g_fov.load() : FOV_MIN;
+        snprintf(fov, sizeof fov, "FIELD OF VIEW: %d", fov_degrees);
         snprintf(res, sizeof res, "RESOLUTION: %d X %d", RES[g_res].w, RES[g_res].h);
         snprintf(sway, sizeof sway, "VIEWMODEL SWAY MULTIPLIER: %.2fX", SWAY[g_sway.load()]);
         return LUA_SET +
                set_text("tF", std::string("FRAMERATE LIMIT: ") + FPS[g_fps]) + set_text("tR", res) +
                set_text("tM", g_borderless ? "WINDOW MODE: BORDERLESS" : "WINDOW MODE: WINDOWED") +
                set_text("tV", g_vsync ? "VSYNC: ON" : "VSYNC: OFF") +
-               set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) + show_keys();
+               set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) + show_keys() +
+               "local fov_slider = gBrowser:GetTagByName(\"sO\")\nif fov_slider then fov_slider:SetCurrentValue(" + std::to_string(fov_degrees) + ") end\n";
     }
 
     // The mouse in menus. A menu row is a widget with this vtable; +4 is 3 while it is on screen and 2 in a
@@ -328,6 +325,55 @@ namespace
         *ctx = saved;
     }
 
+    // The value of a Lua global as text ("" if it is not set). Lua errors crash this runtime, so the code that
+    // sets the global must not be able to fail.
+    std::string lua_global(PPUContext *ctx, uint32_t L, const char *global)
+    {
+        PPUContext saved = *ctx;
+        const uint64_t sp = (saved.r[1] - 256) & ~15ull;
+        st64(sp, saved.r[1]);
+        const uint32_t name = (uint32_t)sp + 112;
+        memcpy(mem::ptr(name), global, strlen(global) + 1);
+        ctx->r[1] = sp;
+        ctx->r[3] = L;
+        f_003f0388(ctx);
+        const int64_t top = (int32_t)ctx->r[3];
+        ctx->r[3] = L, ctx->r[4] = (uint64_t)LUA_GLOBALSINDEX, ctx->r[5] = name;
+        f_003f12a0(ctx);
+        ctx->r[3] = L, ctx->r[4] = (uint64_t)-1ll, ctx->r[5] = 0;
+        f_003f0980(ctx);
+        const uint32_t text = (uint32_t)ctx->r[3];
+        std::string out = text ? (const char *)mem::ptr(text) : "";
+        ctx->r[3] = L, ctx->r[4] = (uint64_t)top;
+        f_003f0600(ctx);
+        *ctx = saved;
+        return out;
+    }
+
+    // The Field of View slider: read while the page updates, ten times a second.
+    void fov_slider(PPUContext *ctx, uint32_t L)
+    {
+        static uint64_t last;
+        const uint64_t now = host_now_ns();
+        if (now - last < 100000000ull)
+            return;
+        last = now;
+        lua_run(ctx, L, "pc_fov = nil\nif gBrowser then local s = gBrowser:GetTagByName(\"sO\") if s and s:IsVisible() then pc_fov = s:GetCurrentValue() end end\n");
+        const std::string text = lua_global(ctx, L, "pc_fov");
+        if (text.empty())
+            return;
+        const int degrees = (int)(atof(text.c_str()) + 0.5);
+        const int value = degrees > FOV_MIN && degrees <= FOV_MAX ? degrees : 0;
+        if (value == g_fov.load())
+            return;
+        std::lock_guard<std::mutex> lk(g_lock);
+        g_fov = value;
+        save();
+        char fov[48];
+        snprintf(fov, sizeof fov, "FIELD OF VIEW: %d", value ? value : FOV_MIN);
+        lua_run(ctx, L, LUA_SET + set_text("tO", fov));
+    }
+
     void menu_mouse(PPUContext *ctx, uint32_t L)
     {
         static const bool off = getenv("HELSARI_NO_MENU_MOUSE") != nullptr;
@@ -416,7 +462,7 @@ namespace
 namespace rsx
 {
     bool pc_vsync() { return g_vsync.load(std::memory_order_relaxed); }
-    int pc_field_of_view() { return FOV_VALUES[g_fov.load(std::memory_order_relaxed)]; }
+    int pc_field_of_view() { return g_fov.load(std::memory_order_relaxed); }
     bool pc_motion_blur() { return g_screen_fx.load(std::memory_order_relaxed) != 2; }
     bool pc_depth_of_field() { return g_screen_fx.load(std::memory_order_relaxed) == 0; }
 }
@@ -460,7 +506,7 @@ extern "C" void f_0047b900(PPU_CTX)
     if (G)
         g_L = L; // a script of the page in use: any of them can reach the page's tags
     if (G && call == "OnUpdatePage")
-        menu_mouse(ctx, L);
+        menu_mouse(ctx, L), fov_slider(ctx, L);
     if (G && call == "OnEnterPage")
     {
         std::lock_guard<std::mutex> lk(g_lock);
@@ -524,9 +570,7 @@ extern "C" void f_0047ccc0(PPU_CTX)
     else if (row == "fx")
         g_screen_fx = (g_screen_fx.load() + 1) % SCREEN_FX_N;
     else if (row == "fov")
-    {
-        g_fov = (g_fov.load() + 1) % FOV_N;
-    }
+        return; // its slider sets it
     else if (row == "sway")
         g_sway = (g_sway.load() + 1) % SWAY_N;
     save();

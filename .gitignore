@@ -25,3 +25,6 @@ spu_cache/
 *.log
 CHECKPNT.DAT
 frame.txt
+recompiled/
+lifted/
+out/

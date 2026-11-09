@@ -71,14 +71,33 @@ namespace menu_patch
             {
                 const std::string id = std::to_string(g);
                 return "<_i name=\"i" + n + "\" c=\"_Medium\" p=\"," + std::to_string(y) + ",620," + std::to_string(h) + "\" g=\"" + id + "\" h=\"static://hs/" + url +
-                       "\" /> <_t name=\"t" + n + "\" c=\"_Medium\" >-</_t> <_i: name=\"!\" g=\"" + id + "\" /> ";
+                       "\" /> <_t name=\"t" + n + "\" c=\"_Medium\">-</_t> <_i: name=\"!\" g=\"" + id + "\" /> ";
             };
             const auto list = [](const char *name, int height, int g)
             {
                 return std::string("<_l name=\"") + name + "\" c=\"_Normal\" p=\"16,14,620," + std::to_string(height) + "\" a=\"true\" bn=\"DOWN_BUTTON\" bp=\"UP_BUTTON\" g=\"" + std::to_string(g) + "\" /> ";
             };
-            const auto end = [](int g) { return "<_l: name=\"!\" g=\"" + std::to_string(g) + "\" /> "; };
-            std::string out = list("lG", 203, 900) + row("F", 0, 901, "fps", 29) + row("R", 29, 902, "res", 29) + row("M", 58, 903, "mode", 29) + row("V", 87, 904, "vsync", 29) + row("B", 116, 907, "fx", 29) + row("O", 145, 908, "fov", 29) + end(900);
+            const auto end = [](int g)
+            { return "<_l: name=\"!\" g=\"" + std::to_string(g) + "\" /> "; };
+            // A row with a slider after its text, as the game's own volume rows have: m and x are its range, s
+            // its step, u its first value, d and i the buttons that move it.
+            const auto slider_row = [](const std::string &n, int y, int g, const std::string &url, int h, int lo, int hi)
+            {
+                const std::string id = std::to_string(g);
+                return "<_i name=\"i" + n + "\" c=\"_Medium\" p=\"," + std::to_string(y) + ",620," + std::to_string(h) + "\" g=\"" + id + "\" h=\"static://hs/" + url +
+                       "\" /> <_t name=\"t" + n + "\" c=\"_Medium\">-</_t> <_r name=\"s" + n + "\" c=\"_SliderMedium\" p=\"370,,220,\" a=\"true\" d=\"LEFT_BUTTON\" i=\"RIGHT_BUTTON\" m=\"" +
+                       std::to_string(lo) + "\" s=\"1\" x=\"" + std::to_string(hi) + "\" /> <_i: name=\"!\" g=\"" + id + "\" /> ";
+            };
+            // GRAPHICS: one row per line. To reorder, move the lines and renumber y (0, 29, 58, ...) from the top.
+            //          name  y    group action   height
+            std::string out = list("lG", 203, 900);
+            out += row("R", 0, 901, "res", 29);                   // RESOLUTION
+            out += row("M", 29, 902, "mode", 29);                 // WINDOW MODE
+            out += row("V", 58, 903, "vsync", 29);                // VSYNC
+            out += row("F", 87, 904, "fps", 29);                  // FRAMERATE LIMIT
+            out += slider_row("O", 116, 907, "fov", 29, 73, 110); // FIELD OF VIEW (slider: 73 to 110)
+            out += row("B", 145, 908, "fx", 29);                  // SCREEN FX
+            out += end(900);
             out += list("lP", 203, 905) + row("S", 0, 906, "sway", 29) + end(905);
             constexpr int ROW = 26;
             out += list("lK", KEYBIND_COUNT * ROW, 910);
