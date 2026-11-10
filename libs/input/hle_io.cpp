@@ -10,9 +10,11 @@
 #include "idle_backoff.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstring>
 #include <string>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -211,9 +213,21 @@ struct AudioPort {
     uint32_t addr = 0, read_index = 0, nchannel = 0, nblock = 0;
     std::atomic<bool> open{false}, running{false};
     std::atomic<float> level{1.0f};
+    // Stale-block statistics for g_lead (audio thread only, reset on open).
+    uint32_t win_passes = 0, win_active = 0, win_stale = 0;
+    uint64_t block_hash[16] = {};
 };
 AudioPort g_ports[MAX_PORTS];
-std::vector<uint64_t> g_notify_keys;
+// Read index lead: how many blocks ahead of the next block we play the reported read
+// indices run. Writers differ: the game's sound engine fills the blocks behind the read
+// index (0 is right; more makes it overwrite what is about to play), the movie mixer fills
+// the block at it and needs time (2 measured clean, and only with every port at 2; the
+// engine is idle while a movie plays). So: 0, 2 once an active port goes stale, 0 again
+// when a port closes. HELSARI_AUDIO_LEAD=<n> fixes it at n.
+std::atomic<uint32_t> g_lead{0};
+const char *const g_fixed_lead = getenv("HELSARI_AUDIO_LEAD");
+std::vector<uint64_t> g_notify_keys;   // event queues told about every block played
+std::mutex g_notify_lock;
 std::atomic<bool> g_audio_thread{false};
 std::atomic<uint64_t> g_audio_block{0};   // blocks played since start: every port's clock
 
@@ -275,7 +289,7 @@ void audio_thread() {
     // Diagnostics, logged every ~5 s: device underruns (queue empty when we came back),
     // stale blocks (a port block unchanged since it was last played: the game did not
     // refill it in time), clipped samples (mix beyond full scale).
-    uint32_t st_under = 0, st_stale = 0, st_clip = 0, st_blocks = 0;
+    uint32_t st_under = 0, st_stale = 0, st_clip = 0, st_blocks = 0, st_port_stale[MAX_PORTS] = {};
     float st_peak = 0;
     std::vector<uint64_t> played_hash(MAX_PORTS * 64, 0);
     for (;;) {
@@ -285,6 +299,20 @@ void audio_thread() {
             if (FAILED(w.client->GetCurrentPadding(&pad))) out = false;
             else if (pad > target) { host_sleep_us(1000); continue; }
             else if (pad == 0 && block > 16) st_under++;
+            // Hand out blocks evenly, one per block period: the device drains in ~10 ms
+            // chunks, and refilling two blocks back to back moved the read index by two
+            // before a writer woke, so writers that fill one block per wake-up (the movie
+            // mixer) skipped blocks. While the device still holds half its queue, wait for
+            // the next block's time; below that, catch up at once.
+            static double next_block_s = 0;
+            QueryPerformanceCounter(&t);
+            const double now = (double)(t.QuadPart - t0.QuadPart) / f.QuadPart;
+            if (out && pad >= target / 2 && now < next_block_s) {
+                host_sleep_us((uint32_t)std::min(1000.0, (next_block_s - now) * 1e6) + 1);
+                continue;
+            }
+            next_block_s = std::max(next_block_s, now - (double)AUDIO_BLOCK_SAMPLES / 48000.0) +
+                           (double)AUDIO_BLOCK_SAMPLES / 48000.0;
         }
         if (!out) {   // no device: pace by the clock
             double due = (double)(block + 1) * AUDIO_BLOCK_SAMPLES / 48000.0;
@@ -302,7 +330,28 @@ void audio_thread() {
                 bool nz = false;
                 for (uint32_t i = 0; i < n * AUDIO_BLOCK_SAMPLES; i++) h = (h ^ src[i]) * 1099511628211ull, nz |= src[i] != 0;
                 hashes[&p - g_ports] = h;
-                if (nz && h == played_hash[(&p - g_ports) * 64 + (block % p.nblock) % 64]) stale = true;
+                const bool port_stale = nz && h == played_hash[(&p - g_ports) * 64 + (block % p.nblock) % 64];
+                if (port_stale) stale = true, st_port_stale[&p - g_ports]++;
+                // Adapt the lead: was the writer active this second (blocks changed in at least a
+                // quarter of the passes), and did blocks still go stale? A port the game leaves idle
+                // keeps old samples that look stale, but shows no writes, so it never qualifies.
+                bool active = false;
+                for (uint32_t k = 0; k < p.nblock && k < 16; k++) {
+                    const uint32_t *b = (const uint32_t *)mem::ptr(p.addr + k * n * AUDIO_BLOCK_SAMPLES * 4);
+                    uint64_t bh = 1469598103934665603ull;
+                    for (uint32_t i = 0; i < n * AUDIO_BLOCK_SAMPLES; i += 7) bh = (bh ^ b[i]) * 1099511628211ull;
+                    active |= bh != p.block_hash[k];
+                    p.block_hash[k] = bh;
+                }
+                p.win_active += active, p.win_stale += port_stale;
+                if (++p.win_passes == 188) {   // about a second
+                    if (!g_fixed_lead && p.win_active > 47 && p.win_stale > 8 && g_lead.load() != 2) {
+                        g_lead = 2;
+                        LOG("audio", "port %d: %u of 188 blocks stale while written, read index lead now 2", (int)(&p - g_ports),
+                            p.win_stale);
+                    }
+                    p.win_passes = p.win_active = p.win_stale = 0;
+                }
             }
             // (Holding playback until a stale block was refilled broke audio: a port the game
             // leaves idle keeps old non-silent samples, so every block looked stale.)
@@ -339,8 +388,9 @@ void audio_thread() {
                 }
             }
             if (++st_blocks == 940) {   // ~5 s
-                LOG("audio", "last 5 s: %u underruns, %u stale blocks, %u samples over full scale (limited), peak %.2f", st_under, st_stale,
-                    st_clip, st_peak);
+                LOG("audio", "last 5 s: %u underruns, %u stale blocks (port 0: %u, port 1: %u), %u samples over full scale (limited), peak %.2f",
+                    st_under, st_stale, st_port_stale[0], st_port_stale[1], st_clip, st_peak);
+                std::fill(st_port_stale, st_port_stale + MAX_PORTS, 0u);
                 st_under = st_stale = st_clip = st_blocks = 0, st_peak = 0;
             }
             BYTE *dst = nullptr;
@@ -350,9 +400,16 @@ void audio_thread() {
             }
         }
         block = g_audio_block.fetch_add(1) + 1;
+        // The read index: the next block we play, plus the lead (see g_lead).
+        const uint32_t lead = g_fixed_lead ? (uint32_t)atoi(g_fixed_lead) : g_lead.load();
         for (auto &p : g_ports)
-            if (p.open && p.running && p.nblock) st64(p.read_index, block % p.nblock);
-        for (uint64_t key : g_notify_keys)
+            if (p.open && p.running && p.nblock) st64(p.read_index, (block + lead) % p.nblock);
+        std::vector<uint64_t> keys;
+        {
+            std::lock_guard<std::mutex> lk(g_notify_lock);
+            keys = g_notify_keys;
+        }
+        for (uint64_t key : keys)
             if (uint32_t q = kern::equeue_by_key(key)) kern::equeue_push(q, {0, 0, 0, 0});
     }
 }
@@ -376,6 +433,7 @@ HLE(cellAudioPortOpen) {
     if (!p.read_index) p.read_index = mem::alloc(8, 16);
     st64(p.read_index, 0);
     p.level = 1.0f, p.running = false, p.open = true;
+    p.win_passes = p.win_active = p.win_stale = 0;
     st32(ARG32(1), id);
     LOG("audio", "port %u open: %u channels, %u blocks", id, p.nchannel, p.nblock);
     if (!g_audio_thread.exchange(true)) std::thread(audio_thread).detach();
@@ -396,14 +454,34 @@ HLE(cellAudioGetPortConfig) {
 }
 HLE(cellAudioPortStart) { if (AudioPort *p = port(ARG32(0))) p->running = true; RET(0); }
 HLE(cellAudioPortStop) { if (AudioPort *p = port(ARG32(0))) p->running = false; RET(0); }
-HLE(cellAudioPortClose) { if (AudioPort *p = port(ARG32(0))) p->running = false, p->open = false; RET(0); }
+HLE(cellAudioPortClose) {
+    if (AudioPort *p = port(ARG32(0))) {
+        p->running = false, p->open = false;
+        if (g_lead.exchange(0)) LOG("audio", "port %u closed: read index lead back to 0", ARG32(0));
+    }
+    RET(0);
+}
 HLE(cellAudioSetPortLevel) {
     // (u32 port, float level): the level arrives in f1
     if (AudioPort *p = port(ARG32(0))) p->level = (float)ctx->f[1];
     RET(0);
 }
-HLE(cellAudioSetNotifyEventQueue) { g_notify_keys.push_back(ARG(0)); RET(0); }
-HLE(cellAudioRemoveNotifyEventQueue) { RET(0); }
+// A queue is told once per block however often it is set; removing it stops the events
+// (the movie player sets and removes its own around each movie).
+HLE(cellAudioSetNotifyEventQueue) {
+    std::lock_guard<std::mutex> lk(g_notify_lock);
+    if (std::find(g_notify_keys.begin(), g_notify_keys.end(), ARG(0)) == g_notify_keys.end()) g_notify_keys.push_back(ARG(0));
+    LOG("audio", "notify queue 0x%llx set (%zu queues)", (unsigned long long)ARG(0), g_notify_keys.size());
+    RET(0);
+}
+HLE(cellAudioRemoveNotifyEventQueue) {
+    std::lock_guard<std::mutex> lk(g_notify_lock);
+    g_notify_keys.erase(std::remove(g_notify_keys.begin(), g_notify_keys.end(), ARG(0)), g_notify_keys.end());
+    LOG("audio", "notify queue 0x%llx removed (%zu queues)", (unsigned long long)ARG(0), g_notify_keys.size());
+    RET(0);
+}
+// Block tags and timestamps keep their first, simple answers: the movie mixer reads them,
+// and answers following the system's description measured worse (more stale blocks).
 HLE(cellAudioGetPortTimestamp) { st64(ARG32(2), ppu_timebase() / 80); RET(0); }
 HLE(cellAudioGetPortBlockTag) { st64(ARG32(2), ARG(1)); RET(0); }
 

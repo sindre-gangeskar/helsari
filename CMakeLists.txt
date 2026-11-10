@@ -118,6 +118,7 @@ add_executable(helsari
   libs/codec/inflate.cpp
   libs/codec/vdec.cpp
   libs/codec/adec.cpp
+  libs/codec/ac3.cpp
   libs/video/rsx/vp.cpp
   libs/video/rsx/fp.cpp
   libs/video/rsx/d3d.cpp)
