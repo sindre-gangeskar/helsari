@@ -80,7 +80,7 @@ void gcm_post_job_mapped(const char *job)
         return;
     static std::mutex lock;
     static uint32_t frame[2] = {~0u, ~0u};
-    int k = !strcmp(job, "job_d62e00") ? 0 : !strcmp(job, "job_d65480") ? 1
+    int k = !strcmp(job, "job_d7aa80") ? 0 : !strcmp(job, "job_d7d100") ? 1
                                                                         : -1;
     if (k < 0)
         return;

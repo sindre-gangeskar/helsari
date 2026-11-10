@@ -244,6 +244,27 @@ void SpuThread::run() {
         uint32_t x = ls32(pc);
         history[history_pos++ & 63] = pc;
         if (traced < trace_limit && traced++ >= 0) LOG("spu", "%s %05x: %08x  %s", name.c_str(), pc, x, disasm(pc, x).c_str());
+        // A run of lqa/stqa (register <-> fixed LS address): the SPURS kernel saves and restores a
+        // workload's registers this way, in code it rewrites in place to switch between the two, so
+        // it is never captured or compiled - and runs around every job. One loop for the whole run
+        // instead of a dispatch per instruction. It stops wherever the loop above has a check to make.
+        if (!trace_limit && (decode(x) == LQA || decode(x) == STQA)) {
+            for (;;) {
+                const uint32_t rt = x & 0x7f, a = (((x >> 7) & 0xffff) << 2) & (LS_SIZE - 16);
+                if (decode(x) == LQA) gpr[rt] = lq(a);
+                else stq(a, gpr[rt]);
+                pc = (pc + 4) & (LS_SIZE - 4);
+                if (traps[pc >> 2] || (native && native[pc >> 2]) || (!(pc & 127) && !line_seen[pc >> 7]))
+                    break;
+                x = ls32(pc);
+                if (decode(x) != LQA && decode(x) != STQA)
+                    break;
+                ++executed, ++interpreted;
+                note_interpreted(pc);
+                history[history_pos++ & 63] = last_interp = pc;
+            }
+            continue;
+        }
         switch (decode(x)) {
 #define SPU_OP_STEP(e, name, bits, code, fmt) case e: pc = step<e>(*this, x, pc); break;
             SPU_OPS(SPU_OP_STEP)

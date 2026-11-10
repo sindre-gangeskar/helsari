@@ -14,8 +14,11 @@
 
 namespace stdfs = std::filesystem;
 
+bool pc_skip_intro_movie();   // GAMEPLAY menu (pc_options.cpp)
+
 namespace menu_patch {   // menu_patch.cpp
 void build(uint64_t real_size, const std::function<void(uint64_t, void *, size_t)> &rd);
+const std::vector<uint8_t> *replaced_update_patch(const std::string &path);
 uint64_t extra_size();
 size_t read_appended(uint64_t pos, void *dst, size_t n);
 void apply(uint64_t pos, uint8_t *data, size_t n);
@@ -31,6 +34,7 @@ struct File {
     std::vector<uint64_t> starts;  // logical offset of each part
     uint64_t size = 0, pos = 0;
     uint64_t patched_from = 0;     // game archive: its real size, past which menu_patch serves reads
+    const std::vector<uint8_t> *memory = nullptr;  // served from memory instead of the host (menu_patch)
 };
 
 bool is_game_archive(const std::string &path) {
@@ -86,16 +90,20 @@ std::string host_path(const std::string &p) {
     if (starts(p, "/dev_bdvd", &rest)) return cfg::dump_dir + rest;
     if (starts(p, "/app_home", &rest)) return cfg::dump_dir + "/PS3_GAME/USRDIR" + rest;
     if (starts(p, "/host_root", &rest)) return cfg::dump_dir + rest;
+    // The update stays where the player has it.
+    if (starts(p, "/dev_hdd0/game/BCES00081", &rest)) return cfg::update_dir + rest;
     for (const char *dev : {"/dev_hdd0", "/dev_hdd1", "/dev_usb000"})
         if (starts(p, dev, &rest)) return cfg::data_dir + dev + rest;
     LOG("fs", "unmapped path '%s'", p.c_str());
     return cfg::data_dir + "/unmapped" + p;
 }
 
-// HELSARI_SKIP_MOVIES=1 hides the movies, so the game skips playback.
+// A hidden movie is skipped by the game. HELSARI_SKIP_MOVIES=1 hides all of them; the menu's
+// INTRO MOVIE: SKIP only the one before the start screen (one file per language).
 bool hidden_movie(const std::string &path) {
     static bool skip = getenv("HELSARI_SKIP_MOVIES") != nullptr;
-    return skip && path.find("/MOVIES/") != std::string::npos;
+    if (path.find("/MOVIES/") == std::string::npos) return false;
+    return skip || (pc_skip_intro_movie() && path.find("/MOVIES/GameIntro") != std::string::npos);
 }
 
 int32_t open(const std::string &path, int32_t flags, uint32_t *fd) {
@@ -106,7 +114,13 @@ int32_t open(const std::string &path, int32_t flags, uint32_t *fd) {
     f.path = path;
     bool exists = stdfs::is_regular_file(h, ec);
     auto parts = exists ? std::vector<uint64_t>{} : split_parts(h);
-    if (!parts.empty()) {
+    // An update patch menu_patch already applied: the game reads one that changes nothing.
+    const std::vector<uint8_t> *memory = exists && !(flags & (O_WRONLY | O_RDWR)) &&
+        path.find("/patch_data_ps3/") != std::string::npos ? menu_patch::replaced_update_patch(path) : nullptr;
+    if (memory) {
+        f.memory = memory;
+        f.size = memory->size();
+    } else if (!parts.empty()) {
         if (flags & (O_WRONLY | O_RDWR)) return EIO;  // split files are disc content: read-only
         uint64_t at = 0;
         for (size_t i = 0; i < parts.size(); i++) {
@@ -156,7 +170,8 @@ int32_t open(const std::string &path, int32_t flags, uint32_t *fd) {
     std::lock_guard<std::mutex> lk(g_lock);
     *fd = g_next_fd++;
     LOG("fs", "open '%s' flags=0x%x -> fd %u (%llu bytes%s)", path.c_str(), flags, *fd,
-        (unsigned long long)f.size, f.parts.size() > 1 ? ", split" : "");
+        (unsigned long long)f.size, f.memory ? ", already applied: serving a patch that changes nothing"
+                                    : f.parts.size() > 1 ? ", split" : "");
     g_files[*fd] = std::move(f);
     return 0;
 }
@@ -166,7 +181,13 @@ int32_t read(uint32_t fd, uint32_t buf, uint64_t n, uint64_t *got) {
     File *f = file(fd);
     if (!f) return EBADF;
     uint64_t done = 0;
-    while (done < n && f->pos < f->size) {
+    if (f->memory) {
+        done = f->pos < f->size ? std::min<uint64_t>(n, f->size - f->pos) : 0;
+        mem::ensure(buf, (uint32_t)done);
+        memcpy(mem::ptr(buf), f->memory->data() + f->pos, (size_t)done);
+        f->pos += done;
+    }
+    while (!f->memory && done < n && f->pos < f->size) {
         if (f->patched_from && f->pos >= f->patched_from) {
             mem::ensure(buf + (uint32_t)done, (uint32_t)(n - done));
             size_t r = menu_patch::read_appended(f->pos, mem::ptr(buf + (uint32_t)done), (size_t)(n - done));

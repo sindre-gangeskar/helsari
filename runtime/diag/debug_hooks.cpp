@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-extern "C" void f_00a4a99c_guest(PPU_CTX);
+extern "C" void f_00a5ed6c_guest(PPU_CTX);
 void edge_zlib_explain(uint32_t ea, uint32_t size);
 
 // HELSARI_HOOK_WATCH="ea:len,ea:len": hooks and host writers log only what overlaps.
@@ -45,7 +45,7 @@ std::string hex(uint32_t ea, int bytes) {
 // Buffered asset stream read: r3 = reader, r4 = destination, r5 = size. The
 // reader's state is at [r3+12]: +176 read cursor, +180 end of buffered data;
 // reads larger than what is buffered go through a refill path.
-extern "C" void f_00a4a99c(PPU_CTX) {
+extern "C" void f_00a5ed6c(PPU_CTX) {
     uint32_t dst = (uint32_t)ctx->r[4], size = (uint32_t)ctx->r[5];
     if (mem::hook_watched(dst, size)) {
         // HELSARI_WATCH_WRITE_LATE="ea:len,...": write watches armed only once a watched
@@ -65,21 +65,21 @@ extern "C" void f_00a4a99c(PPU_CTX) {
             (uint32_t)ctx->r[3], cur, end, (int32_t)(end - cur) < (int32_t)size ? "refill" : "buffered",
             hex(cur, 32).c_str());
         if ((int32_t)(end - cur) >= (int32_t)size) edge_zlib_explain(cur, size);
-        f_00a4a99c_guest(ctx);
+        f_00a5ed6c_guest(ctx);
         LOG("hook", "  -> dst now:%s", hex(dst, 32).c_str());
         return;
     }
-    f_00a4a99c_guest(ctx);
+    f_00a5ed6c_guest(ctx);
 }
 
 // The scripts' trace and print functions (one empty function in the shipped
 // game): log their text arguments, so the menu scripts' progress shows in the
 // log. HELSARI_NO_SCRIPT_TRACE=1 turns it off.
-extern "C" void f_003e2630_guest(PPU_CTX);
-extern "C" void f_003f0388(PPU_CTX);   // lua_gettop(L)
-extern "C" void f_003f0980(PPU_CTX);   // lua_tolstring(L, index, len)
+extern "C" void f_003eea80_guest(PPU_CTX);
+extern "C" void f_003fc7d8(PPU_CTX);   // lua_gettop(L)
+extern "C" void f_003fcdd0(PPU_CTX);   // lua_tolstring(L, index, len)
 
-extern "C" void f_003e2630(PPU_CTX) {
+extern "C" void f_003eea80(PPU_CTX) {
     static const bool off = getenv("HELSARI_NO_SCRIPT_TRACE") != nullptr;
     if (!off) {
         const PPUContext saved = *ctx;
@@ -87,12 +87,12 @@ extern "C" void f_003e2630(PPU_CTX) {
         ctx->r[1] = (saved.r[1] - 256) & ~15ull;
         st64(ctx->r[1], saved.r[1]);
         ctx->r[3] = L;
-        f_003f0388(ctx);
+        f_003fc7d8(ctx);
         const int top = (int32_t)ctx->r[3];
         std::string line;
         for (int i = 1; i <= top && i <= 8; i++) {
             ctx->r[3] = L, ctx->r[4] = (uint64_t)i, ctx->r[5] = 0;
-            f_003f0980(ctx);   // numbers convert in place; other types give no text
+            f_003fcdd0(ctx);   // numbers convert in place; other types give no text
             const uint32_t s = (uint32_t)ctx->r[3];
             line += i > 1 ? " " : "";
             line += s ? std::string((const char *)mem::ptr(s)).substr(0, 300) : "?";
@@ -100,15 +100,15 @@ extern "C" void f_003e2630(PPU_CTX) {
         LOG("lua", "trace: %s", line.c_str());
         *ctx = saved;
     }
-    f_003e2630_guest(ctx);
+    f_003eea80_guest(ctx);
 }
 
 // Script SwitchToGameModule: logs the handler it calls (a descriptor stored at +76 of the module
 // object that r3 points to), so the switch can be followed.
-extern "C" void f_00077310_guest(PPU_CTX);
-extern "C" void f_00077310(PPU_CTX) {
+extern "C" void f_00077f90_guest(PPU_CTX);
+extern "C" void f_00077f90(PPU_CTX) {
     const uint32_t obj = ld32((uint32_t)ctx->r[3]), opd = obj ? ld32(obj + 76) : 0;
     LOG("module", "SwitchToGameModule: object 0x%x, handler 0x%x (code 0x%x)", obj, opd, opd ? ld32(opd) : 0);
-    f_00077310_guest(ctx);
+    f_00077f90_guest(ctx);
     LOG("module", "SwitchToGameModule returned 0x%llx", (unsigned long long)ctx->r[3]);
 }

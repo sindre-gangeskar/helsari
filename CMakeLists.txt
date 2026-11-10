@@ -13,12 +13,28 @@ set(CMAKE_CXX_FLAGS_RELEASE "")
 # dump. Nothing derived from the game is part of this repository.
 set(HELSARI_DUMP "" CACHE PATH "Game disc dump folder (contains PS3_GAME)")
 set(RPCS3_EXE "" CACHE FILEPATH "rpcs3.exe, used once to decrypt EBOOT.BIN")
+# The game's 1.29 update (the folder with its PARAM.SFO and USRDIR). Helsari runs 1.29 only. Found in the
+# RPCS3 install next to RPCS3_EXE when not given.
+set(HELSARI_UPDATE "" CACHE PATH "Game update 1.29 folder (dev_hdd0/game/<title id>)")
 
 if(NOT HELSARI_DUMP)
   message(FATAL_ERROR "Pass your dump: cmake -B build -DHELSARI_DUMP=\"E:/PS3 Dumps/YourDump\" -DRPCS3_EXE=\"E:/RPCS3/rpcs3.exe\"")
 endif()
 
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+
+if(NOT HELSARI_UPDATE AND RPCS3_EXE)
+  get_filename_component(_rpcs3_dir "${RPCS3_EXE}" DIRECTORY)
+  foreach(_title BCES00081 BCUS98116 BCJS30022 BCAS20071)
+    if(EXISTS "${_rpcs3_dir}/dev_hdd0/game/${_title}/PARAM.SFO")
+      set(HELSARI_UPDATE "${_rpcs3_dir}/dev_hdd0/game/${_title}" CACHE PATH "Game update 1.29 folder (dev_hdd0/game/<title id>)" FORCE)
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT HELSARI_UPDATE)
+  message(FATAL_ERROR "The game's 1.29 update is needed: pass -DHELSARI_UPDATE=\"<path to dev_hdd0/game/<title id>>\"")
+endif()
 
 # The game is compiled on the machine that plays it, so it can use all of that CPU: AVX-512's
 # 32 vector registers cut register spills in SPU code by nearly half. Needs at least AVX2.
@@ -31,7 +47,7 @@ endif()
 set(GEN_DIR ${CMAKE_BINARY_DIR}/generated)
 message(STATUS "Generating C from ${HELSARI_DUMP} ...")
 execute_process(
-  COMMAND ${Python3_EXECUTABLE} -m recomp --dump ${HELSARI_DUMP} --rpcs3 ${RPCS3_EXE} --out ${GEN_DIR}
+  COMMAND ${Python3_EXECUTABLE} -m recomp --dump ${HELSARI_DUMP} --update ${HELSARI_UPDATE} --rpcs3 ${RPCS3_EXE} --out ${GEN_DIR}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools
   RESULT_VARIABLE gen_result)
 if(NOT gen_result EQUAL 0)
@@ -98,6 +114,7 @@ add_executable(helsari
   runtime/syscalls/syscalls.cpp
   runtime/syscalls/fs.cpp
   port/menu_patch.cpp
+  runtime/diag/lua_errors.cpp
   port/pc_options.cpp
   port/mouse.cpp
   port/keybinds.cpp
@@ -132,8 +149,10 @@ target_include_directories(helsari_spu PRIVATE runtime/include runtime runtime/s
 target_compile_options(helsari_spu PRIVATE -O2 -march=${HELSARI_MARCH} -Wno-unused-label)
 target_include_directories(helsari PRIVATE runtime/include runtime runtime/spu runtime/syscalls runtime/ppu runtime/memory runtime/diag libs libs/video libs/video/rsx libs/spurs libs/input libs/system libs/codec port ${GEN_DIR})
 cmake_path(SET _dump NORMALIZE "${HELSARI_DUMP}")
+cmake_path(SET _update NORMALIZE "${HELSARI_UPDATE}")
 target_compile_definitions(helsari PRIVATE
   HELSARI_DEFAULT_DUMP="${_dump}"
+  HELSARI_DEFAULT_UPDATE="${_update}"
   HELSARI_DEFAULT_ELF="${GEN_DIR}/decrypt/EBOOT.elf")
 target_compile_options(helsari PRIVATE -O2 -g -march=${HELSARI_MARCH})
 target_link_libraries(helsari PRIVATE helsari_spu helsari_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm ole32 synchronization mfplat mfuuid)

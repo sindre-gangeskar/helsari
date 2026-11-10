@@ -6,8 +6,11 @@
 #include "runtime.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,6 +31,145 @@ namespace menu_patch
             std::vector<uint8_t> bytes;
         };
         std::vector<Patch> g_toc_patches;
+        uint64_t be(const uint8_t *p, int n);
+        void put_be(uint8_t *p, uint64_t v, int n);
+        // Update patches we applied ourselves, by lowercase file name: the game gets a patch that changes nothing.
+        std::map<std::string, std::vector<uint8_t>> g_replaced;
+
+        // The update changes archive files with deltas in USRDIR/patch_data_ps3, applied by the game as it
+        // reads them. If one changes a page cache we patch, the delta would land on our bytes, so we apply it
+        // first and patch the result. Our reading of the format, all big-endian 32-bit words:
+        //   op table size, literal size, then the op table: output size, then tokens. A token with the top bit
+        //   set is a copy (output offset | top bit, source offset); any other is a pair (end of the copy
+        //   before, offset into the literals). The gaps between copies take the literal bytes in order. A
+        //   copy followed by a copy ends where the next starts; the last one ends at the output size.
+        //   The literal bytes follow the op table.
+        struct Delta
+        {
+            uint32_t out = 0;
+            std::vector<uint32_t> d, s, e; // the copies
+            std::vector<uint8_t> lit;
+        };
+
+        bool read_delta(const std::vector<uint8_t> &b, Delta &x)
+        {
+            if (b.size() < 12)
+                return false;
+            const uint32_t opn = (uint32_t)be(&b[0], 4), litn = (uint32_t)be(&b[4], 4);
+            if (opn < 4 || opn % 4 || 8ull + opn + litn > b.size())
+                return false;
+            const uint32_t words = opn / 4;
+            auto w = [&](uint32_t i)
+            { return (uint32_t)be(&b[8 + i * 4], 4); };
+            x.out = w(0);
+            for (uint32_t i = 1; i + 1 < words; i += 2)
+            {
+                if (w(i) & 0x80000000u)
+                {
+                    if (!x.e.empty() && x.e.back() == UINT32_MAX)
+                        x.e.back() = w(i) & 0x7fffffffu;
+                    x.d.push_back(w(i) & 0x7fffffffu), x.s.push_back(w(i + 1)), x.e.push_back(UINT32_MAX);
+                }
+                else if (!x.e.empty() && x.e.back() == UINT32_MAX)
+                    x.e.back() = w(i);
+            }
+            if (!x.e.empty() && x.e.back() == UINT32_MAX)
+                x.e.back() = x.out;
+            x.lit.assign(b.begin() + 8 + opn, b.begin() + 8 + opn + litn);
+            return true;
+        }
+
+        // The source size a delta was made for: its last copy reaches the end of the source.
+        uint64_t delta_source_size(const Delta &x)
+        {
+            return x.d.empty() ? 0 : (uint64_t)x.s.back() + (x.e.back() - x.d.back());
+        }
+
+        bool apply_delta(const Delta &x, const std::string &src, std::string &out)
+        {
+            out.assign(x.out, '\0');
+            size_t pos = 0, lp = 0;
+            auto fill = [&](size_t to)
+            {
+                if (to < pos || to > x.out || lp + (to - pos) > x.lit.size())
+                    return false;
+                memcpy(&out[pos], x.lit.data() + lp, to - pos);
+                lp += to - pos, pos = to;
+                return true;
+            };
+            for (size_t i = 0; i < x.d.size(); i++)
+            {
+                if (!fill(x.d[i]) || x.e[i] < x.d[i] || x.e[i] > x.out || (uint64_t)x.s[i] + (x.e[i] - x.d[i]) > src.size())
+                    return false;
+                memcpy(&out[x.d[i]], src.data() + x.s[i], x.e[i] - x.d[i]);
+                pos = x.e[i];
+            }
+            return fill(x.out) && lp == x.lit.size();
+        }
+
+        std::vector<uint8_t> read_host(const std::filesystem::path &p)
+        {
+            std::vector<uint8_t> b;
+            if (FILE *f = _wfopen(p.c_str(), L"rb"))
+            {
+                fseek(f, 0, SEEK_END);
+                b.resize((size_t)ftell(f));
+                fseek(f, 0, SEEK_SET);
+                b.resize(fread(b.data(), 1, b.size(), f));
+                fclose(f);
+            }
+            return b;
+        }
+
+        // The update's deltas by the source size they apply to, read once.
+        std::multimap<uint64_t, std::filesystem::path> &deltas_by_source_size()
+        {
+            static std::multimap<uint64_t, std::filesystem::path> m;
+            static bool done;
+            if (done)
+                return m;
+            done = true;
+            if (cfg::update_dir.empty())
+                return m;
+            std::error_code ec;
+            for (const auto &it : std::filesystem::directory_iterator(cfg::update_dir + "/USRDIR/patch_data_ps3", ec))
+            {
+                Delta x;
+                if (it.path().extension() == ".pspatch" && read_delta(read_host(it.path()), x))
+                    m.emplace(delta_source_size(x), it.path());
+            }
+            LOG("menu", "%zu update patches indexed", m.size());
+            return m;
+        }
+
+        // Applies the update's delta for this file, if it has one. Returns the delta's lowercase file name.
+        std::string apply_update(std::string &file)
+        {
+            const auto range = deltas_by_source_size().equal_range(file.size());
+            for (auto it = range.first; it != range.second; ++it)
+            {
+                Delta x;
+                std::string out;
+                if (!read_delta(read_host(it->second), x) || !apply_delta(x, file, out) || out.compare(0, 7, "RTTIBin"))
+                    continue;
+                file.swap(out);
+                std::string name = it->second.filename().string();
+                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c)
+                               { return (char)tolower(c); });
+                return name;
+            }
+            return {};
+        }
+
+        // A delta that copies its whole source: output size n, one copy from 0.
+        std::vector<uint8_t> identity_delta(uint32_t n)
+        {
+            std::vector<uint8_t> b(20);
+            put_be(&b[0], 12, 4);
+            put_be(&b[8], n, 4);
+            put_be(&b[12], 0x80000000u, 4);
+            return b;
+        }
 
         uint64_t be(const uint8_t *p, int n)
         {
@@ -98,7 +240,7 @@ namespace menu_patch
             out += slider_row("O", 116, 907, "fov", 29, 73, 110); // FIELD OF VIEW (slider: 73 to 110)
             out += row("B", 145, 908, "fx", 29);                  // SCREEN FX
             out += end(900);
-            out += list("lP", 203, 905) + row("S", 0, 906, "sway", 29) + end(905);
+            out += list("lP", 203, 905) + row("S", 0, 906, "sway", 29) + row("I", 29, 909, "intro", 29) + end(905); // SWAY, INTRO MOVIE
             constexpr int ROW = 26;
             out += list("lK", KEYBIND_COUNT * ROW, 910);
             for (int i = 0; i < KEYBIND_COUNT; i++)
@@ -122,11 +264,12 @@ namespace menu_patch
             if (tag == std::string::npos || tag > page_end)
                 return false;
             std::string add = pc_lists();
-            // Room first from text no script reads: the language table's select_button and page_title
-            // fields, then from CRLF line ends, which does not change what the script means.
+            // Room first from text nothing reads: the language table's select_button, page_title and
+            // caption fields (no script in the cache reads them, and the executable never names them),
+            // then from CRLF line ends, which does not change what the script means.
             std::string body = f.substr(tag, page_end - tag);
             size_t need = add.size();
-            for (const char *field : {"select_button = \"", "page_title = \""})
+            for (const char *field : {"select_button = \"", "page_title = \"", "caption = \""})
                 for (size_t at = body.find(field); need && at != std::string::npos; at = body.find(field, at))
                 {
                     const size_t quote = body.find('"', at + strlen(field));
@@ -250,6 +393,7 @@ namespace menu_patch
             }
             const uint8_t *entry = &entries[index * esz];
             const uint64_t old_size = be(entry + 20, 5);
+            const std::string delta = apply_update(file);
             if (!patch_page(file))
                 continue;
             // The block table cannot grow, so the file must keep its block count. Full blocks are
@@ -272,10 +416,23 @@ namespace menu_patch
             std::vector<uint8_t> lens((size_t)blocks * 2); // all zero: raw full blocks
             put_be(&lens[lens.size() - 2], z.size(), 2);
             g_toc_patches.push_back({zl_at + (uint64_t)zi * 2, lens});
-            LOG("menu", "patched %s (%zu bytes, %llu blocks, entry %u)", name.c_str(), file.size(), (unsigned long long)blocks, index);
+            if (!delta.empty())
+                g_replaced[delta] = identity_delta((uint32_t)file.size());
+            LOG("menu", "patched %s (%zu bytes, %llu blocks, entry %u%s%s)", name.c_str(), file.size(), (unsigned long long)blocks,
+                index, delta.empty() ? "" : ", update patch ", delta.c_str());
             changed++;
         }
         LOG("menu", "%u menu pages patched", changed);
+    }
+
+    // What the game reads instead of an update patch we already applied, or null.
+    const std::vector<uint8_t> *replaced_update_patch(const std::string &path)
+    {
+        std::string name = path.substr(path.find_last_of('/') + 1);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c)
+                       { return (char)tolower(c); });
+        const auto it = g_replaced.find(name);
+        return it == g_replaced.end() ? nullptr : &it->second;
     }
 
     uint64_t extra_size() { return g_appended.size(); }

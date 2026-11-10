@@ -3,10 +3,10 @@
 // The game runs some work as cooperative microthreads. A context buffer
 // holds the callee-saved registers, r1 (+144), r2 (+152), the resume address
 // (+160, the saved r0), r3 (+168) and r4/r5 (+512/+520):
-//   0x71e10  save(buf)                 - like setjmp
-//   0x72680  pick(scheduler) -> buf    - next runnable context
-//   0x71f24  restore(buf)              - loads it and "returns" into it
-//   0x7203c  yield(cur, scheduler)     - save(cur); restore(pick())
+//   0x72988  save(buf)                 - like setjmp
+//   0x731f8  pick(scheduler) -> buf    - next runnable context
+//   0x72a9c  restore(buf)              - loads it and "returns" into it
+//   0x72bb4  yield(cur, scheduler)     - save(cur); restore(pick())
 // New contexts are made by saving a template and patching r1 (fresh stack),
 // r2 and the resume address (an entry point). Restoring a context continues
 // on that context's stack, but generated code keeps its frames on the host
@@ -25,9 +25,9 @@
 #include <mutex>
 
 extern "C" {
-void f_00071e10(PPU_CTX);           // save
-void f_00072680(PPU_CTX);           // pick
-void f_00071f24_guest(PPU_CTX);     // restore: the generated register loads
+void f_00072988(PPU_CTX);           // save
+void f_000731f8(PPU_CTX);           // pick
+void f_00072a9c_guest(PPU_CTX);     // restore: the generated register loads
 }
 
 namespace {
@@ -76,7 +76,7 @@ void CALLBACK fresh_entry(void *p) {
     reap();
     PPUContext *ctx = t_ctx;
     ctx->r[3] = self->buf;
-    f_00071f24_guest(ctx);                    // r1 = new stack, r2, r3 = argument, lr = entry
+    f_00072a9c_guest(ctx);                    // r1 = new stack, r2, r3 = argument, lr = entry
     uint32_t entry = (uint32_t)ctx->lr;
     ppu_call(ctx, entry);
     fatal("microthread entry 0x%x returned (context 0x%x)", entry, self->buf);
@@ -120,20 +120,20 @@ void switch_to(PPUContext *ctx, uint32_t next, uint32_t suspend_in) {
 
 } // namespace
 
-extern "C" void f_0007203c(PPU_CTX) {
+extern "C" void f_00072bb4(PPU_CTX) {
     // yield(cur = r3, scheduler = r4)
     uint32_t cur = (uint32_t)ctx->r[3], sched = (uint32_t)ctx->r[4];
     ctx->r[0] = ctx->lr;                      // the guest's mflr r0: save() stores it as the resume address
-    f_00071e10(ctx);
+    f_00072988(ctx);
     ctx->r[3] = sched;
-    f_00072680(ctx);
+    f_000731f8(ctx);
     uint32_t next = (uint32_t)ctx->r[3];
     if (next != cur) switch_to(ctx, next, cur);
     ctx->r[3] = cur;
-    f_00071f24_guest(ctx);                    // our registers; lr = our caller
+    f_00072a9c_guest(ctx);                    // our registers; lr = our caller
 }
 
-// pick(scheduler = r3) -> context buffer. Same logic as the guest code (0x72680):
+// pick(scheduler = r3) -> context buffer. Same logic as the guest code (0x731f8):
 // five slots, tried round-robin after the current one (scheduler +12); a slot is
 // in use when its word at +3884 (slots are 4 bytes apart from scheduler[+8]) is
 // non-zero, and runnable when its wait pointer (+3864) is null or points to a
@@ -142,10 +142,10 @@ extern "C" void f_0007203c(PPU_CTX) {
 // busy-wait for an SPU job or another thread to set a word, which kept a host
 // core spinning in the main thread. Here each fruitless pass backs off (pause,
 // yield, then 50 us sleeps). HELSARI_PICK_SPIN=1: the original guest code.
-extern "C" void f_00072680_guest(PPU_CTX);
-extern "C" void f_00072680(PPU_CTX) {
+extern "C" void f_000731f8_guest(PPU_CTX);
+extern "C" void f_000731f8(PPU_CTX) {
     static const bool spin = getenv("HELSARI_PICK_SPIN") && atoi(getenv("HELSARI_PICK_SPIN"));
-    if (spin) { f_00072680_guest(ctx); return; }
+    if (spin) { f_000731f8_guest(ctx); return; }
     const uint32_t s = (uint32_t)ctx->r[3];
     uint64_t t_wait = 0;   // set at the first fruitless pass: time waited goes to the flip log
     struct Account { uint64_t &t; ~Account() { if (t) thread::add_wait("microthread wait", host_now_ns() - t); } } acc{t_wait};
@@ -177,7 +177,7 @@ extern "C" void f_00072680(PPU_CTX) {
     }
 }
 
-extern "C" void f_00071f24(PPU_CTX) {
+extern "C" void f_00072a9c(PPU_CTX) {
     // restore(buf = r3) reached directly (microthread exit): switch for good.
     switch_to(ctx, (uint32_t)ctx->r[3], 0);
     fatal("abandoned microthread was resumed");

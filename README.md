@@ -17,7 +17,7 @@ is translated to C ahead of time and compiled on your PC, from your own copy. No
 
 - **Mouse and keyboard**: 1:1 raw mouse look, rebindable keys, on-screen prompts that follow the device you use
 - **PC options** in the game's own menu: framerate limit, resolution, window mode, V-sync, screen effects, field of
-  view, viewmodel sway
+  view, viewmodel sway, intro movie skip
 - **Unlocked framerate**, with the game's logic still running at its own speed
 - **Higher internal resolution**, up to 4K
 
@@ -26,6 +26,8 @@ Details: [docs/FEATURES.md](docs/FEATURES.md).
 ## What you need
 
 - Your own disc dump of the game (European release, BCES00081, is the one tested)
+- The game's 1.29 update, from your own copy. If you have played the game in RPCS3, it is already in RPCS3's
+  `dev_hdd0/game/<title id>` folder, and the build finds it there
 - Windows 10 or 11, 64-bit, with a CPU that supports AVX2
 - The build tools listed in [docs/BUILDING.md](docs/BUILDING.md)
 

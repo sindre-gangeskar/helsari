@@ -13,10 +13,10 @@
 
 extern "C"
 {
-    void f_002d1888_guest(PPU_CTX); // the <buttonimage> tag: (text, args, flag)
-    void f_00063c08(PPU_CTX);       // whether this region swaps the ok and cancel buttons
-    void f_0050ac20(PPU_CTX);       // finds a tag argument: (text, args, "name=a|b|c", int *index, 0)
-    void f_0050a2e8(PPU_CTX);       // adds one character to the text: (text, code)
+    void f_002dc278_guest(PPU_CTX); // the <buttonimage> tag: (text, args, flag)
+    void f_00064768(PPU_CTX);       // whether this region swaps the ok and cancel buttons
+    void f_00517d18(PPU_CTX);       // finds a tag argument: (text, args, "name=a|b|c", int *index, 0)
+    void f_00517398(PPU_CTX);       // adds one character to the text: (text, code)
 }
 bool mouse_in_play();       // mouse.cpp
 bool mouse_menu_cross();    // mouse.cpp: a click in a menu
@@ -444,17 +444,17 @@ void keybind_paint_hud(unsigned char *rgba, int width, int height)
     DeleteDC(dc);
 }
 
-extern "C" void f_002d1888(PPU_CTX)
+extern "C" void f_002dc278(PPU_CTX)
 {
     if (keybind_prompts() == PROMPTS_PLAYSTATION)
     {
-        f_002d1888_guest(ctx);
+        f_002dc278_guest(ctx);
         return;
     }
     static const char *const NAMES[] = {"", "triangle", "square", "", "left", "right", "up", "down", "L1", "L2", "L3", "R1", "R2", "R3", "updown",
                                         "cursor", "arrow", "HR", "asterix", "leftright", "trademark", "LAnalog", "RAnalog", "select", "start",
                                         "familylogo", "ps3logo", "scediamondlogo", "saveprofile", "leftrightupdown"};
-    constexpr uint32_t CANCEL_FIRST = 0xbe6a8c, OK_FIRST = 0xbe6b64;
+    constexpr uint32_t CANCEL_FIRST = 0xbfdd58, OK_FIRST = 0xbfde30;
     PPUContext saved = *ctx;
     const uint32_t text = (uint32_t)ctx->r[3], args = (uint32_t)ctx->r[4];
     const uint64_t sp = (saved.r[1] - 512) & ~15ull;
@@ -463,10 +463,10 @@ extern "C" void f_002d1888(PPU_CTX)
     const uint32_t index_ea = (uint32_t)sp + 140;
     st32(index_ea, 0xffffffffu);
     ctx->r[3] = text;
-    f_00063c08(ctx);
+    f_00064768(ctx);
     const bool cancel_first = (int32_t)ctx->r[3] != 0;
     ctx->r[3] = text, ctx->r[4] = args, ctx->r[5] = cancel_first ? CANCEL_FIRST : OK_FIRST, ctx->r[6] = index_ea, ctx->r[7] = 0;
-    f_0050ac20(ctx);
+    f_00517d18(ctx);
     const int index = (int32_t)ld32(index_ea);
     std::string label;
     if (index == 0)
@@ -478,13 +478,13 @@ extern "C" void f_002d1888(PPU_CTX)
     if (label.empty())
     {
         *ctx = saved;
-        f_002d1888_guest(ctx);
+        f_002dc278_guest(ctx);
         return;
     }
     for (const char c : label)
     {
         ctx->r[3] = text, ctx->r[4] = (uint8_t)c;
-        f_0050a2e8(ctx);
+        f_00517398(ctx);
     }
     *ctx = saved;
     ctx->r[3] = 1;

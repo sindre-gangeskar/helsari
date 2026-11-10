@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rsx { bool pc_depth_of_field(); }   // GRAPHICS menu (pc_options.cpp)
@@ -85,12 +86,12 @@ bool image_matches(const uint8_t *ls, const NativeModule *m) {
 }
 } // namespace
 
-// HELSARI_SKIP_JOBS=job_d62e00,job_d65480 ("post" = the whole post-processing set): these jobs do
+// HELSARI_SKIP_JOBS=job_d7aa80,job_d7d100 ("post" = the whole post-processing set): these jobs do
 // no pixel work. Measures what a job costs, or (later) lets the GPU do its work. They still run:
 // returning at once hangs the game, the job manager relies on the job's calls back into it. So
 // the job gets empty job data (no rows, no optional inputs). Job's code starts at its header's
 // entry offset, 0x30; r3 = context, context+32 = job data.
-// Not in the set: job_d69c80, a 4-byte PUT from job data - the signal the frame waits for.
+// Not in the set: job_d81900, a 4-byte PUT from job data - the signal the frame waits for.
 namespace {
 const uint32_t JOB_ENTRY = 0x30;
 uint32_t skip_job(SpuThread &t, uint32_t pc) {
@@ -110,8 +111,8 @@ bool job_skipped(const char *job) {
         const char *e = getenv("HELSARI_SKIP_JOBS");
         std::string s = e ? e : "";
         if (s == "post")
-            s = "job_d4a280,job_d52080,job_d55200,job_d68180,job_d5b200,job_d4e380,"
-                "job_d48600,job_d61280,job_d5db00,job_d62e00,job_d65480";
+            s = "job_d61f00,job_d69d00,job_d6ce80,job_d7fe00,job_d72e80,job_d66000,"
+                "job_d60280,job_d78f00,job_d75780,job_d7aa80,job_d7d100";
         return s;
     }();
     return !list.empty() && strncmp(job, "job_", 4) == 0 && list.find(job) != std::string::npos;
@@ -124,8 +125,8 @@ bool SpuThread::map_module(const NativeModule *m) {
     if (slot < 0) return false;
     if (!native) native = std::make_unique<NativeFn[]>(LS_SIZE / 4);
     for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = m->entries[i].fn;
-    // job_d65480 is the depth of field. Jobs map many times a frame, so the menu's choice applies at once.
-    if (job_skipped(m->name) || (!::rsx::pc_depth_of_field() && !strcmp(m->name, "job_d65480")))
+    // job_d7d100 is the depth of field. Jobs map many times a frame, so the menu's choice applies at once.
+    if (job_skipped(m->name) || (!::rsx::pc_depth_of_field() && !strcmp(m->name, "job_d7d100")))
         native[(m->ls_base + JOB_ENTRY) >> 2] = skip_job;
     // code_q for this module: computed once, copied at every map (jobs map hundreds of times a frame).
     {
@@ -147,7 +148,10 @@ bool SpuThread::map_module(const NativeModule *m) {
     }
     mapped[slot].m = m;
     if (name[6] == 'j' && !m->image) gcm_post_job_mapped(m->name);   // "spurs:jm_...": F9 buffer dumps
-    if (g_maps++ < 20) LOG("spu", "%s: native code for %s mapped at 0x%x", name.c_str(), m->name, m->ls_base);
+    // The first map of each module on each thread (jobs map hundreds of times a frame).
+    g_maps++;
+    thread_local std::unordered_set<const NativeModule *> seen;
+    if (seen.insert(m).second) LOG("spu", "%s: native code for %s mapped at 0x%x", name.c_str(), m->name, m->ls_base);
     return true;
 }
 

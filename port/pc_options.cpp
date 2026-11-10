@@ -18,15 +18,15 @@
 
 extern "C"
 {
-    void f_0047ccc0_guest(PPU_CTX); // URL dispatcher: (this, const char *url)
-    void f_0047b900_guest(PPU_CTX); // calls a script function: (script, const String &call, ...)
-    void f_003e5300(PPU_CTX);       // script wrapper: loads the script if needed (wrapper)
-    void f_003f0388(PPU_CTX);       // lua_gettop(L)
-    void f_003f0600(PPU_CTX);       // lua_settop(L, index)
-    void f_003f12a0(PPU_CTX);       // lua_getfield(L, index, name)
-    void f_003f0dd0(PPU_CTX);       // lua_pushstring(L, s)
-    void f_003f1de8(PPU_CTX);       // lua_pcall(L, nargs, nresults, errfunc)
-    void f_003f0980(PPU_CTX);       // lua_tolstring(L, index, len)
+    void f_004894e0_guest(PPU_CTX); // URL dispatcher: (this, const char *url)
+    void f_00487fd0_guest(PPU_CTX); // calls a script function: (script, const String &call, ...)
+    void f_003f1750(PPU_CTX);       // script wrapper: loads the script if needed (wrapper)
+    void f_003fc7d8(PPU_CTX);       // lua_gettop(L)
+    void f_003fca50(PPU_CTX);       // lua_settop(L, index)
+    void f_003fd6f0(PPU_CTX);       // lua_getfield(L, index, name)
+    void f_003fd220(PPU_CTX);       // lua_pushstring(L, s)
+    void f_003fe238(PPU_CTX);       // lua_pcall(L, nargs, nresults, errfunc)
+    void f_003fcdd0(PPU_CTX);       // lua_tolstring(L, index, len)
 }
 void gcm_pc_command(const std::string &cmd);                 // hle_gcm.cpp
 void gcm_set_window(int width, int height, bool borderless); // hle_gcm.cpp
@@ -69,6 +69,7 @@ namespace
     constexpr int FOV_MIN = 73, FOV_MAX = 110;
     std::atomic<int> g_fov{0};
     std::atomic<int> g_sway{3};
+    std::atomic<bool> g_skip_intro{false}; // the movie before the start screen
     std::atomic<uint32_t> g_L{0}; // Lua state of the page's script
     std::mutex g_lock;
 
@@ -76,8 +77,8 @@ namespace
     {
         if (FILE *f = fopen(SETTINGS_FILE, "w"))
         {
-            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
-                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), g_fov.load(), SWAY[g_sway.load()]);
+            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\nskip_intro_movie=%d\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
+                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), g_fov.load(), SWAY[g_sway.load()], (int)g_skip_intro.load());
             for (int i = 0; i < KEYBIND_COUNT; i++)
                 fprintf(f, "key_%s=%d\n", keybind_id(i), keybind_key(i));
             fclose(f);
@@ -113,6 +114,10 @@ namespace
             else if (sscanf(line, "vsync=%d", &a) == 1)
             {
                 g_vsync = a != 0;
+            }
+            else if (sscanf(line, "skip_intro_movie=%d", &a) == 1)
+            {
+                g_skip_intro = a != 0;
             }
             else if (sscanf(line, "screen_fx=%d", &a) == 1)
             {
@@ -162,7 +167,7 @@ namespace
         auto report = [&](const char *what)
         {
             ctx->r[3] = L, ctx->r[4] = (uint64_t)-1ll, ctx->r[5] = 0;
-            f_003f0980(ctx);
+            f_003fcdd0(ctx);
             const uint32_t msg = (uint32_t)ctx->r[3];
             LOG("menu", "Lua %s failed: %s", what, msg ? (const char *)mem::ptr(msg) : "(no message)");
         };
@@ -170,21 +175,21 @@ namespace
         auto type_at = [&](int back)
         { return ld32(ld32(L + 8) - 8 * back + 4); };
         ctx->r[3] = L;
-        f_003f0388(ctx);
+        f_003fc7d8(ctx);
         const int64_t top = (int32_t)ctx->r[3];
         ctx->r[3] = L, ctx->r[4] = (uint64_t)LUA_GLOBALSINDEX, ctx->r[5] = name;
-        f_003f12a0(ctx);
+        f_003fd6f0(ctx);
         if (type_at(1) != 6)
         { // this state has no such function
             ctx->r[3] = L, ctx->r[4] = (uint64_t)top;
-            f_003f0600(ctx);
+            f_003fca50(ctx);
             *ctx = saved;
             return;
         }
         ctx->r[3] = L, ctx->r[4] = src;
-        f_003f0dd0(ctx);
+        f_003fd220(ctx);
         ctx->r[3] = L, ctx->r[4] = 1, ctx->r[5] = 1, ctx->r[6] = 0;
-        f_003f1de8(ctx); // loadstring(code) -> the function, or nil
+        f_003fe238(ctx); // loadstring(code) -> the function, or nil
         if ((int32_t)ctx->r[3])
         {
             report("loadstring call");
@@ -196,12 +201,12 @@ namespace
         else
         {
             ctx->r[3] = L, ctx->r[4] = 0, ctx->r[5] = 0, ctx->r[6] = 0;
-            f_003f1de8(ctx);
+            f_003fe238(ctx);
             if ((int32_t)ctx->r[3])
                 report("run");
         }
         ctx->r[3] = L, ctx->r[4] = (uint64_t)top;
-        f_003f0600(ctx);
+        f_003fca50(ctx);
         *ctx = saved;
     }
 
@@ -234,7 +239,8 @@ namespace
                set_text("tF", std::string("FRAMERATE LIMIT: ") + FPS[g_fps]) + set_text("tR", res) +
                set_text("tM", g_borderless ? "WINDOW MODE: BORDERLESS" : "WINDOW MODE: WINDOWED") +
                set_text("tV", g_vsync ? "VSYNC: ON" : "VSYNC: OFF") +
-               set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) + show_keys() +
+               set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) +
+               set_text("tI", g_skip_intro ? "INTRO MOVIE: SKIP" : "INTRO MOVIE: PLAY") + show_keys() +
                "local fov_slider = gBrowser:GetTagByName(\"sO\")\nif fov_slider then fov_slider:SetCurrentValue(" + std::to_string(fov_degrees) + ") end\n";
     }
 
@@ -261,7 +267,7 @@ namespace
             const uint64_t left = (uint8_t *)mb.BaseAddress + mb.RegionSize - host;
             if (mb.State == MEM_COMMIT && !(mb.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
             {
-                const uint32_t *w = (const uint32_t *)host, vt = __builtin_bswap32(0x00f98d54u), shown = __builtin_bswap32(3u);
+                const uint32_t *w = (const uint32_t *)host, vt = __builtin_bswap32(0x00faa9e4u), shown = __builtin_bswap32(3u);
                 for (uint64_t i = 0; i + 24 < left / 4 && rows.size() < 200; i++)
                     if (w[i] == vt && w[i + 1] == shown)
                     {
@@ -311,18 +317,18 @@ namespace
         memcpy(mem::ptr(name), "pc_probe", 9);
         ctx->r[1] = sp;
         ctx->r[3] = L;
-        f_003f0388(ctx);
+        f_003fc7d8(ctx);
         const int64_t top = (int32_t)ctx->r[3];
         ctx->r[3] = L, ctx->r[4] = (uint64_t)LUA_GLOBALSINDEX, ctx->r[5] = name;
-        f_003f12a0(ctx);
+        f_003fd6f0(ctx);
         ctx->r[3] = L, ctx->r[4] = (uint64_t)-1ll, ctx->r[5] = 0;
-        f_003f0980(ctx);
+        f_003fcdd0(ctx);
         const uint32_t text = (uint32_t)ctx->r[3];
         std::string out = text ? (const char *)mem::ptr(text) : "(no text: the script stopped early)";
         for (size_t i = 0; i < out.size(); i += 1500)
             LOG("menu", "probe: %s", out.substr(i, 1500).c_str());
         ctx->r[3] = L, ctx->r[4] = (uint64_t)top;
-        f_003f0600(ctx);
+        f_003fca50(ctx);
         *ctx = saved;
     }
 
@@ -337,16 +343,16 @@ namespace
         memcpy(mem::ptr(name), global, strlen(global) + 1);
         ctx->r[1] = sp;
         ctx->r[3] = L;
-        f_003f0388(ctx);
+        f_003fc7d8(ctx);
         const int64_t top = (int32_t)ctx->r[3];
         ctx->r[3] = L, ctx->r[4] = (uint64_t)LUA_GLOBALSINDEX, ctx->r[5] = name;
-        f_003f12a0(ctx);
+        f_003fd6f0(ctx);
         ctx->r[3] = L, ctx->r[4] = (uint64_t)-1ll, ctx->r[5] = 0;
-        f_003f0980(ctx);
+        f_003fcdd0(ctx);
         const uint32_t text = (uint32_t)ctx->r[3];
         std::string out = text ? (const char *)mem::ptr(text) : "";
         ctx->r[3] = L, ctx->r[4] = (uint64_t)top;
-        f_003f0600(ctx);
+        f_003fca50(ctx);
         *ctx = saved;
         return out;
     }
@@ -446,7 +452,7 @@ namespace
         }
         if (!target_at || now < next_press || mouse_menu_pressing())
             return;
-        if (ld32(target_at) != 0x00f98d54u || ld32(target_at + 4) != 3u)
+        if (ld32(target_at) != 0x00faa9e4u || ld32(target_at + 4) != 3u)
         {
             target_at = 0, click_waiting = false; // another page by now
             return;
@@ -499,6 +505,7 @@ namespace rsx
     bool pc_depth_of_field() { return g_screen_fx.load(std::memory_order_relaxed) == 0; }
 }
 
+bool pc_skip_intro_movie() { return g_skip_intro.load(std::memory_order_relaxed); }
 float pc_viewmodel_sway() { return SWAY[g_sway.load(std::memory_order_relaxed)]; }
 
 // Window thread, once the window exists.
@@ -511,12 +518,12 @@ void pc_options_start()
         g_borderless ? "borderless" : "windowed", (int)g_vsync.load());
 }
 
-extern "C" void f_0047b900(PPU_CTX)
+extern "C" void f_00487fd0(PPU_CTX)
 {
     const uint32_t script = (uint32_t)ctx->r[3], call_ref = (uint32_t)ctx->r[4];
     if (!menu_on() || !call_ref)
     {
-        f_0047b900_guest(ctx);
+        f_00487fd0_guest(ctx);
         return;
     }
     std::string call;
@@ -539,13 +546,13 @@ extern "C" void f_0047b900(PPU_CTX)
     // Before the call: a script can open another page from OnEnterPage, which destroys its state.
     // The options table exists by now, it is built at the script's top level.
     // Scripts load lazily: the wrapper at M checks its load state (+12) before each use and loads
-    // the script if that is not 3 (f_003e5408), and only then is its Lua state (+20) usable.
+    // the script if that is not 3 (f_003f1858), and only then is its Lua state (+20) usable.
     const uint32_t M = ld32(script + 364) + 8;
     if (call == "OnEnterPage" && ld32(M + 12) != 3)
     {
         PPUContext saved = *ctx;
         ctx->r[3] = M;
-        f_003e5300(ctx);
+        f_003f1750(ctx);
         *ctx = saved;
     }
     const uint32_t state = ld32(M + 12), L = state == 3 ? ld32(M + 20) : 0, G = L ? ld32(L + 16) : 0;
@@ -582,10 +589,10 @@ extern "C" void f_0047b900(PPU_CTX)
                         "gBrowser:GetTagByName(\"lK\"):SetVisible(false)\n" +
                             show_values() + "end\n");
     }
-    f_0047b900_guest(ctx);
+    f_00487fd0_guest(ctx);
 }
 
-extern "C" void f_0047ccc0(PPU_CTX)
+extern "C" void f_004894e0(PPU_CTX)
 {
     static const std::string prefix = "static://hs/";
     std::string url;
@@ -593,7 +600,7 @@ extern "C" void f_0047ccc0(PPU_CTX)
         url = (const char *)mem::ptr((uint32_t)ctx->r[4]);
     if (url.compare(0, prefix.size(), prefix) != 0)
     {
-        f_0047ccc0_guest(ctx);
+        f_004894e0_guest(ctx);
         return;
     }
     const std::string row = url.substr(prefix.size());
@@ -619,6 +626,8 @@ extern "C" void f_0047ccc0(PPU_CTX)
         return; // its slider sets it
     else if (row == "sway")
         g_sway = (g_sway.load() + 1) % SWAY_N;
+    else if (row == "intro")
+        g_skip_intro = !g_skip_intro;
     save();
     if (const uint32_t L = g_L.load())
         lua_run(ctx, L, show_values());

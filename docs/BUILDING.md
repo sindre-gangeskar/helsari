@@ -5,7 +5,9 @@
 - Python 3.10 or later
 - CMake and Ninja
 - Visual Studio Build Tools with its Clang component
-- RPCS3 with PS3 firmware installed, used once to decrypt `EBOOT.BIN`
+- RPCS3 with PS3 firmware installed, used once to decrypt the update's `EBOOT.BIN`
+- The game's 1.29 update. Helsari runs 1.29 only: its executable is the one recompiled, and the game reads the
+  update's patches itself
 - A CPU with AVX2, to run the game
 
 Microsoft's Clang is signed, so Windows Smart App Control allows it. The build still has LLVM-MinGW settings, but Smart
@@ -27,6 +29,10 @@ cmake -B build -G Ninja "-DCMAKE_C_COMPILER=%LLVM%/clang.exe" "-DCMAKE_CXX_COMPI
 ninja -C build
 build\helsari2.exe
 ```
+
+The build looks for the update next to `rpcs3.exe`, in `dev_hdd0/game/<title id>`. If it is elsewhere, add
+`-DHELSARI_UPDATE="<path_to_update_folder>"`; `helsari2.exe --update <dir>` overrides it at run time. The update
+stays where it is: the game reads it there.
 
 Configuring runs the recompiler (`tools/recomp`); the build then compiles the generated code. Changing any file in
 `tools/recomp` regenerates all of it, which takes several minutes.

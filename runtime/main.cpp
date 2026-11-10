@@ -14,6 +14,7 @@
 
 namespace cfg {
 std::string dump_dir = HELSARI_DEFAULT_DUMP;
+std::string update_dir = HELSARI_DEFAULT_UPDATE;
 std::string data_dir;
 std::string elf_path = HELSARI_DEFAULT_ELF;
 }
@@ -109,18 +110,22 @@ int main(int argc, char **argv) {
         std::string a = argv[i];
         if (a == "--dump") cfg::dump_dir = argv[++i];
         else if (a == "--elf") cfg::elf_path = argv[++i];
+        else if (a == "--update") cfg::update_dir = argv[++i];
         else if (a == "--data") cfg::data_dir = argv[++i];
     }
-    for (auto *s : {&cfg::dump_dir, &cfg::data_dir})
+    for (auto *s : {&cfg::dump_dir, &cfg::data_dir, &cfg::update_dir})
         for (auto &c : *s) if (c == '\\') c = '/';
     if (!std::filesystem::exists(cfg::dump_dir + "/PS3_GAME/PARAM.SFO"))
         fatal("Game dump not found at '%s' (pass --dump <folder containing PS3_GAME>)", cfg::dump_dir.c_str());
+    if (!std::filesystem::exists(cfg::update_dir + "/USRDIR/EBOOT.BIN"))
+        fatal("Game update 1.29 not found at '%s' (pass --update <dev_hdd0/game/title id folder>)", cfg::update_dir.c_str());
     for (const char *d : {"/dev_hdd0/game", "/dev_hdd0/home/00000001/savedata", "/dev_hdd1"})
         std::filesystem::create_directories(cfg::data_dir + d);
     LOG("main", "build: %s %s, stamp %s", __DATE__, __TIME__, helsari_build_stamp);   // which build wrote this log
     start_alloc_tracing();
     LOG("main", "dump: %s", cfg::dump_dir.c_str());
     LOG("main", "data: %s", cfg::data_dir.c_str());
+    LOG("main", "update: %s", cfg::update_dir.c_str());
 
     mem::init();
     load_elf(cfg::elf_path);
@@ -129,7 +134,9 @@ int main(int argc, char **argv) {
 
     // argv/envp for crt0: 64-bit pointer arrays
     uint32_t path = mem::alloc(64);
-    mem::write_cstr(path, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN", 64);
+    // Started the way the PS3 starts an updated disc game: from the update's executable, where the game
+    // also finds the update's data.
+    mem::write_cstr(path, "/dev_hdd0/game/BCES00081/USRDIR/EBOOT.BIN", 64);
     uint32_t av = mem::alloc(16), ev = mem::alloc(16);
     st64(av, path);
     st64(av + 8, 0);

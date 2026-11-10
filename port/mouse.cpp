@@ -14,22 +14,22 @@
 #include <cstdlib>
 #include <cstring>
 
-extern "C" void f_00080a78_guest(PPU_CTX); // look input: (this, float *outY, float *outX, settings)
-extern "C" void f_006623d8_guest(PPU_CTX); // view data from a camera struct: position +4, forward +16, up +28
+extern "C" void f_00081f10_guest(PPU_CTX); // look input: (this, float *outY, float *outX, settings)
+extern "C" void f_0066f688_guest(PPU_CTX); // view data from a camera struct: position +4, forward +16, up +28
 
 namespace rsx { int pc_field_of_view(); } // GRAPHICS menu (pc_options.cpp)
 
 namespace
 {
-    constexpr uint32_t TICK_TIME_EA = 0xf2a1d4; // the length of a game tick, read by the look code's callers
-    constexpr uint32_t PROFILE_PTR_EA = 0x117e740 + 576;
+    constexpr uint32_t TICK_TIME_EA = 0xf3b454; // the length of a game tick, read by the look code's callers
+    constexpr uint32_t PROFILE_PTR_EA = 0x11b0540 + 576;
     constexpr uint32_t PROFILE_INVERT_Y = 91, PROFILE_INVERT_X = 90;
     constexpr float FULL_STICK_RAD_PER_S = 2.6f; // measured: full stick for 0.6 s turned about 1.59 rad
     constexpr float RAD_PER_COUNT = 0.001007f;   // at sensitivity 1
     constexpr float LOOK_NUDGE = 0.0005f;        // about 0.0001 rad per game tick
     constexpr float STEER_GAIN = 0.5f;           // of a real gap, per game tick, once the mouse is still
-    constexpr uint32_t LOOK_ON_FOOT = 0x16e794;  // return address of the on-foot look code's call
-    constexpr uint32_t VIEW_FIRST = 0x26c8f8, VIEW_NEAR = 0x26c388, VIEW_MAIN = 0x271a8c;
+    constexpr uint32_t LOOK_ON_FOOT = 0x173ff4;  // return address of the on-foot look code's call
+    constexpr uint32_t VIEW_FIRST = 0x276be0, VIEW_NEAR = 0x276668, VIEW_MAIN = 0x27bdcc;
     constexpr float MAX_OFFSET = 1.2f;           // a fast flick within the two tick delay
     constexpr float REST_FADE = 0.8f;            // per frame, once the mouse rests
     constexpr float MAX_PITCH = 1.5f;
@@ -553,11 +553,11 @@ bool mouse_message(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *result)
     return false;
 }
 
-extern "C" void f_00080a78(PPU_CTX)
+extern "C" void f_00081f10(PPU_CTX)
 {
     if (g_mouse_off)
     {
-        f_00080a78_guest(ctx);
+        f_00081f10_guest(ctx);
         return;
     }
     const uint32_t out_y = (uint32_t)ctx->r[4], out_x = (uint32_t)ctx->r[5];
@@ -621,7 +621,7 @@ extern "C" void f_00080a78(PPU_CTX)
         read_turn_factor(ctx);
         apply_look_limits((uint32_t)ctx->r[30]);
     }
-    f_00080a78_guest(ctx);
+    f_00081f10_guest(ctx);
     const int dx = g_dx.exchange(0), dy = g_dy.exchange(0);
     for (int i = 2; i > 0; i--)
         g_tick_x[i] = g_tick_x[i - 1], g_tick_y[i] = g_tick_y[i - 1];
@@ -660,7 +660,7 @@ extern "C" void f_00080a78(PPU_CTX)
     guest_float_add(out_y, y);
 }
 
-extern "C" void f_006623d8(PPU_CTX)
+extern "C" void f_0066f688(PPU_CTX)
 {
     if (!g_mouse_off && g_mouse_active.load(std::memory_order_relaxed))
     {
@@ -685,12 +685,12 @@ extern "C" void f_006623d8(PPU_CTX)
         const float saved[4] = {guest_float(camera + 48), guest_float(camera + 52), guest_float(camera + 56), guest_float(camera + 60)};
         for (int i = 0; i < 4; i++)
             guest_float_set(camera + 48 + i * 4, saved[i] * wider);
-        f_006623d8_guest(ctx);
+        f_0066f688_guest(ctx);
         for (int i = 0; i < 4; i++)
             guest_float_set(camera + 48 + i * 4, saved[i]);
         return;
     }
-    f_006623d8_guest(ctx);
+    f_0066f688_guest(ctx);
 }
 
 // The controller was used: hand the look back to the game until the mouse moves again.

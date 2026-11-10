@@ -40,10 +40,10 @@ def read_sfo(path):
     return out
 
 
-def decrypt(dump, rpcs3, out):
-    eboot = os.path.join(dump, 'PS3_GAME', 'USRDIR', 'EBOOT.BIN')
+def decrypt(update, rpcs3, out):
+    eboot = os.path.join(update, 'USRDIR', 'EBOOT.BIN')
     if not os.path.isfile(eboot):
-        sys.exit(f'EBOOT.BIN not found under {dump}\\PS3_GAME\\USRDIR')
+        sys.exit(f'EBOOT.BIN not found under {update}\\USRDIR')
     work = os.path.join(out, 'decrypt')
     os.makedirs(work, exist_ok=True)
     src_hash = hashlib.sha1(open(eboot, 'rb').read()).hexdigest()
@@ -185,6 +185,7 @@ def _code_end(e):
 def main():
     ap = argparse.ArgumentParser(prog='recomp')
     ap.add_argument('--dump', required=True, help='Game disc dump folder (contains PS3_GAME)')
+    ap.add_argument('--update', required=True, help='Game update 1.29 folder (dev_hdd0/game/<title id>)')
     ap.add_argument('--rpcs3', help='rpcs3.exe, used to decrypt EBOOT.BIN and to recover function names')
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
@@ -197,8 +198,17 @@ def main():
         sys.exit('not a supported dump')
     if title != 'BCES00081':
         log('warning: only BCES00081 has been tested')
+    # Helsari runs the game's 1.29 update: its executable is the one recompiled, and the game reads the
+    # update's patches itself.
+    usfo = os.path.join(a.update, 'PARAM.SFO')
+    if not os.path.isfile(usfo):
+        sys.exit(f'{a.update} does not look like the game update (no PARAM.SFO)')
+    u = read_sfo(usfo)
+    if u.get('TITLE_ID') != title or u.get('APP_VER') != '01.29':
+        sys.exit(f'{a.update} is {u.get("TITLE_ID")} version {u.get("APP_VER")}; Helsari needs {title} version 01.29')
+    log(f'update {u.get("APP_VER")}')
     os.makedirs(a.out, exist_ok=True)
-    elf_path = decrypt(a.dump, a.rpcs3, a.out)
+    elf_path = decrypt(a.update, a.rpcs3, a.out)
     generate(elf.load(elf_path), a.out, a.rpcs3)
 
 

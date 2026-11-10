@@ -174,15 +174,24 @@ HLE(cellSysmoduleUnloadModule) { RET(0); }
 HLE(cellGameBootCheck) {
     // (u32 *type, u32 *attributes, CellGameContentSize *size, char dirName[32])
     put32(ARG32(0), 1);  // CELL_GAME_GAMETYPE_DISC
-    put32(ARG32(1), 0);
+    put32(ARG32(1), 1);  // CELL_GAME_ATTRIBUTE_PATCH: started from the update, as a patched disc game is
     if (ARG32(2)) { st32(ARG32(2), 0x7fffffff); st32(ARG32(2) + 4, 0); st32(ARG32(2) + 8, 0); }
     if (ARG32(3)) mem::write_cstr(ARG32(3), "", 32);
     RET(0);
 }
-HLE(cellGamePatchCheck) { RET(0x8002cb02); }  // CELL_GAME_ERROR_NOTPATCH-style: no patch installed
+static bool g_patch_checked;  // after the patch check, the content folder is the update's
+HLE(cellGamePatchCheck) {
+    // (CellGameContentSize *size, u64 reserved): the 1.29 update is installed.
+    LOG("game", "patch check: update installed");
+    g_patch_checked = true;
+    if (ARG32(0)) { st32(ARG32(0), 0x7fffffff); st32(ARG32(0) + 4, 0); st32(ARG32(0) + 8, 0); }
+    RET(0);
+}
 HLE(cellGameContentPermit) {
-    mem::write_cstr(ARG32(0), "/dev_bdvd/PS3_GAME", 128);
-    mem::write_cstr(ARG32(1), "/dev_bdvd/PS3_GAME/USRDIR", 128);
+    const char *root = g_patch_checked ? "/dev_hdd0/game/BCES00081" : "/dev_bdvd/PS3_GAME";
+    LOG("game", "content permit: %s", root);
+    mem::write_cstr(ARG32(0), root, 128);
+    mem::write_cstr(ARG32(1), (std::string(root) + "/USRDIR").c_str(), 128);
     RET(0);
 }
 // PARAM.SFO of the user's dump: little-endian header, an index of entries,

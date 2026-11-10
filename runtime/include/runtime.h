@@ -128,6 +128,7 @@ namespace cfg {
 extern std::string dump_dir;   /* folder containing PS3_GAME */
 extern std::string data_dir;   /* writable root for dev_hdd0 etc. */
 extern std::string elf_path;
+extern std::string update_dir; /* the game update: dev_hdd0/game/<title id>, read where the game looks for it */
 }
 
 uint32_t syscall_dispatch(PPUContext *ctx, uint64_t n);

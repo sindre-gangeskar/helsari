@@ -310,6 +310,7 @@ struct Surface {
     ID3D11ShaderResourceView *srv = nullptr;
     ID3D11Texture2D *copy = nullptr;            // snapshot for read-while-render
     ID3D11ShaderResourceView *copy_srv = nullptr;
+    uint64_t copy_serial = 0;                   // the drawn_serial the snapshot holds
     uint32_t last_frame = 0;
     uint32_t pitch = 0;                         // bytes per row in guest memory
     bool dirty = false;                         // rendered to since last written back
@@ -318,8 +319,10 @@ struct Surface {
     ID3D11Texture2D *as_color = nullptr;
     ID3D11RenderTargetView *as_color_rtv = nullptr;
     ID3D11ShaderResourceView *as_color_srv = nullptr;
+    uint64_t as_color_serial = 0;               // the drawn_serial it was converted from
     // Colour surface read through a texture format with another layout, see reinterpret_view().
     uint32_t view_fmt = 0;
+    uint64_t view_serial = 0;                   // the drawn_serial it was converted from
     ID3D11Texture2D *view = nullptr;
     ID3D11RenderTargetView *view_rtv = nullptr;
     ID3D11ShaderResourceView *view_srv = nullptr;
@@ -361,7 +364,10 @@ ID3D11ShaderResourceView *snapshot(Surface &s) {
             g_dev->CreateShaderResourceView(s.copy, nullptr, &s.copy_srv);
         }
     }
+    // Nothing drawn since the last snapshot: it still matches (a full 4K copy saved).
+    if (s.copy_serial == s.drawn_serial) return s.copy_srv;
     g_ctx->CopyResource(s.copy, s.tex);
+    s.copy_serial = s.drawn_serial;
     g_snap_n++, g_snap_px += (uint64_t)s.w * s.h;
     return s.copy_srv;
 }
@@ -490,6 +496,10 @@ struct Bound {
 // HELSARI_GPU_TIMING=1: GPU time per render target, logged every 120 frames. Each frame's timestamps
 // are read a few frames later, when the GPU has reached them.
 const bool g_gpu_timing = getenv("HELSARI_GPU_TIMING") != nullptr;
+// HELSARI_GPU_TIMING=2: per render target and pixel shader (a timestamp whenever the pair changes).
+const bool g_gpu_by_shader = g_gpu_timing && atoi(getenv("HELSARI_GPU_TIMING")) == 2;
+std::map<uint64_t, uint32_t> g_gpu_draws;   // draws per key, by_shader mode
+std::map<uint32_t, uint64_t> g_gpu_shader_names;   // key low word -> pixel shader hash
 struct GpuFrame {
     ID3D11Query *disjoint = nullptr;
     std::vector<std::pair<ID3D11Query *, uint64_t>> marks;
@@ -562,13 +572,18 @@ void gpu_frame_end() {
     std::sort(v.rbegin(), v.rend());
     std::string line;
     char b[64];
-    for (size_t i = 0; i < v.size() && i < 10; i++) {
-        snprintf(b, sizeof b, " %08x@%u %.2f", (uint32_t)(v[i].second >> 32), (uint32_t)v[i].second, v[i].first / g_gpu_n);
+    for (size_t i = 0; i < v.size() && i < (g_gpu_by_shader ? 16u : 10u); i++) {
+        const auto name = g_gpu_shader_names.find((uint32_t)v[i].second);
+        if (name != g_gpu_shader_names.end())
+            snprintf(b, sizeof b, " %08x/ps%016llx %.2f (%u draws)", (uint32_t)(v[i].second >> 32), (unsigned long long)name->second,
+                     v[i].first / g_gpu_n, g_gpu_draws[v[i].second] / g_gpu_n);
+        else
+            snprintf(b, sizeof b, " %08x@%u %.2f", (uint32_t)(v[i].second >> 32), (uint32_t)v[i].second, v[i].first / g_gpu_n);
         line += b;
     }
     LOG("rsx", "GPU timing: %.1f ms per frame;%s; snapshots %.1f per frame (%.0f MB)", g_gpu_total / g_gpu_n, line.c_str(),
         (double)g_snap_n / g_gpu_n, g_snap_px * 4.0 / g_gpu_n / 1e6);
-    g_gpu_ms.clear(), g_gpu_total = 0, g_gpu_n = 0, g_snap_n = g_snap_px = 0;
+    g_gpu_ms.clear(), g_gpu_draws.clear(), g_gpu_total = 0, g_gpu_n = 0, g_snap_n = g_snap_px = 0;
 }
 
 Bound bind_surfaces() {
@@ -1069,7 +1084,10 @@ bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, ID3D11Texture2D *&tex, I
 ID3D11ShaderResourceView *depth_as_color(Surface &s) {
     if (!s.as_color && !make_target(s.w, s.h, DXGI_FORMAT_R8G8B8A8_UNORM, s.as_color, s.as_color_rtv, s.as_color_srv))
         return nullptr;
-    run_pass(s.srv, s.as_color_rtv, s.w, s.h, g_depth_color_ps);
+    // A full-surface pass: only when the depth changed since the last one. Deferred lights read
+    // the same buffer hundreds of times a frame.
+    if (s.as_color_serial != s.drawn_serial)
+        run_pass(s.srv, s.as_color_rtv, s.w, s.h, g_depth_color_ps), s.as_color_serial = s.drawn_serial;
     return s.as_color_srv;
 }
 
@@ -1083,9 +1101,12 @@ ID3D11ShaderResourceView *reinterpret_view(Surface &s, uint32_t base) {
         release(s.view_srv), release(s.view_rtv), release(s.view);
         s.view_fmt = 0;
         if (!make_target(s.w, s.h, DXGI_FORMAT_R32G32B32A32_FLOAT, s.view, s.view_rtv, s.view_srv)) return nullptr;
-        s.view_fmt = base;
+        s.view_fmt = base, s.view_serial = 0;
     }
-    run_pass(s.srv, s.view_rtv, s.w, s.h, g_reinterpret_ps, base);
+    // A full-surface pass (4K RGBA32F: 133 MB written): only when the surface changed since the last
+    // one. Deferred lights read the G-buffer this way once per light.
+    if (s.view_serial != s.drawn_serial)
+        run_pass(s.srv, s.view_rtv, s.w, s.h, g_reinterpret_ps, base), s.view_serial = s.drawn_serial;
     return s.view_srv;
 }
 
@@ -2539,7 +2560,13 @@ void draw() {
     }
     // GRAPHICS menu: the motion blur and depth of field reach the screen in this one image. Without it
     // (read as zero, alpha included) the composite leaves the scene sharp and still adds its glow.
-    if (!pc_motion_blur() && srv[1] && ea_for((reg(0x1a04 + 32) & 3) == 2, reg(0x1a00 + 32)) == 0x31b7d200u)
+    // The composite is known by its inputs, not their addresses (they moved between game versions):
+    // texture 0 the 160x90 glow, texture 1 the 640x360 blur image, both made by the SPUs in main memory.
+    const auto main_image = [&](int t, uint32_t w, uint32_t h) {
+        return srv[t] && reg(0x1a18 + t * 32) == (w << 16 | h) &&
+               ea_for((reg(0x1a04 + t * 32) & 3) == 2, reg(0x1a00 + t * 32)) < mem::LOCAL_BASE;
+    };
+    if (!pc_motion_blur() && main_image(1, 640, 360) && main_image(0, 160, 90))
         srv[1] = nullptr;
     // On PC input the HUD's button icons come from our copy of their atlas.
     if (reg(0x1a18) == 0x04000200u && reg(0x1a04) == 0x00018829u)
@@ -2613,6 +2640,14 @@ void draw() {
             }
     }
     lap(5);
+    if (g_gpu_by_shader && b.color[0]) {
+        const uint32_t id = (uint32_t)(uintptr_t)ps | 1u;   // odd: never a target width
+        if (!g_gpu_shader_names.count(id))
+            for (auto &[k, v] : g_ps) if (&v == ps) g_gpu_shader_names[id] = k;
+        const uint64_t key = (uint64_t)b.color[0]->ea << 32 | id;
+        if (key != g_gpu_last) g_gpu_last = key, gpu_mark(key);
+        g_gpu_draws[key]++;
+    }
     if (leak_mode() != 1) g_ctx->DrawIndexed((UINT)list.size(), start_index, 0);   // the shader adds vbase to SV_VertexID
     // Hand queued work to the GPU regularly, so it draws while we translate the next
     // commands: otherwise the driver submits only when a readback forces it, and the
