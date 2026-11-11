@@ -210,6 +210,9 @@ struct SpuThread {
     struct Capture { uint32_t lo, hi; bool valid; std::vector<uint8_t> image; uint64_t last_use; };
     Capture caps[4] = {};
     bool cap_any = false;
+    uint64_t steps_total = 0, interp_total = 0;   // dispatches (compiled-code calls + interpreted) and interpreted, for statistics
+    uint64_t waited_ns = 0;                // time blocked reading the event channel (task statistics)
+    uint64_t wait_ns() const { return waited_ns; }
     IdleBackoff llar_idle;                 // GETLLAR re-reading an unchanged line at once (spu_mfc.cpp)
     uint64_t cap_clock = 0;
     void loaded_from(uint32_t lsa, uint32_t ea, uint32_t size) {

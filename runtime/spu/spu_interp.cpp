@@ -184,12 +184,14 @@ void SpuThread::run() {
     struct Flush {   // account on every exit path
         uint64_t &n, &in;
         std::chrono::steady_clock::time_point t0;
+        SpuThread &self;
         ~Flush() {
             g_insns += n;
             g_interp += in;
+            self.steps_total += n, self.interp_total += in;
             g_run_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
         }
-    } flush{executed, interpreted, started};
+    } flush{executed, interpreted, started, *this};
     while (running) {
         // Compiled code straight into compiled code: the usual case, with the rarer checks below
         // (traps, pending interrupts, the interpreter) only when something needs them.

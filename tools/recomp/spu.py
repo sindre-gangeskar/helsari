@@ -236,20 +236,14 @@ def gen_module(dec, m, prefix, extra_starts=()):
                 return f'goto L_{t:x};'
             return f'{{ ret = 0x{t:x}; goto out; }}'
 
-        # SPU registers live in a local array g for the whole function: loaded on entry
-        # (those the chunk's code uses), written back at the single exit (those it writes).
-        used, written = set(), set()
-        for k in range((lo - m.ls_base) // 4, (hi - m.ls_base) // 4):
-            if m.is_code(pcs[k]):
-                u, w = reg_fields(ops[k], dec.fmt(words[k]), words[k])
-                used |= u
-                if w is not None:
-                    written.add(w)
-        o = [f'uint32_t {fn}(SpuThread &t, uint32_t next) {{',
+        # SPU registers: the thread's own register file, through a no-alias parameter. Nothing else
+        # touches t.gpr while compiled code runs, so the compiler may keep registers in host registers
+        # across LS stores, as with a local copy - without copying the registers in and out on every
+        # entry, which cost most of the time of call-heavy tasks (a chunk is left at every call into
+        # another chunk: ~73,000 times per run of one 7 ms task).
+        o = [f'static uint32_t {fn}_b(SpuThread &t, V *__restrict g, uint32_t next) {{',
              '    const uint32_t epoch = t.code_epoch;',
-             '    uint32_t ret;',
-             '    V g[128];']
-        o += [f'    g[{r}] = t.gpr[{r}];' for r in sorted(used)]
+             '    uint32_t ret;']
         o += ['    goto dispatch;',
               'redispatch:',
               '    if (t.interrupts && t.poll_interrupt(next)) { ret = next; goto out; }',
@@ -287,9 +281,9 @@ def gen_module(dec, m, prefix, extra_starts=()):
                 o.append(f'    ret = 0x{nxt:x}; goto out;')   # falls into data: not compiled
         o.append(f'    ret = 0x{hi & LS_MASK:x};')
         o.append('out:')
-        o += [f'    t.gpr[{r}] = g[{r}];' for r in sorted(written)]
         o.append('    return ret;')
         o.append('}')
+        o.append(f'uint32_t {fn}(SpuThread &t, uint32_t next) {{ return {fn}_b(t, t.gpr, next); }}')
         out.append('\n'.join(o))
     return '\n\n'.join(out) + '\n', entries, fns
 

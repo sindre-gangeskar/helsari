@@ -49,7 +49,40 @@ struct Task {
     uint32_t taskset = 0, id = 0, elf = 0, exit_code_addr = 0;
     spu::SpuThread *spu = nullptr;            // while it runs (else only diagnostics look at it)
     std::atomic<bool> started{false}, done{false};
+    uint64_t t_ready = 0;                     // when it became ready (created, or seen by the scheduler)
+    uint64_t t_queued = 0;                    // handed to a worker
 };
+
+// Where task time goes, per ELF, logged every 2 s: from ready to handed over (scheduler), from handed
+// over to running (worker wake-up), running, and of that blocked in channel waits and signal waits.
+struct TaskStat { uint64_t steps = 0, interp = 0, n = 0, sched_ns = 0, wake_ns = 0, run_ns = 0, block_ns = 0, signal_ns = 0, max_run_ns = 0; };
+std::mutex g_stat_lock;
+std::map<uint32_t, TaskStat> g_task_stats;
+thread_local uint64_t t_signal_ns;   // this task's time in SYS_WAIT_SIGNAL
+void task_stats_add(const Task &t, uint64_t t_start, uint64_t t_end, uint64_t block_ns, uint64_t steps, uint64_t interp) {
+    std::lock_guard<std::mutex> lk(g_stat_lock);
+    TaskStat &st = g_task_stats[t.elf];
+    st.n++, st.steps += steps, st.interp += interp;
+    if (t.t_ready && t.t_queued >= t.t_ready) st.sched_ns += t.t_queued - t.t_ready;
+    if (t.t_queued && t_start >= t.t_queued) st.wake_ns += t_start - t.t_queued;
+    st.run_ns += t_end - t_start, st.block_ns += block_ns, st.signal_ns += t_signal_ns;
+    st.max_run_ns = std::max(st.max_run_ns, t_end - t_start);
+    static uint64_t last;
+    if (t_end - last < 2000000000ull) return;
+    const double secs = last ? (t_end - last) / 1e9 : 2.0;
+    last = t_end;
+    std::string line;
+    for (auto &[elf, x] : g_task_stats) {
+        if (!x.n) continue;
+        char b[320];
+        snprintf(b, sizeof b, " | %x: %.0f/s, ready->handed %.0f us, ->running %.0f us, run %.0f us (max %.0f) of it blocked %.0f + signal %.0f us; %.0f dispatches (%.0f interpreted)",
+                 elf, x.n / secs, x.sched_ns / 1e3 / x.n, x.wake_ns / 1e3 / x.n, x.run_ns / 1e3 / x.n, x.max_run_ns / 1e3,
+                 x.block_ns / 1e3 / x.n, x.signal_ns / 1e3 / x.n, (double)x.steps / x.n, (double)x.interp / x.n);
+        line += b;
+        x = TaskStat{};
+    }
+    LOG("tasks", "per task, averages over %.1f s%s", secs, line.c_str());
+}
 
 std::mutex g_lock;
 std::condition_variable g_wake;                                        // a task became ready
@@ -173,7 +206,11 @@ void task_thread(std::shared_ptr<Task> tp) {
         case SYS_WAIT_SIGNAL:
             // Block until the task's signalled bit is set, then consume it.
             bit_set(ts + TS_WAITING, t.id);
-            while (!bit_test(ts + TS_SIGNALLED, t.id) && !g_shutdown[ts]) std::this_thread::yield();
+            {
+                const uint64_t t0 = host_now_ns();
+                while (!bit_test(ts + TS_SIGNALLED, t.id) && !g_shutdown[ts]) std::this_thread::yield();
+                t_signal_ns += host_now_ns() - t0;
+            }
             bit_clear(ts + TS_SIGNALLED, t.id);
             bit_clear(ts + TS_WAITING, t.id);
             break;
@@ -203,11 +240,16 @@ void task_thread(std::shared_ptr<Task> tp) {
     s.gpr[4] = spu::V{{ld32(ts + TS_ARGS), ld32(ts + TS_ARGS + 4), 0, spurs}};
     s.pc = entry;
     bit_set(ts + TS_RUNNING, t.id);
+    t_signal_ns = 0;
+    take_backoff_ns();
+    const uint64_t t_start = host_now_ns();
+    const uint64_t wait0 = s.wait_ns(), steps0 = s.steps_total, interp0 = s.interp_total;
     if (task_log())
         LOG("spurs", "%s: start at 0x%x (args %08x %08x %08x %08x)", s.name.c_str(), entry, s.gpr[3].w[0], s.gpr[3].w[1],
             s.gpr[3].w[2], s.gpr[3].w[3]);
     s.run();
     if (!t.done) finish(t, 0);
+    task_stats_add(t, t_start, host_now_ns(), s.wait_ns() - wait0, s.steps_total - steps0, s.interp_total - interp0);
     if (task_log()) LOG("spurs", "%s: finished", s.name.c_str());
 }
 
@@ -235,6 +277,7 @@ void pool_worker() {
 }
 
 void pool_submit(std::shared_ptr<Task> t) {
+    t->t_queued = host_now_ns();
     std::unique_lock<std::mutex> lk(g_pool_lock);
     g_pool_q.push_back(std::move(t));
     const bool spawn = g_pool_q.size() > g_pool_idle;
@@ -266,6 +309,7 @@ void scheduler_thread(uint32_t ts) {
             if (!t) {                                                       // made ready by guest code
                 t = std::make_shared<Task>();
                 t->taskset = ts, t->id = id, t->elf = ld32(info + TI_ELF + 4);
+                t->t_ready = host_now_ns();   // made ready by SPU code: we only know when we saw it
                 tasks.push_back(t);
             }
             bit_clear(ts + TS_PENDING_READY, id);
@@ -280,6 +324,7 @@ void scheduler_thread(uint32_t ts) {
                 pool_submit(t);
             } else {
                 t->spu = new spu::SpuThread();
+                t->t_queued = host_now_ns();
                 std::thread(task_thread, t).detach();
             }
         }
@@ -317,6 +362,7 @@ int32_t create_task(uint32_t ts, uint32_t id_out, uint32_t elf, uint32_t context
         if (ls_pattern) memcpy(mem::ptr(info + TI_LS_PATTERN), mem::ptr(ls_pattern), 16);
         auto t = std::make_shared<Task>();
         t->taskset = ts, t->id = id, t->elf = elf, t->exit_code_addr = exit_code_addr;
+        t->t_ready = host_now_ns();
         tasks.push_back(t);
         if (id_out) st32(id_out, id);
         if (task_log()) LOG("spurs", "taskset 0x%x: create task %u (ELF 0x%x)", ts, id, elf);

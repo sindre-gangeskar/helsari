@@ -279,7 +279,10 @@ uint32_t SpuThread::read_channel(int ch) {
             uint32_t e;
             // yield() returns at once when no other thread is ready: back off to real sleeps.
             for (uint32_t n = 0; !(e = pending_events()) && event_mask; n++) host_backoff(n);
-            g_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            {
+                const uint64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                g_wait_ns += d, waited_ns += d;
+            }
             return e;
         }
     case SPU_RdEventMask: return event_mask;
