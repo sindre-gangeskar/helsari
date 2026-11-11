@@ -27,6 +27,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstring>
 #include <deque>
 #include <unordered_map>
@@ -52,6 +56,8 @@ namespace gpu
 
         // Costs for the fps log (Device12::Stats).
         uint64_t st_create_ns, st_creates, st_pso_ns, st_psos, st_up_bytes, st_up_wait_ns, st_map_wait_ns, st_submits;
+        uint64_t st_submit_ns, st_prepare_ns, st_drain_ns;   // RSX thread: in submit(), in prepare(), waiting before Present
+        uint64_t st_prep[5];   // prepare() parts: pipeline lookup, descriptor space, barriers + tables, list calls, constant views
         std::unordered_map<uint64_t, uint64_t> st_what;   // created: (kind, w, h, format) -> count
         void count_create(uint64_t kind, uint64_t w, uint64_t h, uint64_t fmt) { st_what[kind << 60 | w << 40 | h << 20 | fmt]++; }
         uint64_t now_ns()
@@ -93,6 +99,46 @@ namespace gpu
             ID3D12GraphicsCommandList *list = nullptr;
             ID3D12CommandAllocator *alloc = nullptr;
             std::deque<std::pair<uint64_t, ID3D12CommandAllocator *>> spare_allocs;
+            // Asynchronous submission (HELSARI_DX12_ASYNC_SUBMIT, default on): closed command lists go to a
+            // thread of their own, which hands them to the GPU and signals their fence, so the RSX thread
+            // never waits in ExecuteCommandLists. A list is recorded again once that thread has submitted it.
+            bool async = false;
+            std::mutex sub_m;
+            std::condition_variable sub_cv, sub_done_cv;
+            std::deque<std::pair<ID3D12CommandList *, uint64_t>> sub_q;
+            std::atomic<uint64_t> sub_executed{0};   // fence value of the last list handed to the GPU
+            std::deque<std::pair<uint64_t, ID3D12GraphicsCommandList *>> spare_lists;
+            void submit_thread()
+            {
+                for (;;)
+                {
+                    std::pair<ID3D12CommandList *, uint64_t> item;
+                    {
+                        std::unique_lock<std::mutex> lk(sub_m);
+                        sub_cv.wait(lk, [this] { return !sub_q.empty(); });
+                        item = sub_q.front();
+                        sub_q.pop_front();
+                    }
+                    queue->ExecuteCommandLists(1, &item.first);
+                    queue->Signal(fence, item.second);
+                    {
+                        std::lock_guard<std::mutex> lk(sub_m);
+                        sub_executed.store(item.second, std::memory_order_release);
+                    }
+                    sub_done_cv.notify_all();
+                }
+            }
+            // Every closed list handed to the GPU (before Present, which goes to the same queue).
+            void drain()
+            {
+                if (!async)
+                    return;
+                const uint64_t want = next - 1;
+                if (sub_executed.load(std::memory_order_acquire) >= want)
+                    return;
+                std::unique_lock<std::mutex> lk(sub_m);
+                sub_done_cv.wait(lk, [&] { return sub_executed.load(std::memory_order_acquire) >= want; });
+            }
             bool recorded = false;   // the open list has commands
             uint64_t gen = 0;        // submissions so far: a context sets its state again on a new list
             struct Query12 *active_occ = nullptr;   // an occlusion query open across a submission
@@ -232,7 +278,15 @@ namespace gpu
         } g_view_heap;
         constexpr UINT SAMPLER_HEAP = 2048;
         ID3D12DescriptorHeap *g_smp_heap;
-        UINT g_smp_top;
+        void write_sampler(const D3D11_SAMPLER_DESC *src, UINT slot)
+        {
+            D3D12_SAMPLER_DESC d{D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                 D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0, 1, D3D12_COMPARISON_FUNC_NEVER, {0, 0, 0, 0}, 0, D3D12_FLOAT32_MAX};
+            if (src)
+                memcpy(&d, src, sizeof d);   // same layout and values
+            d.MaxAnisotropy = std::max(1u, d.MaxAnisotropy);
+            g.dev->CreateSampler(&d, {g_smp_heap->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)slot * g.smp_size});
+        }
         // Cache keys hold the exact values and are compared in full: a lookup hit is never a different
         // combination (a 64-bit mix of nearby pointers can collide, and a collision draws with the wrong
         // pipeline or samplers).
@@ -245,7 +299,6 @@ namespace gpu
         {
             template <size_t N> size_t operator()(const Key<N> &k) const { return (size_t)hash_bytes(k.v.data(), N * 8); }
         };
-        std::unordered_map<Key<16>, UINT, KeyHash> g_smp_tables;   // 16 samplers -> first descriptor
 
         // ------------------------------------------------------------------ objects
         struct Tex12 final : Texture2D
@@ -336,7 +389,10 @@ namespace gpu
         };
         struct VS12 final : VertexShader { std::vector<uint8_t> code; };
         struct PS12 final : PixelShader { std::vector<uint8_t> code; };
-        struct Sampler12 final : SamplerState { UINT id = 0; };
+        struct Sampler12 final : SamplerState { UINT id = 0; };   // id: its slot in the sampler heap (0: the default)
+        extern ID3D12DescriptorHeap *g_smp_heap;
+        // A sampler's descriptor in its slot (null desc: the default, point and clamp).
+        void write_sampler(const D3D11_SAMPLER_DESC *src, UINT slot);
         struct QueryHeap;
         struct Query12 final : Query
         {
@@ -400,11 +456,29 @@ namespace gpu
                 list->EndQuery(g_occ.heap, D3D12_QUERY_TYPE_OCCLUSION, q->slots.back());
                 list->ResolveQueryData(g_occ.heap, D3D12_QUERY_TYPE_OCCLUSION, q->slots.back(), 1, g_occ.results, (UINT64)q->slots.back() * 8);
             }
+            const uint64_t t_submit = now_ns();
             list->Close();
             st_submits++;
-            ID3D12CommandList *l[] = {list};
-            queue->ExecuteCommandLists(1, l);
-            queue->Signal(fence, next);
+            if (async)
+            {
+                {
+                    std::lock_guard<std::mutex> lk(sub_m);
+                    sub_q.push_back({list, next});
+                }
+                sub_cv.notify_one();
+                spare_lists.push_back({next, list});
+                // The next list: one the submit thread has handed over already, or a new one.
+                ID3D12GraphicsCommandList *fresh = nullptr;
+                if (spare_lists.size() > 1 && sub_executed.load(std::memory_order_acquire) >= spare_lists.front().first)
+                    fresh = spare_lists.front().second, spare_lists.pop_front();
+                list = fresh;
+            }
+            else
+            {
+                ID3D12CommandList *l[] = {list};
+                queue->ExecuteCommandLists(1, l);
+                queue->Signal(fence, next);
+            }
             spare_allocs.push_back({next, alloc});
             g_up.ring.mark(next);
             g_view_heap.ring.mark(next);
@@ -414,7 +488,10 @@ namespace gpu
                 alloc = spare_allocs.front().second, spare_allocs.pop_front(), alloc->Reset();
             else
                 dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void **)&alloc);
-            list->Reset(alloc, nullptr);
+            if (!list)
+                dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, __uuidof(ID3D12GraphicsCommandList), (void **)&list);
+            else
+                list->Reset(alloc, nullptr);
             recorded = false;
             gen++;
             if (q)
@@ -426,6 +503,7 @@ namespace gpu
             collect();
             g_up.ring.retire();
             g_view_heap.ring.retire();
+            st_submit_ns += now_ns() - t_submit;
         }
 
 
@@ -811,6 +889,15 @@ namespace gpu
                 auto *s = new Sampler12;
                 s->desc = *d;
                 s->id = ++ids;
+                if (s->id < SAMPLER_HEAP)
+                    write_sampler(&s->desc, s->id);
+                else
+                {
+                    static bool logged;
+                    if (!logged)
+                        logged = true, LOG("rsx", "DX12: more than %u samplers, the rest read as the default", SAMPLER_HEAP - 1);
+                    s->id = 0;
+                }
                 *out = s;
                 return S_OK;
             }
@@ -831,12 +918,15 @@ namespace gpu
             std::string Stats(uint32_t frames) override
             {
                 const double f = frames ? frames : 1;
-                char b[300];
+                char b[760];
                 snprintf(b, sizeof b,
                          "; DX12 per frame: resources created %.1f (%.1f ms), pipeline states built %.1f (%.1f ms), uploads %.1f MB "
-                         "(waiting for room %.1f ms), read-back waits %.1f ms, submissions %.1f",
+                         "(waiting for room %.1f ms), read-back waits %.1f ms, submissions %.1f (%.2f ms on the RSX thread%s), draw setup %.2f ms, "
+                         "waiting for submissions before present %.2f ms (setup: pipeline %.2f, descriptor space %.2f, barriers+tables %.2f, list calls %.2f, constant views %.2f)",
                          st_creates / f, st_create_ns / 1e6 / f, st_psos / f, st_pso_ns / 1e6 / f, st_up_bytes / 1048576.0 / f,
-                         st_up_wait_ns / 1e6 / f, st_map_wait_ns / 1e6 / f, st_submits / f);
+                         st_up_wait_ns / 1e6 / f, st_map_wait_ns / 1e6 / f, st_submits / f, st_submit_ns / 1e6 / f,
+                         g.async ? ", handed to the submit thread" : "", st_prepare_ns / 1e6 / f, st_drain_ns / 1e6 / f, st_prep[0] / 1e6 / f, st_prep[1] / 1e6 / f, st_prep[2] / 1e6 / f,
+                         st_prep[3] / 1e6 / f, st_prep[4] / 1e6 / f);
                 std::vector<std::pair<uint64_t, uint64_t>> top(st_what.begin(), st_what.end());
                 std::sort(top.begin(), top.end(), [](auto &a, auto &b) { return a.second > b.second; });
                 std::string what;
@@ -854,6 +944,9 @@ namespace gpu
                 if (!what.empty())
                     out += "; created per frame:" + what;
                 st_create_ns = st_creates = st_pso_ns = st_psos = st_up_bytes = st_up_wait_ns = st_map_wait_ns = st_submits = 0;
+                st_submit_ns = st_prepare_ns = st_drain_ns = 0;
+                memset(st_prep, 0, sizeof st_prep);
+
                 return out;
             }
         };
@@ -906,6 +999,22 @@ namespace gpu
             UINT num_sc = 0;
             uint64_t gen = ~0ull;   // the submission count when state was last set on the list
             bool dirty_srv = true, dirty_vs_srv = true, dirty_smp = true;
+            // What prepare() last set on the open list: unchanged state is not set again.
+            struct Last
+            {
+                ID3D12PipelineState *pso = nullptr;
+                UINT nrt = ~0u;
+                D3D12_CPU_DESCRIPTOR_HANDLE rh[8]{}, dh{};
+                int topo = -1;
+                UINT nvp = ~0u, nsc = ~0u, sref = ~0u;
+                D3D11_VIEWPORT vp[16]{};
+                D3D12_RECT sc[16]{};
+                FLOAT bf[4]{-1, -1, -1, -1};
+                D3D12_CONSTANT_BUFFER_VIEW_DESC cb[4]{};
+                bool cb_ok = false;
+                uint64_t cb_base = 0;
+                UINT smp[16] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+            } last;
             std::unordered_map<Key<16>, ID3D12PipelineState *, KeyHash> psos;
             std::vector<D3D12_RESOURCE_BARRIER> bars;
 
@@ -1193,9 +1302,18 @@ namespace gpu
             {
                 if (!vs.p)
                     return false;
+                const uint64_t t_prep = now_ns();
+                struct Timed { uint64_t t0; ~Timed() { st_prepare_ns += now_ns() - t0; } } timed{t_prep};
                 ID3D12PipelineState *p = pso(has_ps);
                 if (!p)
                     return false;
+                uint64_t t_part = now_ns();
+                st_prep[0] += t_part - t_prep;
+                const auto part = [&](int i) { const uint64_t n = now_ns(); st_prep[i] += n - t_part; t_part = n; };
+                D3D12_CONSTANT_BUFFER_VIEW_DESC cbd[4];
+                for (int i = 0; i < 3; i++)
+                    cbd[i] = cbv_desc(vs_cb[i]);
+                cbd[3] = cbv_desc(ps_cb[0]);
                 const auto is_target = [&](Resource *r) {
                     for (UINT i = 0; i < num_rtv; i++)
                         if (rtv[i].p && rtv[i].p->resource == r)
@@ -1205,22 +1323,24 @@ namespace gpu
                 // Descriptor space first: making room can submit the list, and then everything is set
                 // again on the new one (with space taken after that submission).
                 uint64_t srv_base = 0, vs_base = 0, cb_base = 0;
-                D3D12_GPU_DESCRIPTOR_HANDLE smp_table{};
+                bool cb_new = true;
                 for (;;)
                 {
                     const uint64_t before = g.gen;
-                    cb_base = g_view_heap.ring.alloc(4, 1);   // constants change with nearly every draw
+                    // Constant views: a new table only when a binding changed (the buffers are versioned).
+                    cb_new = gen != g.gen || !last.cb_ok || memcmp(cbd, last.cb, sizeof cbd) != 0;
+                    if (cb_new)
+                        cb_base = g_view_heap.ring.alloc(4, 1);
                     if (gen != g.gen)
                         dirty_srv = dirty_vs_srv = dirty_smp = true;
                     if (dirty_srv)
                         srv_base = g_view_heap.ring.alloc(16, 1);
                     if (dirty_vs_srv)
                         vs_base = g_view_heap.ring.alloc(1, 1);
-                    if (dirty_smp)
-                        smp_table = sampler_table();
                     if (g.gen == before)
                         break;
                 }
+                part(1);
                 ID3D12GraphicsCommandList *l = g.list;
                 if (gen != g.gen)
                 {
@@ -1228,6 +1348,7 @@ namespace gpu
                     ID3D12DescriptorHeap *heaps[] = {g_view_heap.heap, g_smp_heap};
                     l->SetDescriptorHeaps(2, heaps);
                     gen = g.gen;
+                    last = Last{};
                 }
                 // Targets, and every bound texture in a readable state (a bound target reads as unbound, as in D3D11).
                 D3D12_CPU_DESCRIPTOR_HANDLE rh[8];
@@ -1247,14 +1368,28 @@ namespace gpu
                         barrier(bars, tex_of(v.p->resource), SRV_STATE);
                 if (dirty_srv)
                 {
+                    // One copy for the table; buffer views (made per version) are written after it.
+                    D3D12_CPU_DESCRIPTOR_HANDLE src[16];
+                    UINT ones[16];
+                    uint32_t buffers = 0;
                     for (UINT i = 0; i < 16; i++)
                     {
                         SRV *v = ps_srv[i].p;
+                        ones[i] = 1, src[i] = g_null_srv;
                         if (v && !is_target(v->resource))
-                            write_srv(static_cast<SRV12 *>(v), g_view_heap.cpu(srv_base + i));
-                        else
-                            g.dev->CopyDescriptorsSimple(1, g_view_heap.cpu(srv_base + i), g_null_srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                        {
+                            if (v->resource->kind == Resource::BUFFER)
+                                buffers |= 1u << i;
+                            else
+                                src[i] = g_srv_cpu.cpu(static_cast<SRV12 *>(v)->slot);
+                        }
                     }
+                    const D3D12_CPU_DESCRIPTOR_HANDLE dst = g_view_heap.cpu(srv_base);
+                    const UINT n16 = 16;
+                    g.dev->CopyDescriptors(1, &dst, &n16, 16, src, ones, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    for (UINT i = 0; buffers >> i; i++)
+                        if (buffers >> i & 1)
+                            write_srv(static_cast<SRV12 *>(ps_srv[i].p), g_view_heap.cpu(srv_base + i));
                     l->SetGraphicsRootDescriptorTable(2, g_view_heap.gpu(srv_base));
                     dirty_srv = false;
                 }
@@ -1269,34 +1404,61 @@ namespace gpu
                 }
                 if (dirty_smp)
                 {
-                    l->SetGraphicsRootDescriptorTable(4, smp_table);
+                    const UINT64 base = g_smp_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+                    for (UINT i = 0; i < 16; i++)
+                    {
+                        const UINT id = smp[i].p ? static_cast<Sampler12 *>(smp[i].p)->id : 0;
+                        if (id != last.smp[i])
+                            l->SetGraphicsRootDescriptorTable(4 + i, {base + (UINT64)id * g.smp_size}), last.smp[i] = id;
+                    }
                     dirty_smp = false;
                 }
                 flush_barriers(bars);
-                l->OMSetRenderTargets(num_rtv, num_rtv ? rh : nullptr, FALSE, dsv.p ? &dh : nullptr);
-                l->SetPipelineState(p);
-                for (int i = 0; i < 3; i++)
-                    write_cbv(vs_cb[i], g_view_heap.cpu(cb_base + i));
-                write_cbv(ps_cb[0], g_view_heap.cpu(cb_base + 3));
-                l->SetGraphicsRootDescriptorTable(0, g_view_heap.gpu(cb_base));
-                l->SetGraphicsRootDescriptorTable(1, g_view_heap.gpu(cb_base + 3));
-                l->IASetPrimitiveTopology((D3D_PRIMITIVE_TOPOLOGY)topo);
-                l->RSSetViewports(num_vp, (const D3D12_VIEWPORT *)vp);
+                part(2);
+                // Only what changed since the last draw on this list.
+                if (last.nrt != num_rtv || last.dh.ptr != (dsv.p ? dh.ptr : 0) || memcmp(last.rh, rh, num_rtv * sizeof rh[0]) != 0)
+                {
+                    l->OMSetRenderTargets(num_rtv, num_rtv ? rh : nullptr, FALSE, dsv.p ? &dh : nullptr);
+                    last.nrt = num_rtv, last.dh.ptr = dsv.p ? dh.ptr : 0;
+                    memcpy(last.rh, rh, num_rtv * sizeof rh[0]);
+                }
+                if (p != last.pso)
+                    l->SetPipelineState(p), last.pso = p;
+                part(3);
+                if (cb_new)
+                {
+                    for (int i = 0; i < 4; i++)
+                        g.dev->CreateConstantBufferView(&cbd[i], g_view_heap.cpu(cb_base + i));
+                    l->SetGraphicsRootDescriptorTable(0, g_view_heap.gpu(cb_base));
+                    l->SetGraphicsRootDescriptorTable(1, g_view_heap.gpu(cb_base + 3));
+                    memcpy(last.cb, cbd, sizeof cbd), last.cb_ok = true;
+                }
+                part(4);
+                if (last.topo != (int)topo)
+                    l->IASetPrimitiveTopology((D3D_PRIMITIVE_TOPOLOGY)topo), last.topo = (int)topo;
+                if (last.nvp != num_vp || memcmp(last.vp, vp, num_vp * sizeof vp[0]) != 0)
+                {
+                    l->RSSetViewports(num_vp, (const D3D12_VIEWPORT *)vp);
+                    last.nvp = num_vp, memcpy(last.vp, vp, num_vp * sizeof vp[0]);
+                }
                 // D3D12 always scissors: without the D3D11 scissor test, the scissor covers everything.
                 const bool scissor = raster.p && raster.p->desc.ScissorEnable;
-                if (scissor && num_sc)
-                    l->RSSetScissorRects(num_sc, (const D3D12_RECT *)sc);
-                else
+                D3D12_RECT all{0, 0, 16384, 16384};
+                const UINT nsc = scissor && num_sc ? num_sc : 1;
+                const D3D12_RECT *rects = scissor && num_sc ? (const D3D12_RECT *)sc : &all;
+                if (last.nsc != nsc || memcmp(last.sc, rects, nsc * sizeof(D3D12_RECT)) != 0)
                 {
-                    D3D12_RECT all{0, 0, 16384, 16384};
-                    l->RSSetScissorRects(1, &all);
+                    l->RSSetScissorRects(nsc, rects);
+                    last.nsc = nsc, memcpy(last.sc, rects, nsc * sizeof(D3D12_RECT));
                 }
-                l->OMSetBlendFactor(blend_factor);
-                l->OMSetStencilRef(stencil_ref);
+                if (memcmp(last.bf, blend_factor, sizeof last.bf) != 0)
+                    l->OMSetBlendFactor(blend_factor), memcpy(last.bf, blend_factor, sizeof last.bf);
+                if (last.sref != stencil_ref)
+                    l->OMSetStencilRef(stencil_ref), last.sref = stencil_ref;
                 g.recorded = true;
                 return true;
             }
-            void write_cbv(const Cb &c, D3D12_CPU_DESCRIPTOR_HANDLE to)
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc(const Cb &c)
             {
                 D3D12_CONSTANT_BUFFER_VIEW_DESC d{g_zero_cb->GetGPUVirtualAddress(), 256};
                 if (auto *b = static_cast<Buf12 *>(c.buf.p))
@@ -1305,7 +1467,7 @@ namespace gpu
                     d.BufferLocation = b->va() + (uint64_t)c.first * 16;
                     d.SizeInBytes = c.num ? std::min(65536u, c.num * 16) : whole;
                 }
-                g.dev->CreateConstantBufferView(&d, to);
+                return d;
             }
             void write_srv(SRV12 *v, D3D12_CPU_DESCRIPTOR_HANDLE to)
             {
@@ -1314,35 +1476,6 @@ namespace gpu
                 else
                     g.dev->CopyDescriptorsSimple(1, to, g_srv_cpu.cpu(v->slot), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             }
-            D3D12_GPU_DESCRIPTOR_HANDLE sampler_table()
-            {
-                Key<16> key;
-                for (int i = 0; i < 16; i++)
-                    key.v[i] = smp[i].p ? static_cast<Sampler12 *>(smp[i].p)->id : 0;
-                auto it = g_smp_tables.find(key);
-                if (it == g_smp_tables.end())
-                {
-                    if (g_smp_top + 16 > SAMPLER_HEAP)
-                    {
-                        g.idle();   // full (rare): start over once nothing uses the old tables
-                        g_smp_tables.clear(), g_smp_top = 0;
-                    }
-                    const UINT inc = g.smp_size;
-                    for (UINT i = 0; i < 16; i++)
-                    {
-                        D3D12_SAMPLER_DESC d{D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                                             D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0, 1, D3D12_COMPARISON_FUNC_NEVER, {0, 0, 0, 0}, 0, D3D12_FLOAT32_MAX};
-                        if (smp[i].p)
-                            memcpy(&d, &smp[i].p->desc, sizeof d);   // same layout and values
-                        d.MaxAnisotropy = std::max(1u, d.MaxAnisotropy);
-                        g.dev->CreateSampler(&d, {g_smp_heap->GetCPUDescriptorHandleForHeapStart().ptr + (SIZE_T)(g_smp_top + i) * inc});
-                    }
-                    it = g_smp_tables.emplace(key, g_smp_top).first;
-                    g_smp_top += 16;
-                }
-                return {g_smp_heap->GetGPUDescriptorHandleForHeapStart().ptr + (UINT64)it->second * g.smp_size};
-            }
-
             void Draw(UINT n, UINT s) override
             {
                 if (prepare(ps.p != nullptr))
@@ -1531,6 +1664,11 @@ namespace gpu
                 barrier(b, t, D3D12_RESOURCE_STATE_PRESENT);
                 flush_barriers(b);
                 g_ctx->Flush();
+                {
+                    const uint64_t t0 = now_ns();
+                    g.drain();
+                    st_drain_ns += now_ns() - t0;
+                }
                 s->Present(vsync ? 1 : 0, !vsync && tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
                 // At most two frames ahead of the GPU (HELSARI_DX12_FRAMES=1..3).
                 static const UINT ahead = [] {
@@ -1567,25 +1705,29 @@ namespace gpu
         g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         g.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void **)&g.alloc);
         g.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc, nullptr, __uuidof(ID3D12GraphicsCommandList), (void **)&g.list);
+        g.async = !getenv("HELSARI_DX12_ASYNC_SUBMIT") || atoi(getenv("HELSARI_DX12_ASYNC_SUBMIT"));
+        if (g.async)
+            std::thread([] { name_host_thread("dx12 submit"); g.submit_thread(); }).detach();
         g.smp_size = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
         // Root signature, all descriptor tables: VS constants b0-b2, PS constants b0 (sized views: reads
         // outside a window give 0), PS textures t0-t15, VS vertex ring t0, PS samplers s0-s15.
-        D3D12_DESCRIPTOR_RANGE ranges[5] = {{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 3, 0, 0, 0},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16, 0, 0, 0},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 16, 0, 0, 0}};
-        const D3D12_SHADER_VISIBILITY vis[5] = {D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_PIXEL,
-                                                D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_PIXEL};
-        D3D12_ROOT_PARAMETER params[5] = {};
-        for (int i = 0; i < 5; i++)
+        // Samplers: each unit its own one-sampler table (parameters 4-19), pointing at the sampler's
+        // permanent slot in the shader-visible heap, so a draw only re-points the units that changed.
+        D3D12_DESCRIPTOR_RANGE ranges[4 + 16] = {{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 3, 0, 0, 0},
+                                                 {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, 0},
+                                                 {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16, 0, 0, 0},
+                                                 {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}};
+        for (UINT i = 0; i < 16; i++)
+            ranges[4 + i] = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, i, 0, 0};
+        D3D12_ROOT_PARAMETER params[4 + 16] = {};
+        for (int i = 0; i < 4 + 16; i++)
         {
             params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
             params[i].DescriptorTable = {1, &ranges[i]};
-            params[i].ShaderVisibility = vis[i];
+            params[i].ShaderVisibility = i == 0 || i == 3 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         }
-        D3D12_ROOT_SIGNATURE_DESC rs{5, params, 0, nullptr,
+        D3D12_ROOT_SIGNATURE_DESC rs{4 + 16, params, 0, nullptr,
                                      D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
                                          D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS};
         ID3DBlob *blob = nullptr, *err = nullptr;
@@ -1612,6 +1754,7 @@ namespace gpu
             g_view_heap.ring.size = 1 << 20;
             D3D12_DESCRIPTOR_HEAP_DESC sd{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, SAMPLER_HEAP, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
             g.dev->CreateDescriptorHeap(&sd, __uuidof(ID3D12DescriptorHeap), (void **)&g_smp_heap);
+            write_sampler(nullptr, 0);
         }
         // An empty view for unbound texture slots.
         {
