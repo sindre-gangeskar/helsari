@@ -35,6 +35,8 @@ All PC options are in the game's own options menu.
 | Graphics | V-sync | On, off |
 | Graphics | Screen FX | Motion blur and depth of field, motion blur only, off |
 | Graphics | Rendering API | DX11, DX12 (from the next start) |
+| Graphics | Upscaler | Off, AMD FSR quality, balanced, performance, native AA (DX12 only); the HUD stays at full resolution |
+| Graphics | Sharpening | A slider for FSR's sharpening, 0 to 100% (default 30%) |
 | Graphics | Field of view | A slider from 73 (the original) to 110 degrees, horizontal; aiming keeps its original zoom |
 | Gameplay | Viewmodel sway multiplier | 0.25x to 2x |
 | Gameplay | Intro movie | Play, skip (from the next start) |

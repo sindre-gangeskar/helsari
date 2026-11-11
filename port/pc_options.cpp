@@ -75,6 +75,14 @@ namespace
     const char *const RENDER_API[] = {"DX11", "DX12"};
     std::atomic<int> g_render_api{0};
     int g_render_api_running = -1;         // what this process runs, once the renderer asked
+    // Upscaler: AMD FSR (DX12 only), by the ratio of output to render size.
+    const char *const UPSCALER[] = {"OFF", "FSR QUALITY", "FSR BALANCED", "FSR PERFORMANCE", "FSR NATIVE AA"};
+    const char *const UPSCALER_ID[] = {"off", "quality", "balanced", "performance", "native"};
+    constexpr int UPSCALER_N = 5;
+    std::atomic<int> g_upscaler{0};
+    // FSR sharpening in 5% steps (the slider's positions 0 to 20); 6 is 30%.
+    constexpr int SHARP_MAX = 20;
+    std::atomic<int> g_sharpness{6};
     std::atomic<uint32_t> g_L{0}; // Lua state of the page's script
     std::mutex g_lock;
 
@@ -82,9 +90,9 @@ namespace
     {
         if (FILE *f = fopen(SETTINGS_FILE, "w"))
         {
-            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\nskip_intro_movie=%d\nrender_api=%s\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
+            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\nskip_intro_movie=%d\nrender_api=%s\nupscaler=%s\nsharpening=%d\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
                     g_borderless, (int)g_vsync.load(), g_screen_fx.load(), g_fov.load(), SWAY[g_sway.load()], (int)g_skip_intro.load(),
-                    RENDER_API[g_render_api.load()]);
+                    RENDER_API[g_render_api.load()], UPSCALER_ID[g_upscaler.load()], g_sharpness.load() * 5);
             for (int i = 0; i < KEYBIND_COUNT; i++)
                 fprintf(f, "key_%s=%d\n", keybind_id(i), keybind_key(i));
             fclose(f);
@@ -132,6 +140,16 @@ namespace
             else if (sscanf(line, "render_api=%63s", s) == 1)
             {
                 g_render_api = !strcmp(s, "DX12") ? 1 : 0;
+            }
+            else if (sscanf(line, "sharpening=%d", &a) == 1)
+            {
+                g_sharpness = a >= 0 && a <= 100 ? (a + 2) / 5 : 6;
+            }
+            else if (sscanf(line, "upscaler=%63s", s) == 1)
+            {
+                for (int i = 0; i < UPSCALER_N; i++)
+                    if (!strcmp(s, UPSCALER_ID[i]))
+                        g_upscaler = i;
             }
             else if (sscanf(line, "skip_intro_movie=%d", &a) == 1)
             {
@@ -260,8 +278,12 @@ namespace
                set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) +
                set_text("tA", std::string("RENDERING API: ") + RENDER_API[g_render_api.load()] +
                                   (g_render_api_running >= 0 && g_render_api.load() != g_render_api_running ? " (RESTART TO APPLY)" : "")) +
+               set_text("tU", std::string("UPSCALER: ") + UPSCALER[g_upscaler.load()] +
+                                  (g_upscaler.load() && g_render_api.load() != 1 ? " (DX12 ONLY)" : "")) +
+               set_text("tH", "SHARPENING: " + std::to_string(g_sharpness.load() * 5) + "%") +
                set_text("tI", g_skip_intro ? "INTRO MOVIE: SKIP" : "INTRO MOVIE: PLAY") + show_keys() +
-               "local fov_slider = gBrowser:GetTagByName(\"sO\")\nif fov_slider then fov_slider:SetCurrentValue(" + std::to_string(fov_degrees) + ") end\n";
+               "local fov_slider = gBrowser:GetTagByName(\"sO\")\nif fov_slider then fov_slider:SetCurrentValue(" + std::to_string(fov_degrees) + ") end\n" +
+               "local sharp_slider = gBrowser:GetTagByName(\"sH\")\nif sharp_slider then sharp_slider:SetCurrentValue(" + std::to_string(g_sharpness.load()) + ") end\n";
     }
 
     // The mouse in menus. A menu row is a widget with this vtable; +4 is 3 while it is on screen and 2 in a
@@ -432,6 +454,27 @@ namespace
         lua_run(ctx, L, LUA_SET + set_text("tO", fov));
     }
 
+    // The sharpening slider, read the same way.
+    void sharpness_slider(PPUContext *ctx, uint32_t L)
+    {
+        static uint64_t last;
+        const uint64_t now = host_now_ns();
+        if (now - last < 100000000ull)
+            return;
+        last = now;
+        lua_run(ctx, L, "pc_sharp = nil\nif gBrowser then local s = gBrowser:GetTagByName(\"sH\") if s and s:IsVisible() then pc_sharp = s:GetCurrentValue() end end\n");
+        const std::string text = lua_global(ctx, L, "pc_sharp");
+        if (text.empty())
+            return;
+        const int steps = (int)(atof(text.c_str()) + 0.5);
+        if (steps < 0 || steps > SHARP_MAX || steps == g_sharpness.load())
+            return;
+        std::lock_guard<std::mutex> lk(g_lock);
+        g_sharpness = steps;
+        save();
+        lua_run(ctx, L, LUA_SET + set_text("tH", "SHARPENING: " + std::to_string(steps * 5) + "%"));
+    }
+
     void menu_mouse(PPUContext *ctx, uint32_t L)
     {
         static const bool off = getenv("HELSARI_NO_MENU_MOUSE") != nullptr;
@@ -523,6 +566,8 @@ namespace rsx
     int pc_field_of_view() { return g_fov.load(std::memory_order_relaxed); }
     bool pc_motion_blur() { return g_screen_fx.load(std::memory_order_relaxed) != 2; }
     bool pc_depth_of_field() { return g_screen_fx.load(std::memory_order_relaxed) == 0; }
+    int pc_upscaler() { load(); return g_upscaler.load(std::memory_order_relaxed); }
+    float pc_sharpness() { return g_sharpness.load(std::memory_order_relaxed) * 0.05f; }
 }
 
 // The rendering API this process runs (asked once, when the renderer starts).
@@ -587,7 +632,7 @@ extern "C" void f_00487fd0(PPU_CTX)
     if (G)
         g_L = L; // a script of the page in use: any of them can reach the page's tags
     if (G && call == "OnUpdatePage")
-        menu_mouse(ctx, L), fov_slider(ctx, L), lua_watch(ctx, L);
+        menu_mouse(ctx, L), fov_slider(ctx, L), sharpness_slider(ctx, L), lua_watch(ctx, L);
     if (G && call == "OnEnterPage")
     {
         std::lock_guard<std::mutex> lk(g_lock);
@@ -650,7 +695,7 @@ extern "C" void f_004894e0(PPU_CTX)
         g_vsync = !g_vsync;
     else if (row == "fx")
         g_screen_fx = (g_screen_fx.load() + 1) % SCREEN_FX_N;
-    else if (row == "fov")
+    else if (row == "fov" || row == "sharp")
         return; // its slider sets it
     else if (row == "sway")
         g_sway = (g_sway.load() + 1) % SWAY_N;
@@ -658,6 +703,8 @@ extern "C" void f_004894e0(PPU_CTX)
         g_skip_intro = !g_skip_intro;
     else if (row == "api")
         g_render_api = !g_render_api.load();
+    else if (row == "upscaler")
+        g_upscaler = (g_upscaler.load() + 1) % UPSCALER_N;
     save();
     if (const uint32_t L = g_L.load())
         lua_run(ctx, L, show_values());

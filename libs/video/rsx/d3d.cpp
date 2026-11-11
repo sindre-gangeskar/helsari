@@ -37,6 +37,8 @@ void mouse_log_aim(); // mouse.cpp
 float pc_viewmodel_sway(); // GAMEPLAY menu (pc_options.cpp)
 namespace rsx {
 bool pc_motion_blur();   // GRAPHICS menu (pc_options.cpp)
+int pc_upscaler();       // GRAPHICS menu: 0 off, 1 FSR quality, 2 balanced, 3 performance, 4 native AA
+float pc_sharpness();    // GRAPHICS menu: FSR sharpening, 0 to 1
 uint32_t regs[0x10000 / 4];
 uint32_t vp_ucode[512 * 4];
 float vp_consts[512 * 4];
@@ -111,7 +113,28 @@ float g_aa_sx = 1, g_aa_sy = 1; // host pixels per pixel of the current target, 
 const int g_res_forced = getenv("HELSARI_RES_SCALE") ? atoi(getenv("HELSARI_RES_SCALE")) : 0;
 std::atomic<uint32_t> g_res_wanted{g_res_forced > 0 ? (uint32_t)std::min(g_res_forced, 4) : 1u};
 uint32_t g_res_setting = g_res_wanted.load();
-uint32_t g_res_scale = 1;
+float g_res_scale = 1;   // of the targets bound now
+std::atomic<uint32_t> g_out_width{1280};   // the Resolution option's width (the upscaler's output)
+
+// Temporal upscaling (Options > Graphics > Upscaler; DX12 with FSR). The scene renders at g_scale_scene
+// with a sub-pixel jitter; where the game first reads the finished scene image (to hand it to the SPUs
+// for post-processing), FSR turns it into a copy at g_scale_out, which the rest of the frame (the
+// post-processing composite and the HUD) draws into and the flip shows. Frames without a scene (menus,
+// movies) render at the plain integer scale; the switch between the two frees the scaled surfaces.
+bool g_fsr_mode = false;                 // the split is in use
+float g_scale_scene = 1, g_scale_out = 1;
+uint32_t g_fsr_last_frame = 0;           // the last frame with an upscaling point
+bool g_fsr_seen = false;
+bool g_scene_drawn = false;              // a G-buffer pass since the last upscaling point
+uint32_t g_scene_depth_key = 0;          // the G-buffer pass's depth surface (g_depth_surfaces key)
+uint32_t g_scene_gw = 1280, g_scene_gh = 720;   // its size as the game sees it
+std::set<uint32_t> g_upscaled;           // colour surfaces replaced by their upscaled copy (key | 2) this frame
+uint32_t g_jitter_index = 0;
+float g_jitter[2] = {0, 0};              // this scene's jitter, in render pixels
+bool g_fsr_reset = true;                 // no usable history next time
+double g_fsr_time = 0;                   // when the last upscale ran (frame time for FSR)
+
+float upscaler_ratio(int mode) { return mode == 1 ? 1.5f : mode == 2 ? 1.7f : mode == 3 ? 2.f : 1.f; }
 // Frame capture: draws of g_log_frame are logged, surfaces dumped when g_dump_frame begins.
 std::atomic<bool> g_capture_req{false};
 std::atomic<bool> g_no_cube{false};   // F11 diagnostic: cube maps read as black
@@ -122,6 +145,7 @@ int g_step_dumps;   // per-draw dumps taken in the current capture
 /* ---------------- shaders ---------------- */
 gpu::VertexShader *g_present_vs;
 gpu::PixelShader *g_present_ps;
+gpu::SamplerState *g_present_smp;
 gpu::PixelShader *g_depth_color_ps;    // depth -> RSX D24S8 bytes as A8R8G8B8
 gpu::PixelShader *g_depth_copy_ps;     // depth texture -> SV_Depth (proxy copies)
 gpu::DepthStencilState *g_ds_always;   // depth test always, write on
@@ -338,7 +362,8 @@ struct Surface {
     uint64_t sub_serial = 0;
     gpu::Texture2D *sub_tex = nullptr;
     gpu::SRV *sub_srv = nullptr;
-    uint32_t res = 1;   // internal resolution scale
+    float res = 1;      // internal resolution scale: host pixels per guest pixel
+    bool uav = false;   // also an unordered-access target (the upscaler writes it)
     gpu::Texture2D *ring[3] = {};              // copies on their way back to guest memory (write_back_surface)
     int ring_first = 0, ring_count = 0;
     bool ring_stored = false;
@@ -431,7 +456,7 @@ void create_surface_tex(Surface &s, uint32_t nw, uint32_t nh) {
         g_dev->CreateShaderResourceView(s.tex, &sv, &s.srv);
     } else {
         d.Format = color_format(fmt);
-        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (s.uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
         g_dev->CreateTexture2D(&d, nullptr, &s.tex);
         g_dev->CreateRenderTargetView(s.tex, nullptr, &s.rtv);
         g_dev->CreateShaderResourceView(s.tex, nullptr, &s.srv);
@@ -482,6 +507,124 @@ void mark_drawn(Surface &s, bool via_proxy) {
 }
 
 uint32_t dma_location(uint32_t ctx) { return (ctx & 0xf) == 1 ? 1 : 0; }  // 0xfeed0000 local, 0xfeed0001 main
+
+/* ---------------- camera motion between frames (for the temporal upscaler) ---------------- */
+// Scene draws carry their object-to-view transform in c[4..7] (rows: view = x*c4 + y*c5 + z*c6 + c7) and
+// object-to-clip in c[0..3]. A static object's transform changes between two frames only by the camera's
+// own motion: prev = cur * D, with D the same 4x4 for every static object, taking a view-space point of
+// this frame to where it was in the view of the frame before. Matching each draw with the same draw of
+// the previous frame and voting gives D without knowing anything about the game's camera.
+struct CamMotion {
+    std::unordered_map<uint64_t, std::array<float, 16>> cur, prev;
+    float delta[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    bool valid = false;        // delta comes from enough agreeing draws
+    int matched = 0, agree = 0;
+    // View space to D3D clip space of the scene (projection, then the viewport mapping of the vertex
+    // shaders, without the jitter), for the G-buffer pass being drawn, the last one, and the one before.
+    struct View { float v2c[16]; bool ok = false; } view_cur, view_last, view_before;
+};
+CamMotion g_cam;
+
+// General 4x4 inverse (row vectors). False: singular.
+bool mat_inverse(const float *m, float *out) {
+    float inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const double det = (double)m[0] * inv[0] + (double)m[1] * inv[4] + (double)m[2] * inv[8] + (double)m[3] * inv[12];
+    if (fabs(det) < 1e-30) return false;
+    for (int i = 0; i < 16; i++) out[i] = (float)(inv[i] / det);
+    return true;
+}
+
+// Inverse of an affine row-vector transform (last column 0, 0, 0, 1). False: singular.
+bool affine_inverse(const float *m, float *out) {
+    const float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    const float A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
+    const float det = a * A + b * B + c * C;
+    if (fabsf(det) < 1e-12f) return false;
+    const float r = 1.f / det;
+    const float inv[9] = {A * r, (c * h - b * i) * r, (b * f - c * e) * r,
+                          B * r, (a * i - c * g) * r, (c * d - a * f) * r,
+                          C * r, (b * g - a * h) * r, (a * e - b * d) * r};
+    for (int row = 0; row < 3; row++)
+        for (int col = 0; col < 3; col++) out[row * 4 + col] = inv[row * 3 + col];
+    for (int col = 0; col < 3; col++)
+        out[12 + col] = -(m[12] * inv[col] + m[13] * inv[3 + col] + m[14] * inv[6 + col]);
+    out[3] = out[7] = out[11] = 0, out[15] = 1;
+    return true;
+}
+
+void mat_mul(const float *x, const float *y, float *out) {   // out = x * y (row vectors)
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r * 4 + c] = x[r * 4] * y[c] + x[r * 4 + 1] * y[4 + c] + x[r * 4 + 2] * y[8 + c] + x[r * 4 + 3] * y[12 + c];
+}
+
+// A scene draw: remember its transform under a key that names the same object next frame.
+void cam_note_draw(uint64_t key, const float *c4) {
+    if (c4[3] != 0.f || c4[7] != 0.f || c4[11] != 0.f || c4[15] != 1.f) return;   // not affine: not ours
+    std::array<float, 16> m;
+    memcpy(m.data(), c4, sizeof(float) * 16);
+    g_cam.cur.emplace(key, m);   // a key drawn twice in one frame keeps its first transform
+}
+
+// At the flip: vote on the camera's motion from the draws of this frame and the one before.
+void cam_frame_end() {
+    std::unordered_map<uint64_t, std::pair<int, std::array<float, 16>>> votes;
+    g_cam.matched = 0;
+    for (auto &[key, m] : g_cam.cur) {
+        auto it = g_cam.prev.find(key);
+        if (it == g_cam.prev.end()) continue;
+        float inv[16], d[16];
+        if (!affine_inverse(m.data(), inv)) continue;
+        mat_mul(inv, it->second.data(), d);
+        g_cam.matched++;
+        // Bucket: rotation to 1e-3, translation to 1 mm.
+        int32_t q[12];
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) q[r * 3 + c] = (int32_t)lrintf(d[r * 4 + c] * 1000.f);
+        for (int c = 0; c < 3; c++) q[9 + c] = (int32_t)lrintf(d[12 + c] * 1000.f);
+        auto &v = votes[hfast(q, sizeof q)];
+        if (!v.first++) memcpy(v.second.data(), d, sizeof d);
+    }
+    int best = 0;
+    const float *best_d = nullptr;
+    for (auto &[k, v] : votes)
+        if (v.first > best) best = v.first, best_d = v.second.data();
+    g_cam.agree = best;
+    g_cam.valid = best >= 8 && best * 4 >= g_cam.matched;
+    if (g_cam.valid) memcpy(g_cam.delta, best_d, sizeof g_cam.delta);
+    static const bool cam_log = getenv("HELSARI_CAM_LOG") != nullptr;
+    if (cam_log && g_cam.matched && g_frame % 6 == 0) {
+        const float *d = g_cam.valid ? g_cam.delta : best_d;
+        const float angle = acosf(std::clamp((d[0] + d[5] + d[10] - 1.f) * 0.5f, -1.f, 1.f));
+        LOG("cam", "draws %zu matched %d agree %d (%zu groups) %s: turn %.4f rad, move %.4f %.4f %.4f",
+            g_cam.cur.size(), g_cam.matched, best, votes.size(), g_cam.valid ? "valid" : "NONE",
+            angle, d[12], d[13], d[14]);
+    }
+    g_cam.prev.swap(g_cam.cur);
+    g_cam.cur.clear();
+    // A frame without a G-buffer pass (menus, a loading screen) keeps the views it had.
+    if (g_cam.view_cur.ok) {
+        g_cam.view_before = g_cam.view_last;
+        g_cam.view_last = g_cam.view_cur;
+        g_cam.view_cur.ok = false;
+    }
+}
 
 struct Bound {
     Surface *color[4] = {};
@@ -597,16 +740,23 @@ Bound bind_surfaces() {
     // edges: The game draws its cheaper particles at 320x180 4x into a 640x360 layer, sharing it with
     // the ones drawn at 640x360, so those targets keep the size of their samples.
     const float samples = aa == 4 || aa == 5 ? 2.f : 1.f;
-    g_res_scale = dma_location(reg(0x0194)) == 0 && b.w != b.h ? g_res_setting : 1;
+    static const uint32_t off_m[4] = {0x0210, 0x0218, 0x0288, 0x028c};     // COLOR_A..D_OFFSET
+    static const uint32_t pitch_m[4] = {0x020c, 0x021c, 0x0280, 0x0284};   // SURFACE_PITCH_A..D
+    static const uint32_t dma_m[4] = {0x0194, 0x018c, 0x01b4, 0x01b8};     // CONTEXT_DMA_COLOR_A..D
+    const bool scaled = dma_location(reg(0x0194)) == 0 && b.w != b.h;
+    // Upscaling: a target already upscaled this frame is drawn in its upscaled copy (key | 2), at the
+    // output scale, together with a depth of that size.
+    bool out_pass = false;
+    if (g_fsr_mode && scaled && !g_upscaled.empty())
+        for (int i = 0; i < 4; i++)
+            if (g_upscaled.count(ea_for(dma_location(reg(dma_m[i])), reg(off_m[i])))) out_pass = true;
+    g_res_scale = !scaled ? 1.f : !g_fsr_mode ? (float)g_res_setting : out_pass ? g_scale_out : g_scale_scene;
     g_aa_sx = g_aa_sy = g_res_scale * samples;
     // The game also binds those targets as plain double-width ones, to shade each sample.
     if (dma_location(reg(0x0194)) == 0 && b.w == 2560 && b.h == 720 && aa < 3)
         g_aa_sx = g_res_scale / 2.f;
     uint32_t sw = (uint32_t)(b.w * g_aa_sx), shh = (uint32_t)(b.h * g_aa_sy);
     uint32_t target = reg(0x0220);
-    static const uint32_t off_m[4] = {0x0210, 0x0218, 0x0288, 0x028c};     // COLOR_A..D_OFFSET
-    static const uint32_t pitch_m[4] = {0x020c, 0x021c, 0x0280, 0x0284};   // SURFACE_PITCH_A..D
-    static const uint32_t dma_m[4] = {0x0194, 0x018c, 0x01b4, 0x01b8};     // CONTEXT_DMA_COLOR_A..D
     int mask = 0;
     switch (target) {
     case 0x01: mask = 1; break;
@@ -618,6 +768,7 @@ Bound bind_surfaces() {
     for (int i = 0; i < 4; i++) {
         if (!(mask & (1 << i))) continue;
         uint32_t ea = ea_for(dma_location(reg(dma_m[i])), reg(off_m[i]));
+        if (out_pass) ea |= 2;
         b.color[i] = get_surface(ea, cfmt, sw, shh, false);
         if (b.color[i]) b.color[i]->pitch = reg(pitch_m[i]), b.color[i]->res = g_res_scale;
     }
@@ -628,7 +779,8 @@ Bound bind_surfaces() {
         // would fight over one surface's size, so the scaled pass has its own, the size of its colour
         // target, under a key no real address has: nothing reads this depth back as a texture.
         uint32_t depth_w = sw, depth_h = shh;
-        if (g_res_scale > 1) {
+        if (out_pass) ea |= 2;
+        else if (g_res_scale != 1) {
             auto shared = g_depth_surfaces.find(ea);
             if (shared != g_depth_surfaces.end() && shared->second.w == shared->second.h && shared->second.res == 1) ea |= 1;
             if (ea & 1) for (Surface *c : b.color) if (c) { depth_w = c->w, depth_h = c->h; break; }
@@ -1129,11 +1281,11 @@ gpu::PixelShader *g_depth_x16_ps;
 // Host texels across a surface read as w x h. The game reads its multisampled targets as 2560x720,
 // with its samples side by side; here they have one sample per pixel, so that width is half.
 uint32_t surface_width(const Surface &s, uint32_t w, uint32_t h) {
-    return w == 2560 && h == 720 ? 1280 * s.res : w * s.res;
+    return (uint32_t)((w == 2560 && h == 720 ? 1280 : w) * s.res);
 }
 
 gpu::SRV *sub_view(Surface &s, uint32_t w, uint32_t h) {
-    w = surface_width(s, w, h), h *= s.res;
+    w = surface_width(s, w, h), h = (uint32_t)(h * s.res);
     if (s.sub_w != w || s.sub_h != h || !s.sub_tex) {
         release(s.sub_srv), release(s.sub_rtv), release(s.sub_tex);
         DXGI_FORMAT f = s.depth ? DXGI_FORMAT_R16G16B16A16_UNORM : color_format(s.fmt);
@@ -1173,11 +1325,11 @@ gpu::SRV *get_texture(int unit, TexDim &dim) {
         // bind_surfaces). Reads of it at a non-square size are of that one, not the square target.
         if (w != h) {
             auto own = g_depth_surfaces.find(ea | 1);
-            if (own != g_depth_surfaces.end() && own->second.w >= w * own->second.res && own->second.h >= h * own->second.res) ds = own;
+            if (own != g_depth_surfaces.end() && own->second.w >= (uint32_t)(w * own->second.res) && own->second.h >= (uint32_t)(h * own->second.res)) ds = own;
         }
         if (ds != g_depth_surfaces.end()) sync_primary(ds->second);
-        const auto holds = [&](const Surface &x) { return x.w == surface_width(x, w, h) && x.h == h * x.res; };
-        const auto covers = [&](const Surface &x) { return x.w >= surface_width(x, w, h) && x.h >= h * x.res; };
+        const auto holds = [&](const Surface &x) { return x.w == surface_width(x, w, h) && x.h == (uint32_t)(h * x.res); };
+        const auto covers = [&](const Surface &x) { return x.w >= surface_width(x, w, h) && x.h >= (uint32_t)(h * x.res); };
         bool ds_fits = ds != g_depth_surfaces.end() && holds(ds->second);
         if (depth_fmt && ds_fits) {
             if (reg(b + 8) >> 28) dim = (TexDim)(dim | TEX_SHADOW);           // compare function set
@@ -1871,6 +2023,161 @@ void occ_poll(bool wait) {
 }
 bool g_render_enabled = true;   // SET_RENDER_ENABLE (conditional rendering)
 
+/* ---------------- temporal upscaling ---------------- */
+// Motion vectors from depth: each pixel's position is taken back to view space, moved by the camera's
+// motion since the last scene (g_cam.delta) and projected with that scene's transform. Objects that move
+// by themselves only get the camera's part; FSR's own checks catch most of the rest.
+gpu::PixelShader *g_mv_ps;
+gpu::Buffer *g_cb_mv;
+struct MvTargets {
+    uint32_t w = 0, h = 0;
+    gpu::Texture2D *mv = nullptr, *depth = nullptr;
+    gpu::RTV *mv_rtv = nullptr, *depth_rtv = nullptr;
+    gpu::SRV *mv_srv = nullptr, *depth_srv = nullptr;
+} g_mvt;
+const char MV_HLSL[] =
+    "Texture2D<float> dep : register(t0);\n"
+    "cbuffer M : register(b0) { row_major float4x4 R; float4 size; float4 dscale; };\n"
+    "struct O { float2 mv : SV_Target0; float d : SV_Target1; };\n"
+    "O ps(float4 p : SV_Position) {\n"
+    "  float d = dep.Load(int3(p.xy * dscale.xy, 0));\n"
+    "  float2 uv = p.xy / size.xy;\n"
+    "  float4 h = mul(float4(uv.x * 2 - 1, 1 - uv.y * 2, d, 1), R);\n"
+    "  O o; o.d = d; o.mv = 0;\n"
+    "  if (size.z > 0 && abs(h.w) > 1e-7) { float2 q = h.xy / h.w; o.mv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5) - uv; }\n"
+    "  return o; }\n";
+
+float halton(uint32_t i, uint32_t base) {
+    float f = 1, r = 0;
+    for (; i; i /= base) f /= base, r += f * (i % base);
+    return r;
+}
+
+// The game reads the finished scene image s (to post-process it on the SPUs): upscale it into its copy at
+// the output scale, which the rest of the frame uses. Returns false if nothing was done.
+bool upscale_scene(Surface &s) {
+    if (!g_fsr_mode || s.res != g_scale_scene) return false;
+    sync_primary(s);
+    auto dit = g_depth_surfaces.find(g_scene_depth_key);
+    if (dit == g_depth_surfaces.end() || !dit->second.srv) return false;
+    Surface &ds = dit->second;
+    sync_primary(ds);
+    const uint32_t rw = s.w, rh = s.h;
+    const uint32_t gw = (uint32_t)lrintf(rw / g_scale_scene), gh = (uint32_t)lrintf(rh / g_scale_scene);
+    const uint32_t ow = (uint32_t)(gw * g_scale_out), oh = (uint32_t)(gh * g_scale_out);
+    // The output: the surface's upscaled copy.
+    Surface &u = g_surfaces[s.ea | 2];
+    if (!u.tex || !u.uav || u.fmt != s.fmt || u.w != ow || u.h != oh) {
+        free_surface(u);
+        u.ea = s.ea | 2, u.fmt = s.fmt, u.uav = true;
+        create_surface_tex(u, ow, oh);
+    }
+    u.res = g_scale_out, u.pitch = s.pitch, u.last_frame = g_frame;
+    // Motion vectors and a 32-bit copy of the depth, at render size.
+    if (g_mvt.w != rw || g_mvt.h != rh) {
+        release(g_mvt.mv_srv), release(g_mvt.mv_rtv), release(g_mvt.mv);
+        release(g_mvt.depth_srv), release(g_mvt.depth_rtv), release(g_mvt.depth);
+        g_mvt.w = g_mvt.h = 0;
+        if (!make_target(rw, rh, DXGI_FORMAT_R16G16_FLOAT, g_mvt.mv, g_mvt.mv_rtv, g_mvt.mv_srv) ||
+            !make_target(rw, rh, DXGI_FORMAT_R32_FLOAT, g_mvt.depth, g_mvt.depth_rtv, g_mvt.depth_srv))
+            return false;
+        g_mvt.w = rw, g_mvt.h = rh;
+    }
+    // Reprojection: this scene's D3D clip space -> view -> the last scene's view -> its clip space.
+    const CamMotion::View &cur = g_cam.view_last, &prev = g_cam.view_before;
+    struct { float r[16]; float size[4]; float dscale[4]; } cb{};
+    float c2v[16], t[16];
+    bool motion = g_cam.valid && cur.ok && prev.ok && !g_fsr_reset && mat_inverse(cur.v2c, c2v);
+    if (motion) mat_mul(c2v, g_cam.delta, t), mat_mul(t, prev.v2c, cb.r);
+    cb.size[0] = (float)rw, cb.size[1] = (float)rh, cb.size[2] = motion ? 1.f : 0.f;
+    cb.dscale[0] = (float)ds.w / rw, cb.dscale[1] = (float)ds.h / rh;
+    // The depth surface is at render size too; dscale only covers a larger one (it keeps its largest size).
+    if (ds.w >= rw && ds.h >= rh) cb.dscale[0] = cb.dscale[1] = 1;
+    upload_cb(g_cb_mv, &cb, sizeof cb);
+    {
+        gpu::RTV *saved_rtv[4];
+        gpu::DSV *saved_dsv;
+        g_ctx->OMGetRenderTargets(4, saved_rtv, &saved_dsv);
+        UINT nvp = 1;
+        D3D11_VIEWPORT saved_vp;
+        g_ctx->RSGetViewports(&nvp, &saved_vp);
+        gpu::SRV *none[16] = {};
+        g_ctx->PSSetShaderResources(0, 16, none);
+        gpu::RTV *rtv[2] = {g_mvt.mv_rtv, g_mvt.depth_rtv};
+        g_ctx->OMSetRenderTargets(2, rtv, nullptr);
+        D3D11_VIEWPORT vp{0, 0, (float)rw, (float)rh, 0, 1};
+        g_ctx->RSSetViewports(1, &vp);
+        g_ctx->RSSetState(nullptr);
+        g_ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        g_ctx->OMSetDepthStencilState(nullptr, 0);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->VSSetShader(g_present_vs, nullptr, 0);
+        g_ctx->VSSetConstantBuffers(0, 1, &g_cb_unit_uv);
+        g_ctx->PSSetShader(g_mv_ps, nullptr, 0);
+        g_ctx->PSSetConstantBuffers(0, 1, &g_cb_mv);
+        g_ctx->PSSetShaderResources(0, 1, &ds.srv);
+        g_ctx->Draw(3, 0);
+        g_ctx->PSSetShaderResources(0, 16, none);
+        g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        // FSR, or a plain stretch if it fails.
+        gpu::UpscaleParams p;
+        p.color = s.tex, p.depth = g_mvt.depth, p.motion = g_mvt.mv, p.output = u.tex;
+        p.render_w = rw, p.render_h = rh, p.out_w = ow, p.out_h = oh;
+        p.jitter_x = g_jitter[0], p.jitter_y = g_jitter[1];
+        p.mv_scale_x = (float)rw, p.mv_scale_y = (float)rh;
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        p.frame_ms = g_fsr_time > 0 ? (float)std::min(100.0, (now - g_fsr_time) * 1000) : 16.7f;
+        g_fsr_time = now;
+        p.near_z = 0.25f, p.far_z = 100000.f;
+        p.fov_y = cur.ok && cur.v2c[5] != 0 ? 2.f * atanf(1.f / fabsf(cur.v2c[5])) : 1.f;
+        p.reset = !motion;   // no trusted camera motion (a cut, a new area): start over
+        p.infinite_depth = true;
+        p.sharpness = pc_sharpness();
+        if (!g_ctx->Upscale(p)) {
+            static int logs;
+            if (logs++ < 5) LOG("rsx", "upscaling failed: stretching the scene instead");
+            gpu::SRV *src = s.srv;
+            g_ctx->PSSetSamplers(0, 1, &g_present_smp);
+            run_pass(src, u.rtv, ow, oh, g_present_ps);
+        }
+        g_ctx->OMSetRenderTargets(4, saved_rtv, saved_dsv);
+        if (nvp) g_ctx->RSSetViewports(1, &saved_vp);
+        for (auto *r : saved_rtv) release(r);
+        release(saved_dsv);
+    }
+    mark_drawn(u, false);
+    g_upscaled.insert(s.ea);
+    {
+        static int logs;
+        if (logs++ < 3) LOG("rsx", "upscaling %ux%u -> %ux%u (surface %08x, depth %08x, camera motion %s)", rw, rh, ow, oh, s.ea,
+                            ds.ea, motion ? "yes" : "no");
+    }
+    g_fsr_reset = false;
+    return true;
+}
+
+// Before a draw: is it the game reading the finished scene image? It reads it from a texture into a
+// target in main memory, after a G-buffer pass.
+void check_upscale_point() {
+    if (!g_scene_drawn || dma_location(reg(0x0194)) != 1) return;
+    const uint32_t fmtreg = reg(0x1a04);
+    if ((fmtreg & 3) == 2 || (fmtreg & 4)) return;   // texture in main memory, or a cube map
+    auto it = g_surfaces.find(local_ea(reg(0x1a00)));
+    if (it == g_surfaces.end() || it->second.depth || it->second.w == it->second.h || it->first == 0xc07b0000u) return;
+    g_scene_drawn = false;
+    g_fsr_seen = true, g_fsr_last_frame = g_frame;
+    upscale_scene(it->second);
+    // The next scene's jitter (Halton 2, 3), with as many phases as FSR wants for this ratio.
+    if (g_fsr_mode) {
+        const float ratio = g_scale_out / g_scale_scene;
+        const uint32_t phases = std::max(8u, (uint32_t)ceilf(8.f * ratio * ratio));
+        g_jitter_index = (g_jitter_index + 1) % phases;
+        g_jitter[0] = halton(g_jitter_index + 1, 2) - 0.5f, g_jitter[1] = halton(g_jitter_index + 1, 3) - 0.5f;
+    } else {
+        g_jitter[0] = g_jitter[1] = 0;
+    }
+}
+
 void draw() {
     if (!g_ok) return;
     if (!g_reports.empty()) occ_poll(false);
@@ -1887,6 +2194,7 @@ void draw() {
         return v;
     }();
     for (int k : skip) if (k == g_draws_this_frame) return;
+    check_upscale_point();
     Bound b = bind_surfaces();
     lap(0);
     if (!b.w) { g_skip[1]++; return; }
@@ -2154,6 +2462,31 @@ void draw() {
     // camera-relative transform (c[4..7]) steps with the game's ticks, which is the stutter. Each mesh
     // follows it smoothly instead, every frame, so the steps go and real motion (bob, recoil) stays.
     // c[0..3] is rebuilt from it: clip = (sx * x, sy * y, -z + near * w, -z).
+    // The G-buffer pass: note each object's transform for the camera's motion (cam_frame_end).
+    // Also the scene's projection, P = inverse(c[4..7]) * c[0..3], from a draw of the world (the weapon has
+    // a camera of its own, near plane 0.01), and what the upscaler needs to know of the pass.
+    const bool gbuffer_pass = b.color[0] && b.color[3] && b.color[0]->ea == 0xc07b0000u;
+    float scene_p[16];
+    bool scene_p_ok = false;
+    if (gbuffer_pass) {
+        uint64_t key = hfast(&g_vs_hash, 8, hfast(&g_ranges[0].first, 4, (uint64_t)list.size() << 32 | reg(0x181c)));
+        for (int a = 0; a < 16; a++)
+            if (reg(0x1ff0) & (1 << a)) { const uint32_t off = reg(0x1680 + a * 4); key = hfast(&off, 4, key); }
+        cam_note_draw(key, &vp_consts[4 * 4]);
+        g_scene_drawn = true;
+        g_scene_gw = b.w, g_scene_gh = b.h;
+        if (b.depth) g_scene_depth_key = b.depth->ea;
+        float inv[16];
+        if (!g_cam.view_cur.ok && vp_consts[3 * 4 + 2] - vp_consts[3 * 4 + 3] < -0.1f && vp_consts[4 * 4 + 15] == 1.f &&
+            affine_inverse(&vp_consts[4 * 4], inv))
+            mat_mul(inv, &vp_consts[0], scene_p), scene_p_ok = true;
+    }
+    // The upscaler's jitter: the passes that make the scene's depth and G-buffer. That includes the decals,
+    // drawn into the G-buffer afterwards with fewer targets and tested against its depth: left unjittered
+    // they pass and fail that test at shifting pixels, and flicker.
+    bool to_gbuffer = false;
+    for (Surface *c : b.color) if (c && c->ea == 0xc07b0000u) to_gbuffer = true;
+    const bool jittered = g_fsr_mode && (to_gbuffer || (!b.color[0] && !b.color[1] && b.depth && b.depth->ea == g_scene_depth_key));
     float gun_saved[8 * 4];
     bool gun_edited = false;
     const float gun_near = vp_consts[3 * 4 + 2] - vp_consts[3 * 4 + 3];
@@ -2376,6 +2709,22 @@ void draw() {
     static const bool flip_y = getenv("HELSARI_FLIP_Y") != nullptr;
     if (flip_y) origin_bottom = !origin_bottom;
     vx[10] = origin_bottom ? 1.f : 0.f;
+    // Upscaling: the jitter as an offset of D3D clip space (clipm0.x, clipm1.x), and the scene's view to
+    // clip transform. The vertex shader maps window coordinates to D3D clip space per axis (vp.cpp):
+    // clip.x = x * 2 vscale.x / w + clip.w * (2 voffset.x / w - 1), likewise y (up or down), z = vscale.z z + voffset.z w.
+    if (jittered) {
+        const float host_w = b.w * g_aa_sx, host_h = b.h * g_aa_sy;
+        vx[16] = 2.f * g_jitter[0] / host_w, vx[20] = -2.f * g_jitter[1] / host_h;
+    }
+    if (scene_p_ok) {
+        float q[16] = {};
+        q[0] = 2 * vx[0] / vx[8], q[12] = 2 * vx[4] / vx[8] - 1;
+        if (vx[10] > 0) q[5] = 2 * vx[1] / vx[9], q[13] = 2 * vx[5] / vx[9] - 1;
+        else q[5] = -2 * vx[1] / vx[9], q[13] = 1 - 2 * vx[5] / vx[9];
+        q[10] = vx[2], q[14] = vx[6], q[15] = 1;
+        mat_mul(scene_p, q, g_cam.view_cur.v2c);
+        g_cam.view_cur.ok = true;
+    }
     memcpy(&vx[24], vattr, sizeof vattr);
     memcpy(&vx[24 + 64], g_vattr, sizeof g_vattr);
     if (!cb_on) {
@@ -2711,8 +3060,6 @@ void draw() {
 /* ---------------- present ---------------- */
 gpu::Texture2D *g_cpu_tex;
 gpu::SRV *g_cpu_srv;
-gpu::SamplerState *g_present_smp;
-
 const char *PRESENT_HLSL =
     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
     "cbuffer P : register(b0) { float4 uvscale; };\n"
@@ -2844,6 +3191,14 @@ bool create_device() {
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     smp.MaxLOD = D3D11_FLOAT32_MAX;
     g_dev->CreateSamplerState(&smp, &g_present_smp);
+    // Upscaling: the motion vector pass.
+    if (SUCCEEDED(D3DCompile(MV_HLSL, sizeof MV_HLSL - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &code, &err))) {
+        g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_mv_ps);
+        code->Release();
+    } else {
+        LOG("rsx", "motion vector shader: %s", err ? (const char *)err->GetBufferPointer() : "?");
+    }
+    g_cb_mv = make_cb(96);
     g_cb_vc = make_cb(sizeof vp_consts);
     // Constant ring (see cb_push), when the driver supports offsets and NO_OVERWRITE on constant buffers.
     if (g_dev->ConstantBufferOffsets()) {
@@ -3082,12 +3437,30 @@ void maybe_screenshot() {
 
 // The window's size picks the internal scale: the smallest whole scale that covers it.
 void set_output_size(uint32_t width) {
+    g_out_width = width;
     if (g_res_forced <= 0) g_res_wanted = std::min(4u, std::max(1u, (width + 1279) / 1280));
 }
 
 void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
-    if (g_res_wanted.load() != g_res_setting) {
+    // Upscaling: on while the game draws a scene (a scene seen in the last half second) and the option
+    // is set on a device that has FSR. Output at the window's size; the scene at that over the ratio.
+    bool fsr_want = false;
+    float fsr_out = g_scale_out, fsr_scene = g_scale_scene;
+    if (g_ok) {
+        const int mode = pc_upscaler();
+        static const bool have_fsr = !g_dev->UpscalerName().empty();
+        fsr_want = mode && have_fsr && g_fsr_seen && g_frame - g_fsr_last_frame < 30;
+        if (fsr_want) {
+            fsr_out = g_res_forced > 0 ? (float)std::min(g_res_forced, 4) : g_out_width.load() / 1280.f;
+            fsr_scene = fsr_out / upscaler_ratio(mode);
+        }
+    }
+    const bool fsr_change = fsr_want != g_fsr_mode || (fsr_want && (fsr_out != g_scale_out || fsr_scene != g_scale_scene));
+    if (g_res_wanted.load() != g_res_setting || fsr_change) {
         g_res_setting = g_res_wanted.load();
+        g_fsr_mode = fsr_want, g_scale_out = fsr_out, g_scale_scene = fsr_scene;
+        g_fsr_reset = true, g_upscaled.clear();
+        g_jitter[0] = g_jitter[1] = 0;
         g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
         // Only scaled surfaces change size. The rest stay, with their contents: the game draws its
         // menu and HUD characters into a square target once, as each is first needed.
@@ -3099,12 +3472,14 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         };
         rescale(g_surfaces);
         rescale(g_depth_surfaces);
-        LOG("rsx", "internal resolution scale: %u", g_res_setting);
+        if (g_fsr_mode) LOG("rsx", "upscaling on: scene at %.3fx, output at %.3fx", g_scale_scene, g_scale_out);
+        else LOG("rsx", "internal resolution scale: %u", g_res_setting);
     }
     if (!g_ok) return;
     extern void frame_delay_rsx();
     frame_delay_rsx();
     cb_flush();
+    cam_frame_end();
     g_frame++;
     if ((int)g_frame == g_dump_frame) dump_surfaces();
     if (g_capture_req.exchange(false)) {
@@ -3159,11 +3534,12 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     uint32_t ea = local_ea(offset);
     gpu::SRV *src = nullptr;
     float uv[4] = {1, 1, 0, 0};
-    auto it = g_surfaces.find(ea);
+    auto it = g_surfaces.find(g_upscaled.count(ea) ? ea | 2 : ea);   // upscaled this frame: its copy
+    if (it == g_surfaces.end()) it = g_surfaces.find(ea);
     if (it != g_surfaces.end() && !it->second.depth) {
         sync_primary(it->second);
         src = it->second.srv;
-        uv[0] = (float)(width * it->second.res) / it->second.w, uv[1] = (float)(height * it->second.res) / it->second.h;
+        uv[0] = (float)(uint32_t)(width * it->second.res) / it->second.w, uv[1] = (float)(uint32_t)(height * it->second.res) / it->second.h;
     } else if (width && height) {
         // Nothing rendered there by the GPU: show memory contents (CPU-drawn).
         if (!g_cpu_tex) {
@@ -3231,6 +3607,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     }
     extern bool pc_vsync();        // GRAPHICS menu (pc_options.cpp)
     g_swap->Present(pc_vsync());
+    g_upscaled.clear();   // the next frame's scene targets are the plain ones again
     gpu_frame_end();
     g_present_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }

@@ -101,6 +101,7 @@ namespace gpu
         float sharpness = 0;                       // 0: no extra sharpening
         bool reset = false;                        // the camera jumped: no history
         bool inverted_depth = false;
+        bool infinite_depth = false;               // the projection has no far plane
     };
 
     struct Device

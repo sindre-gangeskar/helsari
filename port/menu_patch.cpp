@@ -232,7 +232,7 @@ namespace menu_patch
             };
             // GRAPHICS: one row per line. To reorder, move the lines and renumber y (0, 29, 58, ...) from the top.
             //          name  y    group action   height
-            std::string out = list("lG", 203, 900);
+            std::string out = list("lG", 261, 900);
             out += row("R", 0, 901, "res", 29);                   // RESOLUTION
             out += row("M", 29, 902, "mode", 29);                 // WINDOW MODE
             out += row("V", 58, 903, "vsync", 29);                // VSYNC
@@ -240,6 +240,8 @@ namespace menu_patch
             out += slider_row("O", 116, 907, "fov", 29, 73, 110); // FIELD OF VIEW (slider: 73 to 110)
             out += row("B", 145, 908, "fx", 29);                  // SCREEN FX
             out += row("A", 174, 930, "api", 29);                 // RENDERING API (group 930: 911-924 are the keys)
+            out += row("U", 203, 931, "upscaler", 29);            // UPSCALER
+            out += slider_row("H", 232, 932, "sharp", 29, 0, 20); // SHARPENING (slider: 0 to 20, 5% each)
             out += end(900);
             out += list("lP", 203, 905) + row("S", 0, 906, "sway", 29) + row("I", 29, 909, "intro", 29) + end(905); // SWAY, INTRO MOVIE
             constexpr int ROW = 26;

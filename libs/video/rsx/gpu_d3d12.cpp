@@ -510,7 +510,7 @@ namespace gpu
             PfnFfxDispatch dispatch = nullptr;
             ffxContext ctx = nullptr;
             UINT rw = 0, rh = 0, ow = 0, oh = 0;
-            bool inverted = false;
+            bool inverted = false, infinite = false;
             std::string name;   // the version in use, or the newest available before a context exists
 
             bool load()
@@ -559,9 +559,9 @@ namespace gpu
                 LOG("rsx", "FSR: available versions: %s", all.empty() ? "none" : all.c_str());
                 return true;
             }
-            bool ensure(UINT r_w, UINT r_h, UINT o_w, UINT o_h, bool inv)
+            bool ensure(UINT r_w, UINT r_h, UINT o_w, UINT o_h, bool inv, bool inf)
             {
-                if (ctx && r_w <= rw && r_h <= rh && o_w == ow && o_h == oh && inv == inverted)
+                if (ctx && r_w <= rw && r_h <= rh && o_w == ow && o_h == oh && inv == inverted && inf == infinite)
                     return true;
                 if (!load())
                     return false;
@@ -573,7 +573,7 @@ namespace gpu
                 ffxCreateContextDescUpscale d{};
                 d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
                 d.header.pNext = &be.header;
-                d.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | (inv ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0);
+                d.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | (inv ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0) | (inf ? FFX_UPSCALE_ENABLE_DEPTH_INFINITE : 0);
                 d.maxRenderSize = {r_w, r_h};
                 d.maxUpscaleSize = {o_w, o_h};
                 d.fpMessage = fsr_message;
@@ -584,7 +584,7 @@ namespace gpu
                     ctx = nullptr;
                     return false;
                 }
-                rw = r_w, rh = r_h, ow = o_w, oh = o_h, inverted = inv;
+                rw = r_w, rh = r_h, ow = o_w, oh = o_h, inverted = inv, infinite = inf;
                 ffxQueryGetProviderVersion pv{};
                 pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
                 query(&ctx, &pv.header);
@@ -1441,7 +1441,7 @@ namespace gpu
             bool Upscale(const UpscaleParams &u) override
             {
                 Tex12 *color = tex_of(u.color), *depth = tex_of(u.depth), *motion = tex_of(u.motion), *out = tex_of(u.output);
-                if (!color || !depth || !motion || !out || !g_fsr.ensure(u.render_w, u.render_h, u.out_w, u.out_h, u.inverted_depth))
+                if (!color || !depth || !motion || !out || !g_fsr.ensure(u.render_w, u.render_h, u.out_w, u.out_h, u.inverted_depth, u.infinite_depth))
                     return false;
                 barrier(bars, color, SRV_STATE);
                 barrier(bars, depth, SRV_STATE);

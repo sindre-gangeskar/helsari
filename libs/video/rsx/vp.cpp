@@ -224,7 +224,8 @@ VpInfo translate_vp(uint32_t start, const uint8_t afmt[16]) {
          "  float4 p = o[0];\n"
          "  float3 win = (p.xyz / p.w) * vscale.xyz + voffset.xyz;\n"
          "  float2 ndc = float2(win.x / surf.x * 2 - 1, surf.z > 0 ? win.y / surf.y * 2 - 1 : 1 - win.y / surf.y * 2);\n"
-         "  res.pos = float4(ndc * p.w, win.z * p.w, p.w);\n";
+         // clipm0.x, clipm1.x: the upscaler's sub-pixel jitter (zero unless upscaling).
+         "  res.pos = float4((ndc + float2(clipm0.x, clipm1.x)) * p.w, win.z * p.w, p.w);\n";
     for (int k = 1; k < 16; k++) h += "  res.o" + std::to_string(k) + " = o[" + std::to_string(k) + "];\n";
     // User clip planes: distances in o5.yzw (planes 0-2) and o6.yzw (3-5); clipm holds
     // per plane 0 (off), +1 (keep where d >= 0) or -1 (keep where d < 0).
