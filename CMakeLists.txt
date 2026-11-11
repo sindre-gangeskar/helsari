@@ -138,7 +138,9 @@ add_executable(helsari
   libs/codec/ac3.cpp
   libs/video/rsx/vp.cpp
   libs/video/rsx/fp.cpp
-  libs/video/rsx/d3d.cpp)
+  libs/video/rsx/d3d.cpp
+  libs/video/rsx/gpu_d3d11.cpp
+  libs/video/rsx/gpu_d3d12.cpp)
 set_target_properties(helsari PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON OUTPUT_NAME helsari2)
 
 # Recompiled SPU code (EBOOT modules and the runtime-captured cache).
@@ -155,7 +157,53 @@ target_compile_definitions(helsari PRIVATE
   HELSARI_DEFAULT_UPDATE="${_update}"
   HELSARI_DEFAULT_ELF="${GEN_DIR}/decrypt/EBOOT.elf")
 target_compile_options(helsari PRIVATE -O2 -g -march=${HELSARI_MARCH})
-target_link_libraries(helsari PRIVATE helsari_spu helsari_ppu xinput hid setupapi gdi32 user32 d3d11 dxgi d3dcompiler dxguid winmm ole32 synchronization mfplat mfuuid)
+target_link_libraries(helsari PRIVATE helsari_spu helsari_ppu xinput hid setupapi gdi32 user32 d3d11 d3d12 dxgi d3dcompiler dxguid winmm ole32 synchronization mfplat mfuuid)
+
+# AMD FidelityFX Super Resolution (DX12 mode): the FFX API headers and AMD's signed runtime DLLs,
+# downloaded at configure time from a pinned SDK release (checked by SHA-256) and never committed.
+# The DLLs and their licence are copied next to the executable. Without them (offline), the build
+# goes on without FSR.
+set(FFX_TAG v2.4.0)
+set(FFX_DIR ${CMAKE_BINARY_DIR}/fidelityfx)
+set(_ffx_url https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/${FFX_TAG}/Kits/FidelityFX)
+set(_ffx_files
+  api/include/ffx_api.h 4d9dcf243ef5efbf03340a02f16b51a22053243a22e8a9a0b3ce91c26982b4bf
+  api/include/ffx_api_types.h 53f07c113a9ba493f297656e4481b6539aed0afc9f3cc8da682aa477d270c46c
+  api/include/ffx_api_loader.h 18d1901dbbc881e8131b91c65ad44bb3b4a1de6c31435d5b75236f16727ba80e
+  api/include/dx12/ffx_api_dx12.h c9afbc3c4c673723e9e5369a666f0ff54560543b5a93537f8ff453bf1c3bf530
+  upscalers/include/ffx_upscale.h 13091e7fe5fd9c82b1fb7c044b9f08f664d9653f599d2ea500738709236fca4d
+  signedbin/amd_fidelityfx_loader_dx12.dll e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb
+  signedbin/amd_fidelityfx_upscaler_dx12.dll aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace
+  docs/license.md 32357259b965d6a8001e9e508ba60eda6034027c5923a7d226ffbaff813c2bfb)
+set(HELSARI_FFX ON)
+list(LENGTH _ffx_files _n)
+math(EXPR _last "${_n} - 1")
+foreach(_i RANGE 0 ${_last} 2)
+  math(EXPR _j "${_i} + 1")
+  list(GET _ffx_files ${_i} _path)
+  list(GET _ffx_files ${_j} _hash)
+  set(_have "")
+  if(EXISTS ${FFX_DIR}/${_path})
+    file(SHA256 ${FFX_DIR}/${_path} _have)
+  endif()
+  if(NOT _have STREQUAL _hash)
+    message(STATUS "FidelityFX ${FFX_TAG}: downloading ${_path}")
+    file(DOWNLOAD ${_ffx_url}/${_path} ${FFX_DIR}/${_path} EXPECTED_HASH SHA256=${_hash} STATUS _st)
+    list(GET _st 0 _code)
+    if(NOT _code EQUAL 0)
+      message(WARNING "FidelityFX: ${_path} could not be downloaded (${_st}): building without FSR")
+      set(HELSARI_FFX OFF)
+    endif()
+  endif()
+endforeach()
+if(HELSARI_FFX)
+  target_include_directories(helsari PRIVATE ${FFX_DIR})
+  target_compile_definitions(helsari PRIVATE HELSARI_FFX=1)
+  add_custom_command(TARGET helsari POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFX_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll
+            ${FFX_DIR}/signedbin/amd_fidelityfx_upscaler_dx12.dll $<TARGET_FILE_DIR:helsari>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFX_DIR}/docs/license.md $<TARGET_FILE_DIR:helsari>/FidelityFX-license.md)
+endif()
 if(MINGW)
   target_link_options(helsari PRIVATE -static)
 else()

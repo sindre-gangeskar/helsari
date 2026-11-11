@@ -14,7 +14,7 @@
 #include <atomic>
 #include <set>
 #include <windows.h>
-#include <d3d11_1.h>
+#include "gpu.h"
 #include <dxgi1_6.h>
 #include <psapi.h>
 #include <d3dcompiler.h>
@@ -79,10 +79,10 @@ namespace {
 template <class T> void release(T *&p) { if (p) { p->Release(); p = nullptr; } }
 
 HWND g_hwnd;
-ID3D11Device *g_dev;
-ID3D11DeviceContext *g_ctx;
-IDXGISwapChain *g_swap;
-ID3D11RenderTargetView *g_backbuffer;
+gpu::Device *g_dev;
+gpu::Context *g_ctx;
+gpu::Swap *g_swap;
+gpu::RTV *g_backbuffer;
 bool g_ok;
 
 /* ---------------- state tracked from methods ---------------- */
@@ -120,21 +120,21 @@ int g_dump_frame = getenv("HELSARI_DUMP_RT") ? atoi(getenv("HELSARI_DUMP_RT")) :
 int g_step_dumps;   // per-draw dumps taken in the current capture
 
 /* ---------------- shaders ---------------- */
-ID3D11VertexShader *g_present_vs;
-ID3D11PixelShader *g_present_ps;
-ID3D11PixelShader *g_depth_color_ps;    // depth -> RSX D24S8 bytes as A8R8G8B8
-ID3D11PixelShader *g_depth_copy_ps;     // depth texture -> SV_Depth (proxy copies)
-ID3D11DepthStencilState *g_ds_always;   // depth test always, write on
-ID3D11PixelShader *g_reinterpret_ps;    // A8R8G8B8 texels -> another 32-bit texture format
-ID3D11Buffer *g_cb_pass;                // mode constant for the conversion passes
-ID3D11Buffer *g_cb_unit_uv;             // uvscale (1, 1) for g_present_vs in run_pass
-std::unordered_map<uint64_t, ID3D11VertexShader *> g_vs;
+gpu::VertexShader *g_present_vs;
+gpu::PixelShader *g_present_ps;
+gpu::PixelShader *g_depth_color_ps;    // depth -> RSX D24S8 bytes as A8R8G8B8
+gpu::PixelShader *g_depth_copy_ps;     // depth texture -> SV_Depth (proxy copies)
+gpu::DepthStencilState *g_ds_always;   // depth test always, write on
+gpu::PixelShader *g_reinterpret_ps;    // A8R8G8B8 texels -> another 32-bit texture format
+gpu::Buffer *g_cb_pass;                // mode constant for the conversion passes
+gpu::Buffer *g_cb_unit_uv;             // uvscale (1, 1) for g_present_vs in run_pass
+std::unordered_map<uint64_t, gpu::VertexShader *> g_vs;
 std::unordered_map<uint64_t, std::string> g_vs_hlsl;   // translated source, for the frame capture
 struct VsWin { uint16_t lo_base = 0, lo_count = 512, hi_base = 0, hi_count = 0; };
 std::unordered_map<uint64_t, VsWin> g_vs_win;          // constant windows per shader (VpInfo)
 VsWin g_cur_win;                                        // of the current draw's shader
 std::unordered_map<uint64_t, bool> g_vs_dumped;
-struct PsEntry { ID3D11PixelShader *ps; std::vector<uint32_t> consts; std::string hlsl; uint32_t control; bool dumped; };
+struct PsEntry { gpu::PixelShader *ps; std::vector<uint32_t> consts; std::string hlsl; uint32_t control; bool dumped; };
 std::unordered_map<uint64_t, PsEntry> g_ps;
 
 ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
@@ -187,11 +187,11 @@ ID3DBlob *compile(const std::string &src, const char *target, uint64_t hash) {
 
 /* ---------------- dynamic buffers ---------------- */
 struct DynBuf {
-    ID3D11Buffer *buf = nullptr;
-    ID3D11ShaderResourceView *srv = nullptr;
+    gpu::Buffer *buf = nullptr;
+    gpu::SRV *srv = nullptr;
     UINT size = 0;
 };
-ID3D11Buffer *g_cb_vc, *g_cb_vx, *g_cb_px;
+gpu::Buffer *g_cb_vc, *g_cb_vx, *g_cb_px;
 
 void *map_buf(DynBuf &b, UINT size, UINT bind, bool structured) {
     if (size > b.size) {
@@ -250,17 +250,17 @@ void *ring_map(Ring &r, UINT bytes, UINT unit, UINT bind, bool structured, UINT 
     return p;
 }
 
-ID3D11Buffer *make_cb(UINT size) {
+gpu::Buffer *make_cb(UINT size) {
     D3D11_BUFFER_DESC d{};
     d.ByteWidth = size;
     d.Usage = D3D11_USAGE_DYNAMIC;
     d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    ID3D11Buffer *b = nullptr;
+    gpu::Buffer *b = nullptr;
     g_dev->CreateBuffer(&d, nullptr, &b);
     return b;
 }
-void upload_cb(ID3D11Buffer *b, const void *data, size_t n) {
+void upload_cb(gpu::Buffer *b, const void *data, size_t n) {
     D3D11_MAPPED_SUBRESOURCE m;
     g_ctx->Map(b, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
     memcpy(m.pData, data, n);
@@ -272,8 +272,7 @@ void upload_cb(ID3D11Buffer *b, const void *data, size_t n) {
 // every draw (~1700 per frame, 8 KB each) made the driver allocate fresh
 // memory each time, which it kept: the process grew ~30 MB per frame.
 struct CbSlice { UINT first = 0, num = 0, gen = ~0u; };
-ID3D11DeviceContext1 *g_ctx1;
-ID3D11Buffer *g_cbring;
+gpu::Buffer *g_cbring;
 UINT g_cbring_pos, g_cbring_gen;
 constexpr UINT CBRING_SIZE = 16 << 20;
 // The ring stays mapped across a draw's pushes (one Map/Unmap per draw instead of
@@ -304,28 +303,28 @@ CbSlice cb_push(const void *data, size_t n) {
 struct Surface {
     uint32_t ea = 0, fmt = 0, w = 0, h = 0;
     bool depth = false;
-    ID3D11Texture2D *tex = nullptr;
-    ID3D11RenderTargetView *rtv = nullptr;
-    ID3D11DepthStencilView *dsv = nullptr;
-    ID3D11ShaderResourceView *srv = nullptr;
-    ID3D11Texture2D *copy = nullptr;            // snapshot for read-while-render
-    ID3D11ShaderResourceView *copy_srv = nullptr;
+    gpu::Texture2D *tex = nullptr;
+    gpu::RTV *rtv = nullptr;
+    gpu::DSV *dsv = nullptr;
+    gpu::SRV *srv = nullptr;
+    gpu::Texture2D *copy = nullptr;            // snapshot for read-while-render
+    gpu::SRV *copy_srv = nullptr;
     uint64_t copy_serial = 0;                   // the drawn_serial the snapshot holds
     uint32_t last_frame = 0;
     uint32_t pitch = 0;                         // bytes per row in guest memory
     bool dirty = false;                         // rendered to since last written back
-    ID3D11Texture2D *staging = nullptr;         // CPU-readable copy for write-back
+    gpu::Texture2D *staging = nullptr;         // CPU-readable copy for write-back
     // Depth surface read as an A8R8G8B8 texture (the D24S8 bytes), see depth_as_color().
-    ID3D11Texture2D *as_color = nullptr;
-    ID3D11RenderTargetView *as_color_rtv = nullptr;
-    ID3D11ShaderResourceView *as_color_srv = nullptr;
+    gpu::Texture2D *as_color = nullptr;
+    gpu::RTV *as_color_rtv = nullptr;
+    gpu::SRV *as_color_srv = nullptr;
     uint64_t as_color_serial = 0;               // the drawn_serial it was converted from
     // Colour surface read through a texture format with another layout, see reinterpret_view().
     uint32_t view_fmt = 0;
     uint64_t view_serial = 0;                   // the drawn_serial it was converted from
-    ID3D11Texture2D *view = nullptr;
-    ID3D11RenderTargetView *view_rtv = nullptr;
-    ID3D11ShaderResourceView *view_srv = nullptr;
+    gpu::Texture2D *view = nullptr;
+    gpu::RTV *view_rtv = nullptr;
+    gpu::SRV *view_srv = nullptr;
     // A draw may bind targets of different sizes (RSX: memory with a pitch, the draw
     // covers the top-left of each); D3D11 binds none of them then. The draw renders
     // into a draw-sized stand-in instead, see bind_surfaces().
@@ -337,18 +336,18 @@ struct Surface {
     // a GPU copy of that region, refreshed when the surface changed (sub_view()).
     uint32_t sub_w = 0, sub_h = 0;
     uint64_t sub_serial = 0;
-    ID3D11Texture2D *sub_tex = nullptr;
-    ID3D11ShaderResourceView *sub_srv = nullptr;
+    gpu::Texture2D *sub_tex = nullptr;
+    gpu::SRV *sub_srv = nullptr;
     uint32_t res = 1;   // internal resolution scale
-    ID3D11Texture2D *ring[3] = {};              // copies on their way back to guest memory (write_back_surface)
+    gpu::Texture2D *ring[3] = {};              // copies on their way back to guest memory (write_back_surface)
     int ring_first = 0, ring_count = 0;
     bool ring_stored = false;
-    ID3D11RenderTargetView *sub_rtv = nullptr;
+    gpu::RTV *sub_rtv = nullptr;
 };
 
 // The RSX lets a shader sample the surface it is rendering to; D3D11 does
 // not. Sample a snapshot taken just before the draw instead.
-ID3D11ShaderResourceView *snapshot(Surface &s) {
+gpu::SRV *snapshot(Surface &s) {
     if (!s.copy) {
         D3D11_TEXTURE2D_DESC d;
         s.tex->GetDesc(&d);
@@ -488,8 +487,8 @@ struct Bound {
     Surface *color[4] = {};
     Surface *depth = nullptr;
     uint32_t w = 0, h = 0;
-    ID3D11RenderTargetView *rtv[4] = {};   // the views bound (a proxy's when proxied)
-    ID3D11DepthStencilView *dsv = nullptr;
+    gpu::RTV *rtv[4] = {};   // the views bound (a proxy's when proxied)
+    gpu::DSV *dsv = nullptr;
     bool proxied[5] = {};                  // colour 0-3, depth
 };
 
@@ -501,13 +500,13 @@ const bool g_gpu_by_shader = g_gpu_timing && atoi(getenv("HELSARI_GPU_TIMING")) 
 std::map<uint64_t, uint32_t> g_gpu_draws;   // draws per key, by_shader mode
 std::map<uint32_t, uint64_t> g_gpu_shader_names;   // key low word -> pixel shader hash
 struct GpuFrame {
-    ID3D11Query *disjoint = nullptr;
-    std::vector<std::pair<ID3D11Query *, uint64_t>> marks;
+    gpu::Query *disjoint = nullptr;
+    std::vector<std::pair<gpu::Query *, uint64_t>> marks;
     int state = 0;      // 0 free, 1 recording, 2 waiting for the GPU
 };
 GpuFrame g_gpu_frames[8];
 int g_gpu_write, g_gpu_read, g_gpu_n;
-std::vector<ID3D11Query *> g_gpu_pool;
+std::vector<gpu::Query *> g_gpu_pool;
 uint64_t g_gpu_last = ~0ull;
 std::map<uint64_t, double> g_gpu_ms;
 double g_gpu_total;
@@ -522,7 +521,7 @@ void gpu_mark(uint64_t key) {
         g_ctx->Begin(f.disjoint);
         f.state = 1;
     }
-    ID3D11Query *q = nullptr;
+    gpu::Query *q = nullptr;
     if (!g_gpu_pool.empty()) q = g_gpu_pool.back(), g_gpu_pool.pop_back();
     else {
         D3D11_QUERY_DESC d{D3D11_QUERY_TIMESTAMP, 0};
@@ -646,7 +645,7 @@ Bound bind_surfaces() {
     Surface *first = nullptr;
     for (auto *x : all)
         if (x) { if (!first) first = x; else if (x->w != first->w || x->h != first->h) mismatch = true; }
-    ID3D11ShaderResourceView *none[16] = {};
+    gpu::SRV *none[16] = {};
     g_ctx->PSSetShaderResources(0, 16, none);   // a bound surface must not also be bound as a texture
     for (int i = 0; i < 5; i++) {
         Surface *x = all[i];
@@ -668,8 +667,8 @@ Bound bind_surfaces() {
 
 /* ---------------- textures ---------------- */
 struct Tex {
-    ID3D11Texture2D *tex = nullptr;
-    ID3D11ShaderResourceView *srv = nullptr;
+    gpu::Texture2D *tex = nullptr;
+    gpu::SRV *srv = nullptr;
     uint64_t content = 0;
     uint32_t checked_frame = ~0u;
     double last_used = 0;          // g_flip_time when last bound
@@ -891,16 +890,16 @@ void write_back_surface(uint32_t ea, Surface &s) {
 // Full-screen conversion pass from src into dst (w x h) with pixel shader ps
 // and a mode constant. Runs while a draw is being set up, so the bound
 // targets and viewport are restored (everything else is set again later).
-void run_pass(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, uint32_t w, uint32_t h,
-              ID3D11PixelShader *ps, uint32_t mode = 0) {
-    ID3D11RenderTargetView *rtv[4];
-    ID3D11DepthStencilView *dsv;
+void run_pass(gpu::SRV *src, gpu::RTV *dst, uint32_t w, uint32_t h,
+              gpu::PixelShader *ps, uint32_t mode = 0) {
+    gpu::RTV *rtv[4];
+    gpu::DSV *dsv;
     g_ctx->OMGetRenderTargets(4, rtv, &dsv);
     UINT nvp = 1;
     D3D11_VIEWPORT vp;
     g_ctx->RSGetViewports(&nvp, &vp);
 
-    ID3D11ShaderResourceView *none[16] = {};
+    gpu::SRV *none[16] = {};
     g_ctx->PSSetShaderResources(0, 16, none);
     g_ctx->OMSetRenderTargets(1, &dst, nullptr);
     D3D11_VIEWPORT cv{0, 0, (float)w, (float)h, 0, 1};
@@ -935,11 +934,11 @@ void run_pass(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, uint32
 // The game's HUD icon atlas with its button cells repainted (keybinds.cpp). Null for any other texture
 // of that size: it is known by its contents, since its address can differ. The game's DXT5 blocks
 // are decoded here once; only the bound keys change after that.
-ID3D11ShaderResourceView *hud_pc_atlas(uint32_t ea) {
+gpu::SRV *hud_pc_atlas(uint32_t ea) {
     constexpr int W = 1024, H = 512;
     constexpr uint64_t ATLAS_HASH = 0xa80cb0421082def4ull;
-    static ID3D11ShaderResourceView *view;
-    static ID3D11Texture2D *texture;
+    static gpu::SRV *view;
+    static gpu::Texture2D *texture;
     static std::vector<uint8_t> original;
     static int painted = -1, checked_frame = -1;
     const int paint = keybind_generation() * 4 + (int)keybind_prompts();
@@ -997,8 +996,8 @@ ID3D11ShaderResourceView *hud_pc_atlas(uint32_t ea) {
     return view;
 }
 
-ID3D11ShaderResourceView *black_cube() {
-    static ID3D11ShaderResourceView *srv;
+gpu::SRV *black_cube() {
+    static gpu::SRV *srv;
     if (!srv) {
         D3D11_TEXTURE2D_DESC d{};
         d.Width = d.Height = 1, d.MipLevels = 1, d.ArraySize = 6, d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1006,23 +1005,23 @@ ID3D11ShaderResourceView *black_cube() {
         uint32_t zero[6] = {};
         D3D11_SUBRESOURCE_DATA sd[6];
         for (int f = 0; f < 6; f++) sd[f] = {&zero[f], 4, 0};
-        ID3D11Texture2D *t = nullptr;
+        gpu::Texture2D *t = nullptr;
         g_dev->CreateTexture2D(&d, sd, &t);
         g_dev->CreateShaderResourceView(t, nullptr, &srv);
         t->Release();
     }
     return srv;
 }
-ID3D11PixelShader *g_cube_face_ps;
-bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, ID3D11Texture2D *&tex, ID3D11RenderTargetView *&rtv,
-                 ID3D11ShaderResourceView *&srv);
-void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map);
-void dump_cube(ID3D11ShaderResourceView *cube, uint32_t ea) {
+gpu::PixelShader *g_cube_face_ps;
+bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, gpu::Texture2D *&tex, gpu::RTV *&rtv,
+                 gpu::SRV *&srv);
+void dump_srv(gpu::SRV *v, const char *path, bool signed_map);
+void dump_cube(gpu::SRV *cube, uint32_t ea) {
     static std::set<uint32_t> done;
     static uint32_t frame;
     if (frame != g_frame) done.clear(), frame = g_frame;
     if (!g_cube_face_ps || !done.insert(ea).second) return;
-    static ID3D11Texture2D *tex; static ID3D11RenderTargetView *rtv; static ID3D11ShaderResourceView *srv;
+    static gpu::Texture2D *tex; static gpu::RTV *rtv; static gpu::SRV *srv;
     if (!tex && !make_target(128, 128, DXGI_FORMAT_R8G8B8A8_UNORM, tex, rtv, srv)) return;
     for (uint32_t f = 0; f < 6; f++) {
         run_pass(cube, rtv, 128, 128, g_cube_face_ps, f);
@@ -1035,14 +1034,14 @@ void dump_cube(ID3D11ShaderResourceView *cube, uint32_t ea) {
 // Depth copy for proxies (see copy_region): a full-screen pass over the top-left
 // w x h of dst writes the source depth. Bound targets and viewport are restored.
 void copy_depth_region(Surface &dst, Surface &src, uint32_t w, uint32_t h) {
-    ID3D11RenderTargetView *rtv[4];
-    ID3D11DepthStencilView *dsv;
+    gpu::RTV *rtv[4];
+    gpu::DSV *dsv;
     g_ctx->OMGetRenderTargets(4, rtv, &dsv);
     UINT nvp = 1;
     D3D11_VIEWPORT vp;
     g_ctx->RSGetViewports(&nvp, &vp);
 
-    ID3D11ShaderResourceView *none[16] = {};
+    gpu::SRV *none[16] = {};
     g_ctx->PSSetShaderResources(0, 16, none);
     g_ctx->OMSetRenderTargets(0, nullptr, dst.dsv);
     D3D11_VIEWPORT cv{0, 0, (float)w, (float)h, 0, 1};
@@ -1065,8 +1064,8 @@ void copy_depth_region(Surface &dst, Surface &src, uint32_t w, uint32_t h) {
 }
 
 // A render target texture of w x h in format f, with views.
-bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, ID3D11Texture2D *&tex, ID3D11RenderTargetView *&rtv,
-                 ID3D11ShaderResourceView *&srv) {
+bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, gpu::Texture2D *&tex, gpu::RTV *&rtv,
+                 gpu::SRV *&srv) {
     D3D11_TEXTURE2D_DESC d{};
     d.Width = w, d.Height = h, d.MipLevels = 1, d.ArraySize = 1, d.SampleDesc.Count = 1;
     d.Format = f;
@@ -1081,7 +1080,7 @@ bool make_target(uint32_t w, uint32_t h, DXGI_FORMAT f, ID3D11Texture2D *&tex, I
 // 24-bit depth from its bytes. In memory a D24S8 word is depth[23:16],
 // depth[15:8], depth[7:0], stencil, i.e. A, R, G, B. Render that encoding
 // into a colour texture (stencil reads as 0).
-ID3D11ShaderResourceView *depth_as_color(Surface &s) {
+gpu::SRV *depth_as_color(Surface &s) {
     if (!s.as_color && !make_target(s.w, s.h, DXGI_FORMAT_R8G8B8A8_UNORM, s.as_color, s.as_color_rtv, s.as_color_srv))
         return nullptr;
     // A full-surface pass: only when the depth changed since the last one. Deferred lights read
@@ -1096,7 +1095,7 @@ ID3D11ShaderResourceView *depth_as_color(Surface &s) {
 // it as the texture format would. The game packs two half floats per pixel
 // into an A8R8G8B8 G-buffer target and reads them back as Y16_X16_FLOAT.
 bool reinterpretable(uint32_t base) { return base == 0x9f || base == 0x95 || base == 0x9c; }
-ID3D11ShaderResourceView *reinterpret_view(Surface &s, uint32_t base) {
+gpu::SRV *reinterpret_view(Surface &s, uint32_t base) {
     if (s.view_fmt != base) {
         release(s.view_srv), release(s.view_rtv), release(s.view);
         s.view_fmt = 0;
@@ -1126,14 +1125,14 @@ bool same_layout(uint32_t sfmt, uint32_t base) {
 // the whole surface back to guest memory (a CPU stall on the GPU queue) and decoding the
 // region from there. Colour surfaces: a region copy in the surface's format. 16-bit depth
 // read as X16: a pass writing the depth into all four channels (as decode() does).
-ID3D11PixelShader *g_depth_x16_ps;
+gpu::PixelShader *g_depth_x16_ps;
 // Host texels across a surface read as w x h. The game reads its multisampled targets as 2560x720,
 // with its samples side by side; here they have one sample per pixel, so that width is half.
 uint32_t surface_width(const Surface &s, uint32_t w, uint32_t h) {
     return w == 2560 && h == 720 ? 1280 * s.res : w * s.res;
 }
 
-ID3D11ShaderResourceView *sub_view(Surface &s, uint32_t w, uint32_t h) {
+gpu::SRV *sub_view(Surface &s, uint32_t w, uint32_t h) {
     w = surface_width(s, w, h), h *= s.res;
     if (s.sub_w != w || s.sub_h != h || !s.sub_tex) {
         release(s.sub_srv), release(s.sub_rtv), release(s.sub_tex);
@@ -1152,7 +1151,7 @@ ID3D11ShaderResourceView *sub_view(Surface &s, uint32_t w, uint32_t h) {
     return s.sub_srv;
 }
 
-ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
+gpu::SRV *get_texture(int unit, TexDim &dim) {
     uint32_t b = 0x1a00 + unit * 32;
     uint32_t off = reg(b), fmtreg = reg(b + 4), rect = reg(b + 0x18);
     uint32_t loc = (fmtreg & 3) == 2 ? 1 : 0;
@@ -1203,12 +1202,12 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
             covers(s->second) && !holds(s->second) &&
             same_layout(s->second.fmt, base) && color_format(s->second.fmt) != DXGI_FORMAT_UNKNOWN) {
             trace("GPU region copy of the colour surface");
-            if (ID3D11ShaderResourceView *v = sub_view(s->second, w, h)) return v;
+            if (gpu::SRV *v = sub_view(s->second, w, h)) return v;
         }
         if (subrect && (fmt & 0x20) && base == 0x94 && ds != g_depth_surfaces.end() && ds->second.fmt == 1 &&
             pitch == ds->second.pitch && covers(ds->second)) {
             trace("GPU region copy of the Z16 depth surface");
-            if (ID3D11ShaderResourceView *v = sub_view(ds->second, w, h)) return v;
+            if (gpu::SRV *v = sub_view(ds->second, w, h)) return v;
         }
         if (s != g_surfaces.end()) {
             Surface &rt = s->second;
@@ -1317,9 +1316,9 @@ ID3D11ShaderResourceView *get_texture(int unit, TexDim &dim) {
     return t.srv;
 }
 
-std::unordered_map<uint64_t, ID3D11SamplerState *> g_samplers;
+std::unordered_map<uint64_t, gpu::SamplerState *> g_samplers;
 // shadow: depth texture compared against the lookup z with the address register's zfunc.
-ID3D11SamplerState *get_sampler(int unit, bool shadow) {
+gpu::SamplerState *get_sampler(int unit, bool shadow) {
     uint32_t b = 0x1a00 + unit * 32;
     uint32_t addr = reg(b + 8), filt = reg(b + 0x14), ctl0 = reg(b + 0x0c);
     uint64_t key = hfast(&ctl0, 4, hfast(&filt, 4, ((uint64_t)addr << 32) | shadow));
@@ -1368,7 +1367,7 @@ ID3D11SamplerState *get_sampler(int unit, bool shadow) {
     static const uint8_t mirror[8] = {0, 4, 2, 6, 1, 5, 3, 7};
     uint32_t zf = addr >> 28;
     d.ComparisonFunc = shadow ? (D3D11_COMPARISON_FUNC)((cmp_raw ? zf : mirror[zf]) + 1) : D3D11_COMPARISON_NEVER;
-    ID3D11SamplerState *s = nullptr;
+    gpu::SamplerState *s = nullptr;
     g_dev->CreateSamplerState(&d, &s);
     g_samplers[key] = s;
     return s;
@@ -1420,9 +1419,9 @@ D3D11_STENCIL_OP sop(uint32_t o) {
     }
 }
 
-std::unordered_map<uint64_t, ID3D11BlendState *> g_blend;
-std::unordered_map<uint64_t, ID3D11DepthStencilState *> g_depth;
-std::unordered_map<uint64_t, ID3D11RasterizerState *> g_raster;
+std::unordered_map<uint64_t, gpu::BlendState *> g_blend;
+std::unordered_map<uint64_t, gpu::DepthStencilState *> g_depth;
+std::unordered_map<uint64_t, gpu::RasterizerState *> g_raster;
 
 int g_draw_logged_frame = -1;
 void apply_state() {
@@ -1597,7 +1596,7 @@ D3D11_PRIMITIVE_TOPOLOGY gen_indices(uint32_t prim, const uint32_t *idx, uint32_
 
 /* ---------------- shaders for a draw ---------------- */
 uint64_t g_vs_hash;   // of the program used by the current draw (frame capture log)
-ID3D11VertexShader *vertex_shader() {
+gpu::VertexShader *vertex_shader() {
     uint32_t start = reg(0x1ea0) & 511;
     uint64_t h = 1469598103934665603ull;
     for (uint32_t i = start; i < 512; i++) {
@@ -1618,7 +1617,7 @@ ID3D11VertexShader *vertex_shader() {
     auto it = g_vs.find(h);
     if (it != g_vs.end()) { g_cur_win = g_vs_win[h]; return it->second; }
     VpInfo vi = translate_vp(start, afmt);
-    ID3D11VertexShader *vs = nullptr;
+    gpu::VertexShader *vs = nullptr;
     if (ID3DBlob *b = compile(vi.hlsl, "vs_5_0", h)) {
         g_dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &vs);
         b->Release();
@@ -1675,7 +1674,7 @@ void dump_surface(Surface &s, const char *name, bool alpha = false) {
     D3D11_TEXTURE2D_DESC d;
     s.tex->GetDesc(&d);
     d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Texture2D *st = nullptr;
+    gpu::Texture2D *st = nullptr;
     g_dev->CreateTexture2D(&d, nullptr, &st);
     g_ctx->CopyResource(st, s.tex);
     D3D11_MAPPED_SUBRESOURCE m;
@@ -1714,15 +1713,14 @@ void dump_surface(Surface &s, const char *name, bool alpha = false) {
 // Capture: write any 2D texture view to a BMP as the shaders see it (first slice,
 // first mip). 8-bit colour as is; float formats clamped to [0,1]; depth as grey.
 int g_pass_dumps;
-void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = false) {
+void dump_srv(gpu::SRV *v, const char *path, bool signed_map = false) {
     if (!v) return;
     D3D11_SHADER_RESOURCE_VIEW_DESC vd;
     v->GetDesc(&vd);
-    ID3D11Resource *res = nullptr;
+    gpu::Resource *res = nullptr;
     v->GetResource(&res);
-    ID3D11Texture2D *tex = nullptr;
-    if (!res || FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) { release(res); return; }
-    res->Release();
+    gpu::Texture2D *tex = gpu::as_texture(res);
+    if (!tex) { release(res); return; }
     D3D11_TEXTURE2D_DESC d;
     tex->GetDesc(&d);
     DXGI_FORMAT f = vd.Format;
@@ -1733,7 +1731,7 @@ void dump_srv(ID3D11ShaderResourceView *v, const char *path, bool signed_map = f
     D3D11_TEXTURE2D_DESC sd = d;
     sd.MipLevels = 1, sd.ArraySize = 1, sd.Usage = D3D11_USAGE_STAGING, sd.BindFlags = 0, sd.MiscFlags = 0;
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Texture2D *st = nullptr;
+    gpu::Texture2D *st = nullptr;
     if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &st))) { tex->Release(); return; }
     g_ctx->CopySubresourceRegion(st, 0, 0, 0, 0, tex, 0, nullptr);
     tex->Release();
@@ -1811,16 +1809,16 @@ inline void lap(int i) { uint64_t n = host_now_ns(); g_seg_ns[i] += n - g_seg_t;
    (polled every draw, forced at the flip), and the value is written to the report
    area when known. The game fades light sprites (coronas) by these counts; answering
    "always visible" drew them through walls. HELSARI_REPORT_VISIBLE=1: the old answer. */
-std::vector<ID3D11Query *> g_occ_since_clear;   // ended stretches since the last clear
-ID3D11Query *g_occ_active = nullptr;            // current stretch, while counting is on
+std::vector<gpu::Query *> g_occ_since_clear;   // ended stretches since the last clear
+gpu::Query *g_occ_active = nullptr;            // current stretch, while counting is on
 bool g_occ_enabled = false;
-struct PendingReport { uint32_t ea; std::vector<ID3D11Query *> queries; uint64_t sum = 0; size_t done = 0; };
+struct PendingReport { uint32_t ea; std::vector<gpu::Query *> queries; uint64_t sum = 0; size_t done = 0; };
 std::vector<PendingReport> g_reports;
-std::vector<ID3D11Query *> g_query_pool;
-std::unordered_map<ID3D11Query *, int> g_query_refs;   // a query can serve several reports
+std::vector<gpu::Query *> g_query_pool;
+std::unordered_map<gpu::Query *, int> g_query_refs;   // a query can serve several reports
 uint64_t g_occ_reports = 0, g_occ_visible = 0;         // per flip, for the log
-ID3D11Query *occ_new() {
-    ID3D11Query *q = nullptr;
+gpu::Query *occ_new() {
+    gpu::Query *q = nullptr;
     if (!g_query_pool.empty()) q = g_query_pool.back(), g_query_pool.pop_back();
     else {
         D3D11_QUERY_DESC d{D3D11_QUERY_OCCLUSION, 0};
@@ -1828,7 +1826,7 @@ ID3D11Query *occ_new() {
     }
     return q;
 }
-void occ_unref(ID3D11Query *q) { if (--g_query_refs[q] <= 0) g_query_refs.erase(q), g_query_pool.push_back(q); }
+void occ_unref(gpu::Query *q) { if (--g_query_refs[q] <= 0) g_query_refs.erase(q), g_query_pool.push_back(q); }
 void occ_end_active() {
     if (!g_occ_active) return;
     g_ctx->End(g_occ_active);
@@ -1842,7 +1840,7 @@ void occ_begin() {
 }
 void occ_clear() {
     occ_end_active();
-    for (ID3D11Query *q : g_occ_since_clear) occ_unref(q);
+    for (gpu::Query *q : g_occ_since_clear) occ_unref(q);
     g_occ_since_clear.clear();
     occ_begin();
 }
@@ -1866,7 +1864,7 @@ void occ_poll(bool wait) {
         if (r.done < r.queries.size()) { i++; continue; }
         write_report(r.ea, (uint32_t)std::min<uint64_t>(r.sum, 0xffffffffu));
         g_occ_reports++, g_occ_visible += r.sum != 0;
-        for (ID3D11Query *q : r.queries) occ_unref(q);
+        for (gpu::Query *q : r.queries) occ_unref(q);
         g_reports[i] = std::move(g_reports.back());
         g_reports.pop_back();
     }
@@ -2080,13 +2078,13 @@ void draw() {
 
     lap(1);
     // shaders
-    ID3D11VertexShader *vs = vertex_shader();
+    gpu::VertexShader *vs = vertex_shader();
     lap(7);
     uint32_t sp = reg(0x08e4);
     uint32_t fp_ea = ea_for((sp & 3) == 2 ? 1 : 0, sp & ~3u);
     uint8_t texdim[16] = {};
-    ID3D11ShaderResourceView *srv[16] = {};
-    ID3D11SamplerState *smp[16] = {};
+    gpu::SRV *srv[16] = {};
+    gpu::SamplerState *smp[16] = {};
     // Games leave textures enabled that the program never samples (the game keeps
     // its G-buffer bound while rendering into it); binding one costs a decode, a
     // readback or a snapshot copy of a render target, so bind only sampled units.
@@ -2541,13 +2539,13 @@ void draw() {
     apply_state();
     g_ctx->VSSetShader(vs, nullptr, 0);
     g_ctx->PSSetShader(ps->ps, nullptr, 0);
-    ID3D11Buffer *vcb[2] = {g_cb_vc, g_cb_vx};
+    gpu::Buffer *vcb[2] = {g_cb_vc, g_cb_vx};
     if (g_cbring) {
         cb_flush();
-        ID3D11Buffer *rings[3] = {g_cbring, g_cbring, g_cbring};
+        gpu::Buffer *rings[3] = {g_cbring, g_cbring, g_cbring};
         UINT first[3] = {s_vc.first, s_vx.first, s_vch.first}, num[3] = {s_vc.num, s_vx.num, s_vch.num};
-        g_ctx1->VSSetConstantBuffers1(0, 3, rings, first, num);
-        g_ctx1->PSSetConstantBuffers1(0, 1, &g_cbring, &s_px.first, &s_px.num);
+        g_ctx->VSSetConstantBuffers1(0, 3, rings, first, num);
+        g_ctx->PSSetConstantBuffers1(0, 1, &g_cbring, &s_px.first, &s_px.num);
     } else {
         g_ctx->VSSetConstantBuffers(0, 2, vcb);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb_px);
@@ -2572,7 +2570,7 @@ void draw() {
     if (reg(0x1a18) == 0x04000200u && reg(0x1a04) == 0x00018829u)
     {
         const uint32_t atlas = ea_for((reg(0x1a04) & 3) == 2, reg(0x1a00));
-        if (ID3D11ShaderResourceView *pc = hud_pc_atlas(atlas))
+        if (gpu::SRV *pc = hud_pc_atlas(atlas))
         {
             if (keybind_prompts() != PROMPTS_PLAYSTATION)
                 srv[0] = pc;
@@ -2711,9 +2709,9 @@ void draw() {
 }
 
 /* ---------------- present ---------------- */
-ID3D11Texture2D *g_cpu_tex;
-ID3D11ShaderResourceView *g_cpu_srv;
-ID3D11SamplerState *g_present_smp;
+gpu::Texture2D *g_cpu_tex;
+gpu::SRV *g_cpu_srv;
+gpu::SamplerState *g_present_smp;
 
 const char *PRESENT_HLSL =
     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
@@ -2722,12 +2720,13 @@ const char *PRESENT_HLSL =
     "V vs(uint id : SV_VertexID) { V o; float2 q = float2((id << 1) & 2, id & 2); o.uv = q * uvscale.xy;\n"
     "  o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
     "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
-ID3D11Buffer *g_cb_present;
+gpu::Buffer *g_cb_present;
 
 } // namespace
 } // namespace rsx
 // Hybrid-graphics drivers (NVIDIA Optimus, AMD PowerXpress) run executables exporting
 // these on the discrete GPU.
+int pc_render_api();   // GRAPHICS menu (pc_options.cpp): 0 DX11, 1 DX12
 extern "C" {
 __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
@@ -2736,17 +2735,6 @@ namespace rsx {
 namespace {
 
 bool create_device() {
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 1;
-    sd.BufferDesc.Width = 1280, sd.BufferDesc.Height = 720;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = g_hwnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;  // blt model: stretches to the window, capturable
-    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    UINT flags = getenv("HELSARI_D3D_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0;
     // The default adapter is whatever Windows considers primary - often the integrated
     // GPU of an APU. Ask DXGI for the high-performance one (the discrete GPU).
     IDXGIAdapter1 *adapter = nullptr;
@@ -2763,22 +2751,22 @@ bool create_device() {
         WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof name, nullptr, nullptr);
         LOG("rsx", "GPU: %s (%llu MB video memory)", name, (unsigned long long)(ad.DedicatedVideoMemory >> 20));
     }
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-                                               nullptr, flags, &fl, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, nullptr,
-                                               &g_ctx);
+    // Options > Graphics > Rendering API (gpu.h: gpu_d3d11.cpp, gpu_d3d12.cpp). DX12 falls back to DX11.
+    const bool debug = getenv("HELSARI_D3D_DEBUG") != nullptr;
+    bool ok = false;
+    if (pc_render_api() == 1) {
+        ok = adapter && gpu::create_d3d12(adapter, g_hwnd, debug, &g_dev, &g_ctx, &g_swap);
+        if (!ok) LOG("rsx", "DX12 is not available: using DX11");
+    }
+    if (!ok) ok = gpu::create_d3d11(adapter, g_hwnd, debug, &g_dev, &g_ctx, &g_swap);
     if (adapter) {
         adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&g_adapter3);
         adapter->Release();
     }
-    if (FAILED(hr)) { LOG("rsx", "D3D11 device creation failed (0x%08lx)", hr); return false; }
-    D3D11_FEATURE_DATA_D3D11_OPTIONS opts{};
-    g_ring_ok = SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opts, sizeof opts)) &&
-                opts.MapNoOverwriteOnDynamicBufferSRV;
+    if (!ok) return false;
+    LOG("rsx", "rendering API: %s", g_dev->Name());
+    g_ring_ok = g_dev->NoOverwriteOnBufferSRV();
     if (!g_ring_ok) LOG("rsx", "driver lacks MapNoOverwriteOnDynamicBufferSRV: per-draw buffers are discarded (slow)");
-    ID3D11Texture2D *bb = nullptr;
-    g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
-    g_dev->CreateRenderTargetView(bb, nullptr, &g_backbuffer);
-    bb->Release();
     std::string src = PRESENT_HLSL;
     ID3DBlob *code = nullptr, *err = nullptr;
     D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &code, &err);
@@ -2858,12 +2846,10 @@ bool create_device() {
     g_dev->CreateSamplerState(&smp, &g_present_smp);
     g_cb_vc = make_cb(sizeof vp_consts);
     // Constant ring (see cb_push), when the driver supports offsets and NO_OVERWRITE on constant buffers.
-    if (opts.ConstantBufferOffsetting && opts.MapNoOverwriteOnDynamicConstantBuffer &&
-        SUCCEEDED(g_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&g_ctx1))) {
+    if (g_dev->ConstantBufferOffsets()) {
         g_cbring = make_cb(CBRING_SIZE);
         // constant windows need buffer offsets (D3D11.1). HELSARI_VS_WINDOWS=0: whole constant file.
         g_vp_windows = g_cbring != nullptr && (!getenv("HELSARI_VS_WINDOWS") || atoi(getenv("HELSARI_VS_WINDOWS")));
-        if (!g_cbring) release(g_ctx1);
     }
     if (!g_cbring) LOG("rsx", "driver lacks constant buffer offsets: constants are re-uploaded per draw");
     g_cb_vx = make_cb(sizeof(float) * (24 + 128));
@@ -2872,7 +2858,7 @@ bool create_device() {
     g_cb_unit_uv = make_cb(16);
     { float one[4] = {1, 1, 0, 0}; upload_cb(g_cb_unit_uv, one, sizeof one); }
     for (auto &a : g_vattr) a[0] = a[1] = a[2] = 0, a[3] = 1;
-    LOG("rsx", "Direct3D 11 renderer ready");
+    LOG("rsx", "renderer ready (%s)", g_dev->Name());
     return true;
 }
 } // namespace
@@ -2934,7 +2920,7 @@ void dump_surfaces() {
         // Also as the game reads its packed G-buffer target: two half floats per pixel
         // (Y16_X16_FLOAT, e.g. view-space normal X/Y), mapped -1..1 -> 0..255 in red/green.
         if (color_format(s.fmt) == DXGI_FORMAT_R8G8B8A8_UNORM && s.w >= 640)
-            if (ID3D11ShaderResourceView *v = reinterpret_view(s, 0x9f)) {
+            if (gpu::SRV *v = reinterpret_view(s, 0x9f)) {
                 char path[48];
                 snprintf(path, sizeof path, "rt_%08x_as_y16x16f.bmp", ea);
                 dump_srv(v, path, true);
@@ -3012,7 +2998,7 @@ std::string stats_line(uint32_t frames) {
         snprintf(sc, sizeof sc, "; scene draws per frame min %d avg %.0f max %d", g_scene_min,
                  (double)g_scene_sum / g_scene_frames, g_scene_max);
     g_scene_min = 1 << 30, g_scene_max = 0, g_scene_sum = 0, g_scene_frames = 0;
-    return std::string(b) + seg + sk + sc;
+    return std::string(b) + seg + sk + sc + g_dev->Stats(frames);
 }
 
 // Debug: HELSARI_SCREENSHOT=<sec> writes the presented frame, half size, to
@@ -3068,12 +3054,12 @@ void maybe_screenshot() {
     double now = (GetTickCount64() - t0) / 1000.0;
     if (now < next) return;
     next = now + interval;
-    ID3D11Resource *bb = nullptr;
+    gpu::Resource *bb = nullptr;
     g_backbuffer->GetResource(&bb);
     D3D11_TEXTURE2D_DESC d;
-    ((ID3D11Texture2D *)bb)->GetDesc(&d);
+    gpu::as_texture(bb)->GetDesc(&d);
     d.Usage = D3D11_USAGE_STAGING, d.BindFlags = 0, d.CPUAccessFlags = D3D11_CPU_ACCESS_READ, d.MiscFlags = 0;
-    ID3D11Texture2D *st = nullptr;
+    gpu::Texture2D *st = nullptr;
     if (SUCCEEDED(g_dev->CreateTexture2D(&d, nullptr, &st))) {
         g_ctx->CopyResource(st, bb);
         D3D11_MAPPED_SUBRESOURCE m;
@@ -3171,7 +3157,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         }
     }
     uint32_t ea = local_ea(offset);
-    ID3D11ShaderResourceView *src = nullptr;
+    gpu::SRV *src = nullptr;
     float uv[4] = {1, 1, 0, 0};
     auto it = g_surfaces.find(ea);
     if (it != g_surfaces.end() && !it->second.depth) {
@@ -3199,8 +3185,9 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         g_ctx->UpdateSubresource(g_cpu_tex, 0, nullptr, px.data(), width * 4, 0);
         src = g_cpu_srv;
     }
-    ID3D11ShaderResourceView *none[16] = {};
+    gpu::SRV *none[16] = {};
     g_ctx->PSSetShaderResources(0, 16, none);
+    g_backbuffer = g_swap->Backbuffer();
     g_ctx->OMSetRenderTargets(1, &g_backbuffer, nullptr);
     // keep the swapchain the size of the window's client area
     RECT cr;
@@ -3209,12 +3196,8 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
     UINT cw = std::max<LONG>(cr.right, 1), ch = std::max<LONG>(cr.bottom, 1);
     if (cw != bw || ch != bh) {
         g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
-        release(g_backbuffer);
-        g_swap->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
-        ID3D11Texture2D *bb = nullptr;
-        g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb);
-        g_dev->CreateRenderTargetView(bb, nullptr, &g_backbuffer);
-        bb->Release();
+        g_swap->Resize(cw, ch);
+        g_backbuffer = g_swap->Backbuffer();
         g_ctx->OMSetRenderTargets(1, &g_backbuffer, nullptr);
         bw = cw, bh = ch;
     }
@@ -3247,7 +3230,7 @@ void flip(uint32_t offset, uint32_t width, uint32_t height, uint32_t pitch) {
         g_occ_reports = g_occ_visible = 0;
     }
     extern bool pc_vsync();        // GRAPHICS menu (pc_options.cpp)
-    g_swap->Present(pc_vsync() ? 1 : 0, 0);
+    g_swap->Present(pc_vsync());
     gpu_frame_end();
     g_present_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -3330,7 +3313,7 @@ void method(uint32_t m, uint32_t arg) {
         if (type == 1 && g_ok && !zero && !visible) {
             occ_end_active();   // close the current stretch; counting continues in a new one
             PendingReport r{ea, g_occ_since_clear};
-            for (ID3D11Query *q : r.queries) g_query_refs[q]++;
+            for (gpu::Query *q : r.queries) g_query_refs[q]++;
             if (r.queries.empty()) write_report(ea, 0);
             else g_reports.push_back(std::move(r));
             occ_begin();

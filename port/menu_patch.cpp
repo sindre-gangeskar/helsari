@@ -239,6 +239,7 @@ namespace menu_patch
             out += row("F", 87, 904, "fps", 29);                  // FRAMERATE LIMIT
             out += slider_row("O", 116, 907, "fov", 29, 73, 110); // FIELD OF VIEW (slider: 73 to 110)
             out += row("B", 145, 908, "fx", 29);                  // SCREEN FX
+            out += row("A", 174, 930, "api", 29);                 // RENDERING API (group 930: 911-924 are the keys)
             out += end(900);
             out += list("lP", 203, 905) + row("S", 0, 906, "sway", 29) + row("I", 29, 909, "intro", 29) + end(905); // SWAY, INTRO MOVIE
             constexpr int ROW = 26;

@@ -70,6 +70,11 @@ namespace
     std::atomic<int> g_fov{0};
     std::atomic<int> g_sway{3};
     std::atomic<bool> g_skip_intro{false}; // the movie before the start screen
+    // Rendering API, chosen at start (the device is made once): 0 DX11, 1 DX12. A change shows
+    // "restart" until the next start.
+    const char *const RENDER_API[] = {"DX11", "DX12"};
+    std::atomic<int> g_render_api{0};
+    int g_render_api_running = -1;         // what this process runs, once the renderer asked
     std::atomic<uint32_t> g_L{0}; // Lua state of the page's script
     std::mutex g_lock;
 
@@ -77,15 +82,24 @@ namespace
     {
         if (FILE *f = fopen(SETTINGS_FILE, "w"))
         {
-            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\nskip_intro_movie=%d\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
-                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), g_fov.load(), SWAY[g_sway.load()], (int)g_skip_intro.load());
+            fprintf(f, "framerate_limit=%s\nresolution=%dx%d\nborderless=%d\nvsync=%d\nscreen_fx=%d\nfield_of_view=%d\nviewmodel_sway=%.2f\nskip_intro_movie=%d\nrender_api=%s\n", FPS[g_fps], RES[g_res].w, RES[g_res].h,
+                    g_borderless, (int)g_vsync.load(), g_screen_fx.load(), g_fov.load(), SWAY[g_sway.load()], (int)g_skip_intro.load(),
+                    RENDER_API[g_render_api.load()]);
             for (int i = 0; i < KEYBIND_COUNT; i++)
                 fprintf(f, "key_%s=%d\n", keybind_id(i), keybind_key(i));
             fclose(f);
         }
     }
 
+    // Read once, by whichever thread needs the settings first (the renderer may ask for the
+    // rendering API before the window thread loads the rest).
+    void load_file();
     void load()
+    {
+        static std::once_flag once;
+        std::call_once(once, load_file);
+    }
+    void load_file()
     {
         FILE *f = fopen(SETTINGS_FILE, "r");
         if (!f)
@@ -114,6 +128,10 @@ namespace
             else if (sscanf(line, "vsync=%d", &a) == 1)
             {
                 g_vsync = a != 0;
+            }
+            else if (sscanf(line, "render_api=%63s", s) == 1)
+            {
+                g_render_api = !strcmp(s, "DX12") ? 1 : 0;
             }
             else if (sscanf(line, "skip_intro_movie=%d", &a) == 1)
             {
@@ -240,6 +258,8 @@ namespace
                set_text("tM", g_borderless ? "WINDOW MODE: BORDERLESS" : "WINDOW MODE: WINDOWED") +
                set_text("tV", g_vsync ? "VSYNC: ON" : "VSYNC: OFF") +
                set_text("tB", std::string("SCREEN FX: ") + SCREEN_FX[g_screen_fx.load()]) + set_text("tO", fov) + set_text("tS", sway) +
+               set_text("tA", std::string("RENDERING API: ") + RENDER_API[g_render_api.load()] +
+                                  (g_render_api_running >= 0 && g_render_api.load() != g_render_api_running ? " (RESTART TO APPLY)" : "")) +
                set_text("tI", g_skip_intro ? "INTRO MOVIE: SKIP" : "INTRO MOVIE: PLAY") + show_keys() +
                "local fov_slider = gBrowser:GetTagByName(\"sO\")\nif fov_slider then fov_slider:SetCurrentValue(" + std::to_string(fov_degrees) + ") end\n";
     }
@@ -505,6 +525,14 @@ namespace rsx
     bool pc_depth_of_field() { return g_screen_fx.load(std::memory_order_relaxed) == 0; }
 }
 
+// The rendering API this process runs (asked once, when the renderer starts).
+int pc_render_api()
+{
+    load();
+    if (g_render_api_running < 0)
+        g_render_api_running = g_render_api.load();
+    return g_render_api_running;
+}
 bool pc_skip_intro_movie() { return g_skip_intro.load(std::memory_order_relaxed); }
 float pc_viewmodel_sway() { return SWAY[g_sway.load(std::memory_order_relaxed)]; }
 
@@ -628,6 +656,8 @@ extern "C" void f_004894e0(PPU_CTX)
         g_sway = (g_sway.load() + 1) % SWAY_N;
     else if (row == "intro")
         g_skip_intro = !g_skip_intro;
+    else if (row == "api")
+        g_render_api = !g_render_api.load();
     save();
     if (const uint32_t L = g_L.load())
         lua_run(ctx, L, show_values());

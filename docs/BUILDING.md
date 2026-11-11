@@ -37,6 +37,11 @@ stays where it is: the game reads it there.
 Configuring runs the recompiler (`tools/recomp`); the build then compiles the generated code. Changing any file in
 `tools/recomp` regenerates all of it, which takes several minutes.
 
+Configuring also downloads AMD FidelityFX (a pinned SDK release, checked by SHA-256) into
+`build/fidelityfx`: the headers of its API and AMD's signed upscaler DLLs, which the DX12 renderer uses. The DLLs
+and their licence (`FidelityFX-license.md`) are copied next to the executable. Offline, the build goes on without
+them.
+
 ## Where files go
 
 | Path | What it holds |

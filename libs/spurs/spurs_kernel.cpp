@@ -82,6 +82,35 @@ struct Workload {
     std::vector<std::unique_ptr<spu::SpuThread>> spus;   // one per instance
 };
 
+// How long an instance keeps looking for work after a run before it sleeps (us). Jobs arrive in
+// bursts tens of microseconds apart, and a kernel sleep and wake-up per job costs more than that.
+// HELSARI_SPURS_SPIN_US=<us> (default 50, 0: off). HELSARI_SPURS_SWEEP=<us>,<us>,...: cycle
+// through these, 15 s each, logging each switch - compares settings in one session.
+std::atomic<uint32_t> g_spin_us{[] {
+    const char *e = getenv("HELSARI_SPURS_SPIN_US");
+    return e ? (uint32_t)atoi(e) : 50u;
+}()};
+void spin_sweep(std::vector<uint32_t> values) {
+    for (size_t i = 0;; i = (i + 1) % values.size()) {
+        g_spin_us = values[i];
+        LOG("sweep", "SPURS spin %u us", values[i]);
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+    }
+}
+void start_spin_sweep() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char *e = getenv("HELSARI_SPURS_SWEEP");
+        if (!e) return;
+        std::vector<uint32_t> v;
+        for (const char *p = e; *p;) {
+            v.push_back((uint32_t)strtoul(p, (char **)&p, 10));
+            while (*p == ',' || *p == ' ') p++;
+        }
+        if (!v.empty()) std::thread(spin_sweep, v).detach();
+    });
+}
+
 // SPU instances per workload: the game's SPURS instance has 5 SPUs (HELSARI_SPURS_SPUS
 // overrides; 1 = the old single-instance behaviour), capped by maxContention.
 int instances_for(uint32_t max_contention) {
@@ -157,11 +186,10 @@ void workload_thread(Workload *w, int k) {
     uint64_t runs = 0;
     IdleBackoff exit_idle;
     while (!w->shutdown) {
-        // Short spin before sleeping: jobs arrive in bursts tens of microseconds apart, and a
-        // kernel sleep and wake-up per job costs more than that (a quarter of the process's
-        // CPU time, and latency along the whole job chain). 50 us: no gain while SPU code was slow,
-        // but with faster code busy scenes went from ~38 to ~45 fps. HELSARI_SPURS_SPIN_US=0: off.
-        static const uint32_t spin_us = getenv("HELSARI_SPURS_SPIN_US") ? (uint32_t)atoi(getenv("HELSARI_SPURS_SPIN_US")) : 50;
+        // Short spin before sleeping (g_spin_us): a kernel sleep and wake-up per job cost a quarter
+        // of the process's CPU time and latency along the whole job chain. 50 us: no gain while SPU
+        // code was slow, but with faster code busy scenes went from ~38 to ~45 fps.
+        const uint32_t spin_us = g_spin_us.load(std::memory_order_relaxed);
         if (spin_us && runs) {
             uint64_t t0 = host_now_ns(), limit = spin_us * 1000ull;
             while (w->ready() <= k && !w->shutdown && host_now_ns() - t0 < limit)
@@ -479,6 +507,7 @@ HLE(cellSpursAddWorkloadWithAttribute) {
             }
             q = *end ? end + 1 : end;
         }
+    start_spin_sweep();
     for (int k = 0; k < n; k++) std::thread(workload_thread, p, k).detach();
     RET(0);
 }
