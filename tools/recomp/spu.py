@@ -9,10 +9,11 @@ each instruction is a call to the runtime's step<OP>(thread, insn, pc)
 (runtime/spu/spu_ops.h) with constant operands, so recompiled code and
 the interpreter execute identical semantics. Only control flow is compiled.
 
-A generated chunk function `uint32_t f(SpuThread &t, uint32_t pc)` starts at
-any of its block entries and returns the next pc whenever control leaves
-what it knows (indirect branch to an unknown target, another chunk, an
-instruction the interpreter must run). The runtime maps a module when its
+A generated chunk function `uint32_t f(SpuThread &t, V *g, uint32_t pc)` starts
+at any of its block entries. When control leaves what it knows (another chunk,
+an indirect branch elsewhere) it tail-calls the compiled code there if the run
+loop would, and otherwise returns the next pc (an instruction the interpreter
+must run, a channel stop, a pending interrupt, a trap). The runtime maps a module when its
 image is loaded into LS and unmaps it when that LS range is written.
 """
 import contextlib
@@ -234,14 +235,14 @@ def gen_module(dec, m, prefix, extra_starts=()):
                 if t <= pc:   # backward: let pending interrupts in, as the interpreter would
                     return f'if (t.interrupts) {{ next = 0x{t:x}; goto redispatch; }} goto L_{t:x};'
                 return f'goto L_{t:x};'
-            return f'{{ ret = 0x{t:x}; goto out; }}'
+            return f'{{ ret = 0x{t:x}; goto chain; }}'
 
         # SPU registers: the thread's own register file, through a no-alias parameter. Nothing else
         # touches t.gpr while compiled code runs, so the compiler may keep registers in host registers
         # across LS stores, as with a local copy - without copying the registers in and out on every
         # entry, which cost most of the time of call-heavy tasks (a chunk is left at every call into
         # another chunk: ~73,000 times per run of one 7 ms task).
-        o = [f'static uint32_t {fn}_b(SpuThread &t, V *__restrict g, uint32_t next) {{',
+        o = [f'uint32_t {fn}(SpuThread &t, V *__restrict g, uint32_t next) {{',
              '    const uint32_t epoch = t.code_epoch;',
              '    uint32_t ret;']
         o += ['    goto dispatch;',
@@ -251,7 +252,7 @@ def gen_module(dec, m, prefix, extra_starts=()):
               'dispatch:',
               '    switch (next) {']
         o += [f'    case 0x{s:x}: goto L_{s:x};' for s in labels]
-        o += ['    default: ret = next; goto out;', '    }']
+        o += ['    default: ret = next; goto chain;', '    }']
         for k in range((lo - m.ls_base) // 4, (hi - m.ls_base) // 4):
             x, op, pc = words[k], ops[k], pcs[k]
             nxt = (pc + 4) & LS_MASK
@@ -280,10 +281,16 @@ def gen_module(dec, m, prefix, extra_starts=()):
             if m.ls_base <= nxt < m.end and not m.is_code(nxt):
                 o.append(f'    ret = 0x{nxt:x}; goto out;')   # falls into data: not compiled
         o.append(f'    ret = 0x{hi & LS_MASK:x};')
+        # Somewhere this chunk does not hold: straight on into the compiled code there (a tail call,
+        # so chains of chunks use no stack), under the run loop's own conditions; else back to it.
+        o.append('chain:')
+        # With interrupts on, a pending event goes back to the run loop (which enters the handler).
+        o.append('    if (t.interrupts && t.chain_interrupt(ret)) return ret;')
+        o.append('    if (t.running && t.code_epoch == epoch && !t.traps[(ret & 0x3ffff) >> 2])')
+        o.append('        if (NativeFn f = t.native[(ret & 0x3ffff) >> 2]) [[clang::musttail]] return f(t, g, ret & 0x3ffff);')
         o.append('out:')
         o.append('    return ret;')
         o.append('}')
-        o.append(f'uint32_t {fn}(SpuThread &t, uint32_t next) {{ return {fn}_b(t, t.gpr, next); }}')
         out.append('\n'.join(o))
     return '\n\n'.join(out) + '\n', entries, fns
 
@@ -325,7 +332,7 @@ def module_table(table, symbol):
     out = ['#include "spu/spu.h"', '', 'namespace spu {', '']
     rows = []
     for m, tag, entries, fns in table:
-        out += [f'uint32_t {fn}(SpuThread &, uint32_t);' for fn in fns]
+        out += [f'uint32_t {fn}(SpuThread &, V *__restrict, uint32_t);' for fn in fns]   # restrict is in the mangled name
         out.append(f'static const NativeEntry {tag}_entries[] = {{')
         out += [f'    {{0x{pc:x}, {fn}}},' for pc, fn in entries]
         out.append('};')

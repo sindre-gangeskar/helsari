@@ -94,7 +94,7 @@ bool image_matches(const uint8_t *ls, const NativeModule *m) {
 // Not in the set: job_d81900, a 4-byte PUT from job data - the signal the frame waits for.
 namespace {
 const uint32_t JOB_ENTRY = 0x30;
-uint32_t skip_job(SpuThread &t, uint32_t pc) {
+uint32_t skip_job(SpuThread &t, V *g, uint32_t pc) {
     uint32_t data = t.ls32((t.gpr[3].w[0] + 32) & (LS_SIZE - 4));
     t.ls[(data + 2) & (LS_SIZE - 1)] &= ~0x07;   // q0 word 0, bits 4-10: optional inputs
     t.ls[(data + 3) & (LS_SIZE - 1)] &= ~0xf0;
@@ -102,7 +102,7 @@ uint32_t skip_job(SpuThread &t, uint32_t pc) {
     for (auto &mp : t.mapped)
         if (mp.m && mp.m->ls_base + JOB_ENTRY == pc)
             for (uint32_t i = 0; i < mp.m->count; i++)
-                if (mp.m->entries[i].pc == pc) return mp.m->entries[i].fn(t, pc);
+                if (mp.m->entries[i].pc == pc) return mp.m->entries[i].fn(t, g, pc);
     t.interp_once = true;
     return pc;
 }

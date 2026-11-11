@@ -55,14 +55,14 @@ struct Task {
 
 // Where task time goes, per ELF, logged every 2 s: from ready to handed over (scheduler), from handed
 // over to running (worker wake-up), running, and of that blocked in channel waits and signal waits.
-struct TaskStat { uint64_t steps = 0, interp = 0, n = 0, sched_ns = 0, wake_ns = 0, run_ns = 0, block_ns = 0, signal_ns = 0, max_run_ns = 0; };
+struct TaskStat { uint64_t backoff_ns = 0, steps = 0, interp = 0, n = 0, sched_ns = 0, wake_ns = 0, run_ns = 0, block_ns = 0, signal_ns = 0, max_run_ns = 0; };
 std::mutex g_stat_lock;
 std::map<uint32_t, TaskStat> g_task_stats;
 thread_local uint64_t t_signal_ns;   // this task's time in SYS_WAIT_SIGNAL
-void task_stats_add(const Task &t, uint64_t t_start, uint64_t t_end, uint64_t block_ns, uint64_t steps, uint64_t interp) {
+void task_stats_add(const Task &t, uint64_t t_start, uint64_t t_end, uint64_t block_ns, uint64_t steps, uint64_t interp, uint64_t backoff_ns) {
     std::lock_guard<std::mutex> lk(g_stat_lock);
     TaskStat &st = g_task_stats[t.elf];
-    st.n++, st.steps += steps, st.interp += interp;
+    st.n++, st.steps += steps, st.interp += interp, st.backoff_ns += backoff_ns;
     if (t.t_ready && t.t_queued >= t.t_ready) st.sched_ns += t.t_queued - t.t_ready;
     if (t.t_queued && t_start >= t.t_queued) st.wake_ns += t_start - t.t_queued;
     st.run_ns += t_end - t_start, st.block_ns += block_ns, st.signal_ns += t_signal_ns;
@@ -74,10 +74,10 @@ void task_stats_add(const Task &t, uint64_t t_start, uint64_t t_end, uint64_t bl
     std::string line;
     for (auto &[elf, x] : g_task_stats) {
         if (!x.n) continue;
-        char b[320];
-        snprintf(b, sizeof b, " | %x: %.0f/s, ready->handed %.0f us, ->running %.0f us, run %.0f us (max %.0f) of it blocked %.0f + signal %.0f us; %.0f dispatches (%.0f interpreted)",
+        char b[360];
+        snprintf(b, sizeof b, " | %x: %.0f/s, ready->handed %.0f us, ->running %.0f us, run %.0f us (max %.0f) of it blocked %.0f + signal %.0f + polling sleeps %.0f us; %.0f dispatches (%.0f interpreted)",
                  elf, x.n / secs, x.sched_ns / 1e3 / x.n, x.wake_ns / 1e3 / x.n, x.run_ns / 1e3 / x.n, x.max_run_ns / 1e3,
-                 x.block_ns / 1e3 / x.n, x.signal_ns / 1e3 / x.n, (double)x.steps / x.n, (double)x.interp / x.n);
+                 x.block_ns / 1e3 / x.n, x.signal_ns / 1e3 / x.n, x.backoff_ns / 1e3 / x.n, (double)x.steps / x.n, (double)x.interp / x.n);
         line += b;
         x = TaskStat{};
     }
@@ -249,7 +249,7 @@ void task_thread(std::shared_ptr<Task> tp) {
             s.gpr[3].w[2], s.gpr[3].w[3]);
     s.run();
     if (!t.done) finish(t, 0);
-    task_stats_add(t, t_start, host_now_ns(), s.wait_ns() - wait0, s.steps_total - steps0, s.interp_total - interp0);
+    task_stats_add(t, t_start, host_now_ns(), s.wait_ns() - wait0, s.steps_total - steps0, s.interp_total - interp0, take_backoff_ns());
     if (task_log()) LOG("spurs", "%s: finished", s.name.c_str());
 }
 

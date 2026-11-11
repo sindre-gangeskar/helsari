@@ -79,6 +79,19 @@ void SpuThread::dump_history() {
 }
 
 std::atomic<uint64_t> g_insns{0}, g_run_ns{0}, g_wait_ns{0}, g_interp{0};
+std::atomic<bool> g_chain_irq{true};
+// HELSARI_SPU_CHAIN_AB=1: chaining with interrupts on, off and on again every 8 s (an A/B test in one run).
+static const bool g_chain_ab = [] {
+    if (!getenv("HELSARI_SPU_CHAIN_AB")) return false;
+    std::thread([] {
+        for (bool on = false;; on = !on) {
+            g_chain_irq = on;
+            LOG("ab", "SPU chaining with interrupts on: %s", on ? "ON" : "OFF");
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+        }
+    }).detach();
+    return true;
+}();
 
 // HELSARI_SPU_HOTSPOTS=1: every 1024th interpreted instruction is sampled as (thread, pc, hash of
 // the 256 code bytes around it - job managers load different code at the same
@@ -199,7 +212,7 @@ void SpuThread::run() {
             NativeFn f = native[pc >> 2];
             if (f && !traps[pc >> 2]) {
                 executed++;
-                pc = f(*this, pc);
+                pc = f(*this, gpr, pc);
                 continue;
             }
         }
@@ -227,7 +240,7 @@ void SpuThread::run() {
         if (!interp_once) {
             if (native)
                 if (NativeFn f = native[pc >> 2]) {
-                    pc = f(*this, pc);
+                    pc = f(*this, gpr, pc);
                     continue;
                 }
             // HELSARI_SPU_MAP_LINES=0: the old rule (look once after any LS write) for comparison.

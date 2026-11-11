@@ -60,7 +60,10 @@ constexpr uint32_t EVENT_SN = 0x002;   // DMA list stall-and-notify
 // Recompiled SPU code (tools/recomp/spu.py, spu_native.cpp). A native function
 // enters at one of its block starts and returns the next pc to run.
 struct SpuThread;
-using NativeFn = uint32_t (*)(SpuThread &, uint32_t pc);
+extern std::atomic<bool> g_chain_irq;   // chunks chain with interrupts on (see SpuThread::chain_interrupt)
+// A compiled chunk: runs from pc on register file gpr (t.gpr) and returns where to go on. Chunks pass
+// control to each other directly (tail calls), so the run loop sees them only when one stops.
+using NativeFn = uint32_t (*)(SpuThread &, V *gpr, uint32_t pc);
 struct NativeEntry { uint32_t pc; NativeFn fn; };
 // One compiled image, executed at LS ls_base: `size` bytes found at guest address
 // src_ea (EBOOT modules), or captured at runtime and embedded as `image`
@@ -211,7 +214,7 @@ struct SpuThread {
     Capture caps[4] = {};
     bool cap_any = false;
     uint64_t steps_total = 0, interp_total = 0;   // dispatches (compiled-code calls + interpreted) and interpreted, for statistics
-    uint64_t waited_ns = 0;                // time blocked reading the event channel (task statistics)
+    uint64_t waited_ns = 0;                // time blocked on the event channel or a polled lock line (task statistics)
     uint64_t wait_ns() const { return waited_ns; }
     IdleBackoff llar_idle;                 // GETLLAR re-reading an unchanged line at once (spu_mfc.cpp)
     uint64_t cap_clock = 0;
@@ -245,6 +248,15 @@ struct SpuThread {
     // Called by native code at branches while interrupts are enabled: take a pending event.
     bool poll_interrupt(uint32_t &next) {
         if (++native_polls & 15 || !pending_events()) return false;
+        srr0 = next, next = 0, interrupts = false;
+        return true;
+    }
+    // Compiled code passing control to another chunk with interrupts on: whether to go back to the run
+    // loop instead (an interrupt is due, or chaining is off). Events are checked every 64th time, as the
+    // run loop does. HELSARI_SPU_CHAIN_AB=1: chaining with interrupts on alternates every 8 s.
+    bool chain_interrupt(uint32_t &next) {
+        if (!g_chain_irq.load(std::memory_order_relaxed)) return true;
+        if (++native_polls & 63 || !pending_events()) return false;
         srr0 = next, next = 0, interrupts = false;
         return true;
     }

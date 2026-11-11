@@ -171,7 +171,9 @@ void SpuThread::mfc_command(uint32_t cmd) {
                 return e ? (uint32_t)atoi(e) : 1000u;
             }();
             if (unchanged && wait_us && llar_idle.streak >= 256 && host_now_ns() - llar_idle.last < 10000) {
+                const uint64_t t0 = host_now_ns();
                 line_wait(raddr, rdata, wait_us);
+                waited_ns += host_now_ns() - t0;   // blocked, for the task statistics
                 llar_idle.streak++;
                 llar_idle.last = host_now_ns();
             } else llar_idle.poll(unchanged);
