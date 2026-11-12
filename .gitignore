@@ -28,3 +28,7 @@ frame.txt
 recompiled/
 lifted/
 out/
+
+# Launcher build output
+launcher/target/
+launcher/gen/
