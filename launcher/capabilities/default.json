@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The launcher window: our own commands, plus events for build progress.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

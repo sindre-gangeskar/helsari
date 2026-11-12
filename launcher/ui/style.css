@@ -1,0 +1,194 @@
+:root {
+  --bg: #0d0f12;
+  --panel: #14171c;
+  --panel-2: #1a1e25;
+  --line: #262b34;
+  --text: #e8eaee;
+  --muted: #8b93a1;
+  --dim: #5c6370;
+  --ok: #5fbf8a;
+  --warn: #e0a64a;
+  --bad: #e06a5a;
+  --accent: #f2a541;          /* Killzone 2 card */
+  --accent-ink: #1b1206;
+  --cold: #7ea6c9;            /* Killzone 3 card */
+  --radius: 14px;
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  display: grid;
+  grid-template-rows: auto auto 1fr auto auto;
+  gap: 18px;
+  padding: 22px 28px 0;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ---- top ---- */
+.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.mark {
+  width: 22px; height: 22px; border-radius: 6px;
+  background: linear-gradient(135deg, var(--accent) 0 50%, var(--cold) 50% 100%);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+}
+.name { font-weight: 700; letter-spacing: 0.32em; font-size: 15px; }
+.tagline { margin: 0; color: var(--muted); font-size: 13px; }
+
+/* ---- prerequisites ---- */
+.prereqs { display: flex; flex-wrap: wrap; gap: 8px; min-height: 30px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-radius: 999px;
+  background: var(--panel); border: 1px solid var(--line);
+  font-size: 12.5px; color: var(--muted);
+}
+.chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+.chip.missing { color: var(--text); border-color: rgba(224, 166, 74, 0.45); cursor: pointer; }
+.chip.missing .dot { background: var(--warn); }
+.chip.missing:hover { background: var(--panel-2); }
+.chip .fix { color: var(--warn); }
+
+/* ---- cards ---- */
+/* The cards keep the backdrop's 16:9 shape and grow with the window: each takes the largest size
+   that fits both the width (two side by side) and the height of this area. */
+.cards {
+  --gap: 22px;
+  container-type: size;
+  display: flex; align-items: center; justify-content: center; gap: var(--gap);
+  min-height: 0;
+}
+
+.card {
+  position: relative; overflow: hidden; cursor: pointer;
+  border-radius: var(--radius); border: 1px solid var(--line);
+  background: var(--panel);
+  display: flex; flex-direction: column; justify-content: flex-end;
+  flex: none;
+  width: min(calc((100cqw - var(--gap)) / 2), calc((100cqh - 8px) * 16 / 9));
+  aspect-ratio: 16 / 9;
+  transition: border-color 0.15s, transform 0.15s;
+  outline: none;
+}
+.card:hover { transform: translateY(-2px); }
+.card.selected { border-color: var(--card-accent); box-shadow: 0 0 0 1px var(--card-accent), 0 18px 40px rgba(0, 0, 0, 0.45); }
+.card:focus-visible { box-shadow: 0 0 0 2px var(--card-accent); }
+.card[data-game="helsari2"] { --card-accent: var(--accent); }
+.card[data-game="helsari3"] { --card-accent: var(--cold); }
+.card.unsupported .art { filter: saturate(0.35) brightness(0.75); }
+
+/* Our own artwork: layered light, a horizon grid and the game's numeral. */
+.art { position: absolute; inset: 0; }
+.art::before {
+  content: ""; position: absolute; inset: 0;
+  background:
+    radial-gradient(120% 80% at 75% 10%, color-mix(in srgb, var(--card-accent) 55%, transparent) 0%, transparent 60%),
+    radial-gradient(90% 60% at 10% 100%, color-mix(in srgb, var(--card-accent) 22%, transparent) 0%, transparent 70%),
+    linear-gradient(180deg, #171a20 0%, #0e1014 100%);
+}
+.art::after {
+  content: ""; position: absolute; left: -10%; right: -10%; bottom: 0; height: 55%;
+  background:
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.05) 0 1px, transparent 1px 46px),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.04) 0 1px, transparent 1px 30px);
+  transform: perspective(380px) rotateX(58deg);
+  transform-origin: bottom;
+  mask-image: linear-gradient(0deg, black 10%, transparent 90%);
+}
+.numeral {
+  position: absolute; right: 6%; top: 4%;
+  font-size: clamp(150px, 26vh, 280px); font-weight: 800; line-height: 1;
+  color: transparent; -webkit-text-stroke: 2px color-mix(in srgb, var(--card-accent) 70%, white 10%);
+  opacity: 0.55;
+}
+.band {
+  position: absolute; left: 0; right: 0; top: 38%; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--card-accent), transparent);
+  opacity: 0.5;
+}
+
+/* The disc's own menu artwork, read from the player's dump: it replaces ours. */
+.card.has-art .art { background-size: cover; background-position: center; }
+.card.has-art .art::before {
+  background: linear-gradient(180deg, rgba(10, 12, 15, 0.05) 0%, rgba(10, 12, 15, 0.25) 45%, rgba(10, 12, 15, 0.9) 100%);
+}
+.card.has-art .art::after, .card.has-art .numeral, .card.has-art .band { display: none; }
+
+.card-body {
+  position: relative; padding: 22px 24px 22px;
+  background: linear-gradient(0deg, rgba(10, 12, 15, 0.92) 30%, transparent);
+}
+.card-title { margin: 0 0 6px; font-size: 30px; font-weight: 700; letter-spacing: 0.02em; }
+.card-meta { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+.badge {
+  padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em;
+  background: rgba(255, 255, 255, 0.07); color: var(--text);
+}
+.badge.built { background: color-mix(in srgb, var(--ok) 22%, transparent); color: #bfeccf; }
+.badge.ready { background: color-mix(in srgb, var(--card-accent) 22%, transparent); }
+.badge.missing { background: rgba(255, 255, 255, 0.06); color: var(--muted); }
+.badge.unsupported { background: rgba(255, 255, 255, 0.04); color: var(--dim); }
+
+/* ---- failure ---- */
+.failure {
+  background: var(--panel); border: 1px solid rgba(224, 106, 90, 0.45); border-radius: 10px;
+  padding: 10px 14px; max-height: 160px; display: grid; grid-template-rows: auto 1fr; gap: 6px;
+}
+.failure[hidden] { display: none; }
+.failure-head { display: flex; justify-content: space-between; align-items: center; color: var(--bad); }
+.failure pre {
+  margin: 0; overflow: auto; font: 11.5px/1.45 Consolas, "Cascadia Mono", monospace; color: var(--muted);
+  user-select: text; white-space: pre-wrap;
+}
+
+/* ---- bottom bar ---- */
+.bar {
+  display: flex; align-items: center; gap: 24px;
+  margin: 0 -28px; padding: 18px 28px 22px;
+  background: var(--panel); border-top: 1px solid var(--line);
+}
+.status { flex: 1; min-width: 0; display: grid; gap: 8px; }
+.status-line { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+.status-title { font-size: 17px; font-weight: 650; white-space: nowrap; }
+.status-detail { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.progress[hidden] { display: none; }
+.progress { display: grid; gap: 5px; }
+.progress-track { height: 6px; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+.progress-fill {
+  height: 100%; width: 0%; border-radius: inherit;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 70%, black), var(--accent));
+  transition: width 0.25s ease;
+}
+.progress-text { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--text); font-variant-numeric: tabular-nums; }
+.progress-line {
+  font: 11.5px Consolas, "Cascadia Mono", monospace; color: var(--dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.secondary { display: flex; gap: 16px; font-size: 12.5px; min-height: 16px; }
+.link {
+  background: none; border: 0; padding: 0; color: var(--muted); font: inherit; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line);
+}
+.link:hover { color: var(--text); }
+
+.play {
+  min-width: 230px; height: 64px; padding: 0 34px; border: 0; border-radius: 12px;
+  font-family: inherit; font-weight: 700; font-size: 19px; line-height: 1; letter-spacing: 0.14em; text-transform: uppercase;
+  background: var(--accent); color: var(--accent-ink); cursor: pointer;
+  box-shadow: 0 10px 28px color-mix(in srgb, var(--accent) 35%, transparent);
+  transition: transform 0.1s, filter 0.15s;
+}
+.play:hover:not(:disabled) { filter: brightness(1.08); }
+.play:active:not(:disabled) { transform: translateY(1px); }
+.play:disabled { background: var(--panel-2); color: var(--dim); box-shadow: none; cursor: default; }
+.play.secondary-style { background: var(--panel-2); color: var(--text); box-shadow: 0 0 0 1px var(--line) inset; }

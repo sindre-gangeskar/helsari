@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Helsari</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <span class="name">HELSARI</span>
+    </div>
+    <p class="tagline">Built on your PC, from your own discs</p>
+  </header>
+
+  <section class="prereqs" id="prereqs" aria-label="What the build needs"></section>
+
+  <main class="cards" id="cards" aria-label="Games"></main>
+
+  <section class="failure" id="failure" hidden>
+    <div class="failure-head">
+      <strong id="failure-title">The build failed</strong>
+      <button class="link" id="failure-close" type="button">Dismiss</button>
+    </div>
+    <pre id="failure-log"></pre>
+  </section>
+
+  <footer class="bar">
+    <div class="status">
+      <div class="status-line">
+        <span class="status-title" id="status-title"></span>
+        <span class="status-detail" id="status-detail"></span>
+      </div>
+      <div class="progress" id="progress" hidden>
+        <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+        <div class="progress-text"><span id="progress-stage"></span><span id="progress-percent"></span></div>
+        <div class="progress-line" id="progress-line"></div>
+      </div>
+      <div class="secondary" id="secondary"></div>
+    </div>
+    <button class="play" id="primary" type="button"></button>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>
