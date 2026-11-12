@@ -26,13 +26,13 @@ OPS_HEADER = os.path.join(os.path.dirname(__file__), '..', '..', 'runtime', 'spu
 LS_MASK = 0x3fffc
 CHUNK_INSNS = 4000             # instructions per generated function (larger: slow, memory-hungry compiles)
 JOB_LS_BASE = 0x4000          # job managers DMA job binaries here (observed for jm_post)
-MAX_JOB_SIZE = 0x8000         # larger "jobs" between the ELFs are data
 
 DIRECT = {'BR', 'BRA', 'BRSL', 'BRASL'}
 COND = {'BRZ', 'BRNZ', 'BRHZ', 'BRHNZ'}
 INDIRECT = {'BI', 'BISL', 'BIZ', 'BINZ', 'BIHZ', 'BIHNZ'}
 TO_INTERP = {'STOP', 'STOPD', 'IRET', 'BISLED', 'INVALID'}   # the interpreter runs these
 CHANNEL = {'RDCH', 'RCHCNT', 'WRCH'}
+BLOCK_ENDS = {'BR', 'BRA', 'BI', 'BRSL', 'BRASL', 'BISL'} | TO_INTERP   # control does not fall through
 HALT = {'HEQ', 'HEQI', 'HGT', 'HGTI', 'HLGT', 'HLGTI'}
 # Instructions that write no register (everything else writes rt; see reg_fields).
 NO_WRITE = {'STQD', 'STQX', 'STQA', 'STQR', 'BR', 'BRA', 'BRZ', 'BRNZ', 'BRHZ', 'BRHNZ', 'BI', 'BIZ', 'BINZ', 'BIHZ',
@@ -113,7 +113,7 @@ class Module:
 
 
 def find_modules(e):
-    """SPU ELF text segments, and job binaries packed between them."""
+    """SPU ELF text segments, job binaries (found by their header), and the policy module."""
     mods = []
     seg = next(s for s in e.segments if s.type == 1)          # the read-only image: code and rodata
     data, base = e.data[seg.offset:seg.offset + seg.filesz], seg.vaddr
@@ -127,61 +127,52 @@ def find_modules(e):
     for ea in elves:
         hdr = e.read(ea, 52)
         phoff, phnum = struct.unpack('>I', hdr[28:32])[0], struct.unpack('>H', hdr[44:46])[0]
-        shoff, shnum = struct.unpack('>I', hdr[32:36])[0], struct.unpack('>H', hdr[48:50])[0]
-        # executable sections (SHF_EXECINSTR): the rest of a segment is data the program writes
-        text = []
-        for k in range(shnum if shoff else 0):
-            _, _, sflags, addr, _, size = struct.unpack('>6I', e.read(ea + shoff + 40 * k, 24))
-            if sflags & 4 and size:
-                text.append((addr, addr + size))
+        # Each executable segment whole, not just its declared code sections: programs run code
+        # outside them. Data among the code is safe to compile as instructions (never run), and the
+        # runtime tolerates the program changing it (stale quadwords, spu_native.cpp); zero quadwords
+        # are data to it.
         for k in range(phnum):
             p_type, off, vaddr, _, filesz, _, flags, _ = struct.unpack('>8I', e.read(ea + phoff + 32 * k, 32))
             if p_type == 1 and flags & 1 and filesz:
                 size = filesz & ~3
-                protect = None
-                if text:
-                    protect = [any(a < vaddr + 16 * (q + 1) and vaddr + 16 * q < b for a, b in text)
-                               for q in range((size + 15) // 16)]
-                mods.append(Module(f'elf_{ea:x}', ea + off, vaddr, e.read(ea + off, size), protect))
-    # Job binaries sit between the ELFs: each ends with a 16-byte marker line
-    # (ffffffff, then ffffffff in word 2 or 3), is zero-padded, and the next one
-    # starts at the following 0x80-aligned non-zero line.
-    if elves:
-        def elf_end(ea):
-            hdr = e.read(ea, 52)
-            phoff, shoff = struct.unpack('>I', hdr[28:32])[0], struct.unpack('>I', hdr[32:36])[0]
-            phnum, shnum = struct.unpack('>H', hdr[44:46])[0], struct.unpack('>H', hdr[48:50])[0]
-            end = max(shoff + 40 * shnum, phoff + 32 * phnum)
-            for k in range(phnum):
-                _, off, _, _, filesz, _, _, _ = struct.unpack('>8I', e.read(ea + phoff + 32 * k, 32))
-                end = max(end, off + filesz)
-            return ea + end
-        spans = [(ea, elf_end(ea)) for ea in elves]
-        first, last = elves[0], elves[-1]
-        region = e.read(first, last - first)
-
-        def line(a):
-            return region[a - first:a - first + 16]
-
-        def is_marker(l):
-            return l[:4] == b'\xff' * 4 and (l[8:12] == b'\xff' * 4 or l[12:16] == b'\xff' * 4)
-
-        starts = []
-        for a in range(first + 0x80, last, 0x80):
-            if any(s <= a < t for s, t in spans) or line(a) == bytes(16) or line(a - 16) != bytes(16):
-                continue
-            b = a - 16
-            while b > first and line(b) == bytes(16):
-                b -= 16
-            if is_marker(line(b)) and not is_marker(line(a)):
-                starts.append(a)
-        for a in starts:
-            b = a
-            while b < last and not is_marker(line(b)) and not any(s <= b < t for s, t in spans):
-                b += 16
-            if b - a <= MAX_JOB_SIZE:
-                mods.append(Module(f'job_{a:x}', a, JOB_LS_BASE, e.read(a, b - a)))
+                mods.append(Module(f'elf_{ea:x}', ea + off, vaddr, e.read(ea + off, size)))
+    # Job binaries: a 48-byte header, with the constant 0xc0dec0de at +0x20. +0x10: offset of the
+    # program in the binary (0x30 or 0x80), +0x14: its size, +0x28: the LS address it runs at, or 0:
+    # 0x8400 if the flag word at +0x2c has its top bit set, else 0x4000; the flag's low byte is 5.
+    # Found by the header alone, wherever the job sits: the EBOOT has no other index of them.
+    have = {(m.src_ea, m.ls_base) for m in mods}
+    heads = []
+    i = data.find(JOB_MAGIC)
+    while i >= 0:
+        h = i - 0x20
+        if h >= 0 and h % 16 == 0:
+            w = struct.unpack('>12I', data[h:h + 48])
+            if w[11] & 0xff == 5 and 0 < w[5] < 0x40000 and w[4] < 0x40000:
+                heads.append((base + h, w))
+        i = data.find(JOB_MAGIC, i + 1)
+    # A job ends where the next image starts (the header's size field can only shorten that: some
+    # jobs state a size well past their binary).
+    bounds = sorted([ea for ea, _ in heads] + elves + [ea for _, ea, _, _ in KNOWN_IMAGES] + [base + len(data)])
+    for ea, w in heads:
+        ls = w[10] if w[10] else (0x8400 if w[11] & 0x80000000 else JOB_LS_BASE)
+        nxt = next(b for b in bounds if b > ea)
+        size = min(w[4] + w[5] if w[4] in (0x30, 0x80) else nxt - ea, nxt - ea, 0x40000 - ls)
+        size = (size + 15) & ~15
+        if (ea, ls) not in have:
+            mods.append(Module(f'job_{ea:x}', ea, ls, e.read(ea, size)))
+            have.add((ea, ls))
+    # The job managers' policy module, loaded at 0xa00 by the SPURS kernel (spurs_kernel.cpp): no
+    # header to find it by. A fact about this game version (BCES00081, update 1.29).
+    for name, ea, ls, size in KNOWN_IMAGES:
+        if (ea, ls) not in have and e.read(ea, 16) != bytes(16):
+            mods.append(Module(f'{name}_{ea:x}', ea, ls, e.read(ea, size)))
     return mods
+
+
+JOB_MAGIC = bytes.fromhex('c0dec0de')
+KNOWN_IMAGES = [
+    ('pm', 0xda2c80, 0xa00, 0x2e80),     # EBOOT address, LS address, size
+]
 
 
 def gen_module(dec, m, prefix, extra_starts=()):
@@ -213,6 +204,27 @@ def gen_module(dec, m, prefix, extra_starts=()):
             starts.add(pc)
     starts |= {s for s in extra_starts if m.ls_base <= s < m.end}
     starts = {s for s in starts if m.is_code(s)}
+
+    # Quadwords the runtime treats as code (spu_native.cpp is_code): a capture's executed words; an
+    # EBOOT image's non-zero quadwords (zero words decode as STOP, which the interpreter runs).
+    def runtime_code(qpc):
+        if m.protect is not None:
+            return bool(m.protect[(qpc - m.ls_base) >> 4])
+        off = qpc - m.ls_base
+        return any(m.code[off:off + 16])
+
+    def block_quads(k):
+        """Quadwords (absolute LS index) of the block starting at instruction k: up to and including
+        its first unconditional transfer, or until the next block start."""
+        qs = []
+        while k < n:
+            q = pcs[k] >> 4
+            if (not qs or qs[-1] != q) and runtime_code(q << 4):
+                qs.append(q)
+            if ops[k] in BLOCK_ENDS or (k + 1 < n and pcs[k + 1] in starts):
+                break
+            k += 1
+        return qs
 
     # chunks: runs of whole blocks, about CHUNK_INSNS instructions each
     chunks, cur = [], m.ls_base
@@ -260,6 +272,10 @@ def gen_module(dec, m, prefix, extra_starts=()):
                 continue
             if pc in starts:
                 o.append(f'L_{pc:x}:')
+                # The block's quadwords must still hold what was compiled: the program may have
+                # written them (runtime code_q: STALE, see spu.h). A stale one goes to stale_block.
+                for q in block_quads(k):
+                    o.append(f'    if (t.code_q[0x{q:x}] != 1) {{ ret = t.stale_block(0x{pc:x}, 0x{q:x}); goto out; }}')
             s = f'step_r<{op}>(t, g, 0x{x:08x}u, 0x{pc:x}u)'
             if op in TO_INTERP or not m.word_checked(pc):
                 o.append(f'    t.interp_once = true; ret = 0x{pc:x}; goto out;')

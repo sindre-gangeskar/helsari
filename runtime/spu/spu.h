@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 namespace spu {
@@ -147,11 +148,14 @@ struct SpuThread {
     }
 
     // Recompiled code mapped into LS. native[pc / 4] is the function entering
-    // at pc; code_q marks the quadwords of mapped modules: a write to a CODE
-    // quadword unmaps its module (code_epoch++ makes running native code
-    // return); DATA (the rest of the image) may change freely - nothing was
-    // compiled from it. Quadwords, not lines: code and data share 128-byte lines.
-    enum : uint8_t { CODE = 1, DATA = 2 };
+    // at pc; code_q marks the quadwords of mapped modules. CODE: LS holds what the code was compiled
+    // from. A write there makes it STALE instead of unmapping the module (programs write their own
+    // data, which sits among their code): every compiled block checks its quadwords on entry and
+    // hands a stale one to stale_block (spu_native.cpp), which trusts it again if LS holds the
+    // original bytes and otherwise lets the interpreter run it. DMA writes also bump code_epoch,
+    // so running native code returns at its next check. DATA: never compiled (zero quadwords of
+    // EBOOT images, unexecuted words of captures). Quadwords, not lines: code and data share lines.
+    enum : uint8_t { CODE = 1, DATA = 2, STALE = 3 };
     std::unique_ptr<NativeFn[]> native;   // owned: a SpuThread per SPURS task start (~200/s) leaked 512 KB each
     uint8_t code_q[LS_SIZE / 16] = {};
     uint32_t code_epoch = 0;
@@ -182,27 +186,39 @@ struct SpuThread {
     bool same_code_reload(uint32_t lsa, const void *src, uint32_t size, uint32_t ea = 0) {
         static const bool on = [] { const char *e = getenv("HELSARI_SPU_RELOAD_CHECK"); return !e || atoi(e) != 0; }();
         if (!on || !size || lsa + size > LS_SIZE) return false;
-        // An EBOOT job still mapped where it is being loaded again: the source is the game's
-        // read-only image, and any write to that LS range would have unmapped it. Same bytes,
-        // nothing to compare. (Only whole-code modules: others have data that may have changed.)
+        // An EBOOT job still mapped where it is being loaded again from the game's read-only image: the
+        // mapping stays. The bytes are copied all the same - the program has filled in its zeroed
+        // data (not tracked: never compiled) and changed stale quadwords, and a reload resets them -
+        // after which its stale quadwords hold the original again and are code.
         if (ea)
             for (auto &mp : mapped)
                 if (mp.m && !mp.m->protect && !mp.m->image && ea >= mp.m->src_ea && ea - mp.m->src_ea == lsa - mp.m->ls_base &&
-                    lsa >= mp.m->ls_base && lsa + size <= mp.m->ls_base + mp.m->size)   // whole, or one piece of it
+                    lsa >= mp.m->ls_base && lsa + size <= mp.m->ls_base + mp.m->size) {   // whole, or one piece of it
+                    memcpy(ls + lsa, src, size);
+                    for (uint32_t q = (lsa + 15) >> 4, e = (lsa + size) >> 4; q < e; q++)
+                        if (code_q[q] == STALE) code_q[q] = CODE;
                     return true;
+                }
         bool code = false;
         for (uint32_t q = lsa >> 4, e = (lsa + size - 1) >> 4; q <= e && !code; q++) code = code_q[q] == CODE;
         return code && !memcmp(ls + lsa, src, size);
     }
-    // LS [lsa, lsa+size) is about to be written by anything other than a code load.
-    __attribute__((noinline, cold)) void ls_written_cold(uint32_t lsa, uint32_t size) { ls_written(lsa, size); }
-    void ls_written(uint32_t lsa, uint32_t size) {
+    // LS [lsa, lsa+size) is about to be written. SPU stores (ls_written_cold) only mark compiled
+    // quadwords stale; DMA and loads (ls_written) also bump code_epoch, so native code running now
+    // returns at its next check and every block it enters is checked again.
+    __attribute__((noinline, cold)) void ls_written_cold(uint32_t lsa, uint32_t size) { ls_written(lsa, size, false); }
+    void ls_written(uint32_t lsa, uint32_t size, bool bump = true) {
         code_dirty = true;
         mark_fresh(lsa, size);
         if (cap_any && size) capture_overwritten(lsa, size);
+        bool stale = false;
         for (uint32_t q = lsa >> 4, e = ((lsa + size - 1) & (LS_SIZE - 1)) >> 4; q <= e && size; q++)
-            if (code_q[q] == CODE) { unmap_range(lsa, size); return; }
+            if (code_q[q] == CODE) code_q[q] = STALE, stale = true;
+        if (stale && bump) code_epoch++;
     }
+    // A compiled block found quadword q stale on entry (generated code): pc to go on at, with the
+    // quadword trusted again if LS holds what its module was compiled from, else interp_once.
+    uint32_t stale_block(uint32_t pc, uint32_t q);
 
     // Runtime capture of interpreted code (spu_capture.cpp): src_delta[line] is
     // ea - lsa of the DMA load that filled the line (0: not loaded), so lines
@@ -245,6 +261,7 @@ struct SpuThread {
     void flush_capture(Capture &c);
     void checkpoint_captures();
     void unmap_range(uint32_t lsa, uint32_t size);
+    void unmap_module(Mapped &mp);         // clear its native entries and code_q range
     // Called by native code at branches while interrupts are enabled: take a pending event.
     bool poll_interrupt(uint32_t &next) {
         if (++native_polls & 15 || !pending_events()) return false;
@@ -262,6 +279,7 @@ struct SpuThread {
     }
 
     void reset();
+    void clear_native();            // clear the native entries of every mapped module (spu_native.cpp)
     void run();                     // execute from pc until stopped
     uint32_t read_channel(int ch);
     void write_channel(int ch, uint32_t v);

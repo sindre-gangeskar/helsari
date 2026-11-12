@@ -159,7 +159,7 @@ void task_thread(std::shared_ptr<Task> tp) {
             spu::SpuThread *p = t.spu;
             t.spu = nullptr;
             if (!pooled) { delete p; return; }
-            if (p->native) memset(p->native.get(), 0, spu::LS_SIZE / 4 * sizeof(spu::NativeFn));
+            p->clear_native();
             spare = std::move(p->native);
             p->~SpuThread();
         }

@@ -54,36 +54,53 @@ const bool g_rt_enabled = [] {
 std::atomic<uint64_t> g_maps{0}, g_unmaps{0}, g_match_tries{0};   // reported in the flip log (spu_interp.cpp)
 namespace {
 
-bool is_code(const NativeModule *m, uint32_t q) {   // q: quadword index from ls_base
-    return !m->protect || m->protect[q];
+// A quadword that is all zero in an EBOOT module's image. Zero words decode as STOP, which compiled
+// code hands to the interpreter, so whatever LS holds there never runs as compiled code: such
+// quadwords are not compared, and writes to them (the program filling in its zeroed data) are data
+// writes, not code changes that unmap the module.
+bool zero_quad(const NativeModule *m, uint32_t q) {
+    const uint8_t *img = (const uint8_t *)mem::ptr(m->src_ea) + q * 16;
+    uint64_t a, b;
+    memcpy(&a, img, 8), memcpy(&b, img + 8, 8);
+    return !(a | b);
 }
 
-// Does LS hold m's image? Runtime modules are compared on their code quadwords only:
-// those are all that was compiled, and the rest is data the program may have changed.
-bool image_matches(const uint8_t *ls, const NativeModule *m) {
-    // EBOOT modules compare with the game image, captured ones with their embedded copy. Only code
-    // counts: the rest of a segment is data the running program has changed, and comparing it
-    // would keep a task that was unmapped once in the interpreter for good.
+bool is_code(const NativeModule *m, uint32_t q) {   // q: quadword index from ls_base
+    if (m->protect) return m->protect[q];
+    return m->image || !zero_quad(m, q);
+}
+
+// Does LS hold quadword q (index from ls_base) of m's image? Only the words that were compiled count.
+bool quad_matches(const uint8_t *ls, const NativeModule *m, uint32_t q) {
     const uint8_t *img = m->image ? m->image : (const uint8_t *)mem::ptr(m->src_ea);
-    if (!m->protect) return !memcmp(ls + m->ls_base, img, m->size);
-    // protect: per quadword, a bit per executed word (spu_capture.cpp); runs of whole
-    // quadwords are compared with one memcmp, partial ones word by word.
-    for (uint32_t off = 0; off < m->size;) {
-        uint8_t bits = m->protect[off >> 4] & 0xf;
-        if (bits != 0xf) {
-            for (uint32_t w = 0; w < 4 && off + w * 4 < m->size; w++)
-                if ((bits >> w & 1) && memcmp(ls + m->ls_base + off + w * 4, img + off + w * 4, 4)) return false;
-            off += 16;
-            continue;
-        }
-        uint32_t end = off;
-        while (end < m->size && (m->protect[end >> 4] & 0xf) == 0xf) end += 16;
-        end = std::min(end, m->size);
-        if (memcmp(ls + m->ls_base + off, img + off, end - off)) return false;
-        off = end;
-    }
+    const uint32_t off = q * 16, n = std::min(16u, m->size - off);
+    const uint8_t bits = m->protect ? (m->protect[q] & 0xf) : 0xf;
+    if (bits == 0xf) return !memcmp(ls + m->ls_base + off, img + off, n);
+    for (uint32_t w = 0; w < 4 && w * 4 < n; w++)
+        if ((bits >> w & 1) && memcmp(ls + m->ls_base + off + w * 4, img + off + w * 4, 4)) return false;
     return true;
 }
+
+// Is m's program in LS? Its compiled quadwords, allowing a few that differ: programs keep data among
+// their code and change it. Those are mapped STALE (map_module), so they never run as compiled code;
+// the threshold only keeps a different program from being mapped. HELSARI_SPU_MATCH_EXACT=1: no slack.
+bool program_matches(const uint8_t *ls, const NativeModule *m, std::vector<uint32_t> *differ = nullptr) {
+    static const bool exact = getenv("HELSARI_SPU_MATCH_EXACT") != nullptr;
+    const uint8_t *img = m->image ? m->image : (const uint8_t *)mem::ptr(m->src_ea);
+    if (!m->protect && !memcmp(ls + m->ls_base, img, m->size)) return true;
+    uint32_t code = 0, bad = 0;
+    for (uint32_t q = 0; q * 16 < m->size; q++) {
+        if (!is_code(m, q)) continue;
+        code++;
+        if (!quad_matches(ls, m, q)) {
+            if (exact) return false;
+            bad++;
+            if (differ) differ->push_back(q);
+        }
+    }
+    return code >= 4 && bad * 16 <= code;
+}
+
 } // namespace
 
 // HELSARI_SKIP_JOBS=job_d7aa80,job_d7d100 ("post" = the whole post-processing set): these jobs do
@@ -120,6 +137,9 @@ bool job_skipped(const char *job) {
 }
 
 bool SpuThread::map_module(const NativeModule *m) {
+    // Whatever was mapped over this range is gone from LS now (m's image is there).
+    for (auto &mp : mapped)
+        if (mp.m && mp.m != m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size) unmap_module(mp);
     int slot = -1;
     for (int i = 0; i < 8; i++) if (!mapped[i].m) { slot = i; break; }
     if (slot < 0) return false;
@@ -146,6 +166,12 @@ bool SpuThread::map_module(const NativeModule *m) {
         }
         memcpy(code_q + (m->ls_base >> 4), t, qn);
     }
+    // Quadwords LS holds differently (the program's changed data): stale, not run as compiled code.
+    {
+        std::vector<uint32_t> differ;   // the callers checked that it is m's program
+        program_matches(ls, m, &differ);
+        for (uint32_t q : differ) code_q[(m->ls_base >> 4) + q] = STALE;
+    }
     mapped[slot].m = m;
     if (name[6] == 'j' && !m->image) gcm_post_job_mapped(m->name);   // "spurs:jm_...": F9 buffer dumps
     // The first map of each module on each thread (jobs map hundreds of times a frame).
@@ -162,7 +188,7 @@ void SpuThread::code_loaded(uint32_t lsa, uint32_t ea, uint32_t size) {
     auto range = by_source().equal_range(ea);
     for (auto it = range.first; it != range.second; ++it) {
         const NativeModule *m = it->second;
-        if (m->ls_base != lsa || m->size > size || !image_matches(ls, m)) continue;
+        if (m->ls_base != lsa || m->size > size || !program_matches(ls, m)) continue;
         map_module(m);
         return;
     }
@@ -178,7 +204,8 @@ bool SpuThread::map_at(uint32_t pc) {
     auto try_map = [&](const NativeModule *m) {
         if (pc < m->ls_base || pc >= m->ls_base + m->size || !is_code(m, (pc - m->ls_base) >> 4)) return false;
         for (auto &mp : mapped)
-            if (mp.m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size) {
+            if (mp.m && m->ls_base < mp.m->ls_base + mp.m->size && mp.m->ls_base < m->ls_base + m->size &&
+                code_q[pc >> 4] != STALE) {   // overwritten at pc: m may replace it
                 static const char *mlog = getenv("HELSARI_SPU_MATCH_LOG");
                 static std::atomic<int> logs{0};
                 static const uint32_t spc = getenv("HELSARI_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("HELSARI_SPU_MATCH_PC"), nullptr, 16) : 0;
@@ -188,24 +215,45 @@ bool SpuThread::map_at(uint32_t pc) {
                 return false;
             }
         g_match_tries++;
-        if (!image_matches(ls, m)) {
+        if (!program_matches(ls, m)) {
             // Diagnostics (HELSARI_SPU_MATCH_LOG=1): which compiled module was rejected, and the
             // first code quadword where LS differs from the image it was compiled from.
             // HELSARI_SPU_MATCH_LOG=<text>: only threads whose name contains it ("1": all).
             static const char *mlog = getenv("HELSARI_SPU_MATCH_LOG");
             static std::atomic<int> logs{0};
             static const uint32_t mpc = getenv("HELSARI_SPU_MATCH_PC") ? (uint32_t)strtoul(getenv("HELSARI_SPU_MATCH_PC"), nullptr, 16) : 0;
-            if (mlog && logs < 60 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos) && (!mpc || (pc & ~0x1ffu) == (mpc & ~0x1ffu))) {
-                const uint8_t *img = m->image ? m->image : (const uint8_t *)mem::ptr(m->src_ea);
-                for (uint32_t off = 0; off < m->size; off += 16)
-                    if (is_code(m, off >> 4) && memcmp(ls + m->ls_base + off, img + off, std::min(16u, m->size - off)) &&
-                        (!m->image || !m->protect || (m->protect[off >> 4] & 0xf) == 0xf)) {
-                        logs++;
-                        const uint32_t *x = (const uint32_t *)(ls + m->ls_base + off), *y = (const uint32_t *)(img + off);
-                        LOG("spu", "%s: %s rejected at pc 0x%x: code quadword 0x%x differs (LS %08x %08x %08x %08x, image %08x %08x %08x %08x)",
-                            name.c_str(), m->name, pc, m->ls_base + off, x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]);
-                        break;
+            // HELSARI_SPU_MATCH_MODULE=<text>,<text>: only modules whose name contains one of them.
+            static const char *mmod = getenv("HELSARI_SPU_MATCH_MODULE");
+            const auto module_wanted = [&] {
+                if (!mmod) return true;
+                for (const char *p = mmod; *p;) {
+                    const char *e = strchr(p, ',');
+                    const std::string part(p, e ? e - p : strlen(p));
+                    if (!part.empty() && strstr(m->name, part.c_str())) return true;
+                    if (!e) break;
+                    p = e + 1;
+                }
+                return false;
+            };
+            if (mlog && logs < 60 && (!strcmp(mlog, "1") || name.find(mlog) != std::string::npos) && (!mpc || (pc & ~0x1ffu) == (mpc & ~0x1ffu)) &&
+                module_wanted()) {
+                // How many of its code quadwords differ, and the first few (the match allows 1 in 16).
+                uint32_t code = 0;
+                std::vector<uint32_t> differ;
+                for (uint32_t q = 0; q * 16 < m->size; q++)
+                    if (is_code(m, q)) {
+                        code++;
+                        if (!quad_matches(ls, m, q)) differ.push_back(q);
                     }
+                std::string where;
+                for (size_t i = 0; i < differ.size() && i < 6; i++) {
+                    char b[16];
+                    snprintf(b, sizeof b, " 0x%x", m->ls_base + differ[i] * 16);
+                    where += b;
+                }
+                logs++;
+                LOG("spu", "%s: %s rejected at pc 0x%x: %zu of %u code quadwords differ, first at%s", name.c_str(), m->name, pc,
+                    differ.size(), code, where.c_str());
             }
             return false;
         }
@@ -242,7 +290,47 @@ bool SpuThread::map_at(uint32_t pc) {
             if (try_map(&table[i])) return native[pc >> 2];
         }
     }
+    // Nothing compiled matches, and what is mapped here was overwritten at pc: another program is in
+    // LS now. Unmap the old one, so its stale blocks go and the new program can be mapped or captured.
+    if (code_q[pc >> 4] == STALE)
+        for (auto &mp : mapped)
+            if (mp.m && pc >= mp.m->ls_base && pc < mp.m->ls_base + mp.m->size) unmap_module(mp);
     return false;
+}
+
+// Before the thread object is reused for another program (the task pool): clear just the native
+// entries its mapped modules set, instead of the whole 512 KB table.
+void SpuThread::clear_native() {
+    if (!native) return;
+    for (auto &mp : mapped) {
+        if (const NativeModule *m = mp.m) {
+            for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = nullptr;
+            native[(m->ls_base + JOB_ENTRY) >> 2] = nullptr;
+            mp.m = nullptr;
+        }
+    }
+}
+
+void SpuThread::unmap_module(Mapped &mp) {
+    const NativeModule *m = mp.m;
+    for (uint32_t i = 0; i < m->count; i++) native[m->entries[i].pc >> 2] = nullptr;
+    if (native[(m->ls_base + JOB_ENTRY) >> 2] == skip_job) native[(m->ls_base + JOB_ENTRY) >> 2] = nullptr;
+    memset(code_q + (m->ls_base >> 4), 0, ((m->ls_base + m->size - 1) >> 4) - (m->ls_base >> 4) + 1);
+    mp.m = nullptr;
+    code_epoch++;
+}
+
+uint32_t SpuThread::stale_block(uint32_t pc, uint32_t q) {
+    for (auto &mp : mapped) {
+        const NativeModule *m = mp.m;
+        if (m && q >= (m->ls_base >> 4) && q < ((m->ls_base + m->size + 15) >> 4) && is_code(m, q - (m->ls_base >> 4)) &&
+            quad_matches(ls, m, q - (m->ls_base >> 4))) {
+            code_q[q] = CODE;
+            return pc;
+        }
+    }
+    interp_once = true;   // the interpreter runs it as LS holds it
+    return pc;
 }
 
 void SpuThread::unmap_range(uint32_t lsa, uint32_t size) {
